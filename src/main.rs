@@ -1,16 +1,16 @@
-//! BORUIX 用户态 shell（命令行解释器，库形式，由 init 调用）。
+//! BORUIX 用户态 shell（命令行解释器，独立可执行程序）。
 //!
-//! 当前形态：由于内核尚无键盘输入（输入后置），shell 以**内置脚本**方式运行，
-//! 逐行解释执行以下命令，验证「词法 + 表达式求值 + 转义」能力：
+//! 由 init（PID 1）经 `exec` 系统调用加载运行为 PID 2。libsys 提供 `_start`
+//! 入口，本文件导出 `user_main`（进程入口）。
 //!
+//! 命令集：
 //! - `echo <文本>`：输出一行文本（支持双引号字符串与 `\n` 等转义）。
 //! - `print("字符串")`：输出字符串字面量（支持 `\n`/`\t`/`\\`/`\"` 转义）。
-//! - `print(<算术表达式>)`：解析并求值 `+ - * /` 四则运算（含括号、空格），
-//!   输出十进制结果。
-//!
-//! 交互式输入（read syscall + 键盘）落地后，把内置脚本替换为「读一行 → 执行」即可。
+//! - `print(<算术表达式>)`：解析并求值 `+ - * /` 四则运算（含括号、空格、
+//!   一元负号），输出十进制结果。
 
 #![no_std]
+#![no_main]
 
 use libsys::{write, STDOUT};
 
@@ -107,11 +107,6 @@ impl<'a> Expr<'a> {
         while self.pos < self.s.len() && self.s[self.pos].is_ascii_whitespace() {
             self.pos += 1;
         }
-    }
-
-    fn peek(&mut self) -> Option<u8> {
-        self.skip_ws();
-        self.s.get(self.pos).copied()
     }
 
     fn eat(&mut self, c: u8) -> bool {
@@ -270,20 +265,6 @@ fn exec_print(arg: &[u8]) {
     }
 }
 
-// ---------- 解释执行 ----------
-
-/// 内置演示脚本（验证 echo / print 字符串 / print 算术）。
-/// 中文经 UTF-8 字节转义；`\n`/`\t` 等转义以字面反斜杠序列书写，
-/// 由 `unescape` 解码为实际控制字符。
-const SCRIPT: &[&[u8]] = &[
-    b"echo helloworld",
-    b"print(\"\xe8\xae\xa1\xe7\xae\x97\xe7\xbb\x93\xe6\x9e\x9c\xe6\x98\xaf\xef\xbc\x9a\\n\")",
-    b"print(1+1)",
-    b"print((10 + 2) * 3 / 4 - 5)",
-    b"print(-7 + 3 * 2)",
-    b"print(\"tab:\\t done, slash:\\\\, quote:\\\"\\n\")",
-];
-
 /// 执行一行命令。以 `;` 结尾可省略。空行/注释(`#`)跳过。
 fn exec_line(line: &[u8]) {
     let line = trim_bytes(line);
@@ -316,15 +297,58 @@ fn exec_line(line: &[u8]) {
     }
 }
 
-/// shell 主循环：执行内置脚本。返回退出码。
-pub fn run() -> i32 {
-    outln(b"BORUIX shell (interactive input pending; running built-in script)");
-    for line in SCRIPT {
-        prompt();
-        outln(line);
-        exec_line(line);
-        out(b"\n");
-    }
-    outln(b"script done");
+/// shell 入口（libsys `_start` 调用）：输出横幅并进入 REPL 循环。
+/// 返回退出码。
+#[unsafe(no_mangle)]
+pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
+    outln(b"BORUIX shell (PID 2)");
+    repl_loop();
     0
 }
+
+/// REPL（Read-Eval-Print-Loop）主循环：读一行 → 执行。
+///
+/// 读取经 `read` 系统调用从内核键盘输入缓冲取一行；当前无键盘输入时
+/// 返回空/阻塞。空行与 `#` 注释跳过。
+fn repl_loop() {
+    let mut line = [0u8; 256];
+    loop {
+        prompt();
+        let n = read_line(&mut line);
+        if n == 0 {
+            // 无输入源/读失败：短暂让出避免忙等；无调度时直接返回结束。
+            // （键盘输入接入后，read 会阻塞直到有数据。）
+            return;
+        }
+        exec_line(&line[..n]);
+    }
+}
+
+/// 从标准输入读一行（直到 `\n` 或缓冲满），返回有效长度（不含 `\n`）。
+/// 读到的字节数。当前经 `read` syscall 从内核键盘缓冲取；无可用输入返回 0。
+fn read_line(buf: &mut [u8]) -> usize {
+    let mut n = 0;
+    while n < buf.len() {
+        let mut one = [0u8; 1];
+        let got = libsys::read(STDIN, &mut one).unwrap_or(0);
+        if got == 0 {
+            break; // 无可读数据
+        }
+        let c = one[0];
+        if c == b'\n' {
+            break;
+        }
+        // 回显 + 暂存
+        let _ = write(STDOUT, &one);
+        if c == b'\r' {
+            continue;
+        }
+        buf[n] = c;
+        n += 1;
+    }
+    out(b"\n");
+    n
+}
+
+/// 标准输入文件描述符。
+const STDIN: u64 = 0;
