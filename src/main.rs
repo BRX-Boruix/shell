@@ -308,43 +308,48 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
 
 /// REPL（Read-Eval-Print-Loop）主循环：读一行 → 执行。
 ///
-/// 读取经 `read` 系统调用从内核键盘输入缓冲取一行；当前无键盘输入时
-/// 返回空/阻塞。空行与 `#` 注释跳过。
+/// 经 `read` 系统调用从内核键盘输入缓冲逐字符读行；缓冲空（`WouldBlock`）时
+/// 让出 CPU 并重试（键盘是异步中断驱动，无输入时不忙等）。空行与 `#` 注释跳过。
 fn repl_loop() {
     let mut line = [0u8; 256];
     loop {
         prompt();
         let n = read_line(&mut line);
         if n == 0 {
-            // 无输入源/读失败：短暂让出避免忙等；无调度时直接返回结束。
-            // （键盘输入接入后，read 会阻塞直到有数据。）
-            return;
+            // 读到空行（直接回车）：继续下一轮。
+            continue;
         }
         exec_line(&line[..n]);
     }
 }
 
 /// 从标准输入读一行（直到 `\n` 或缓冲满），返回有效长度（不含 `\n`）。
-/// 读到的字节数。当前经 `read` syscall 从内核键盘缓冲取；无可用输入返回 0。
+///
+/// 逐字符 `read(0, &1)`：内核键盘缓冲有字符则回显并暂存；空则返回
+/// `WouldBlock`（`Err`），此处先让出 CPU 再继续，避免忙等。
 fn read_line(buf: &mut [u8]) -> usize {
     let mut n = 0;
     while n < buf.len() {
         let mut one = [0u8; 1];
-        let got = libsys::read(STDIN, &mut one).unwrap_or(0);
-        if got == 0 {
-            break; // 无可读数据
+        match libsys::read(STDIN, &mut one) {
+            Ok(got) if got == 1 => {
+                let c = one[0];
+                if c == b'\n' || c == b'\r' {
+                    break; // 行结束
+                }
+                // 回显 + 暂存
+                let _ = write(STDOUT, &one);
+                buf[n] = c;
+                n += 1;
+            }
+            Ok(_) => {
+                // 读到 0 字节：无更多数据，继续尝试。
+            }
+            Err(_) => {
+                // WouldBlock / 其它：键盘尚未就绪或缓冲空，让出 CPU 重试。
+                let _ = libsys::yield_now();
+            }
         }
-        let c = one[0];
-        if c == b'\n' {
-            break;
-        }
-        // 回显 + 暂存
-        let _ = write(STDOUT, &one);
-        if c == b'\r' {
-            continue;
-        }
-        buf[n] = c;
-        n += 1;
     }
     out(b"\n");
     n
