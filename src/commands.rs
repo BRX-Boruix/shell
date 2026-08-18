@@ -13,7 +13,7 @@ use libsys::signal::LIST;
 /// 列出全部内建命令。
 fn cmd_help() {
     out(
-        b"builtins: echo print println help now time uptime version uname cpu \
+        b"builtins: echo help now time uptime version uname cpu \
 sleep clear env export ps kill signal\n",
     );
 }
@@ -178,11 +178,9 @@ fn exec_echo(arg: &[u8]) {
 
 /// 执行一行输入。以 `;` 结尾可省略。空行/注释(`#`)跳过。
 ///
-/// 两类语句在此分流：
-/// 1. **函数调用语句**（`print(..)`/`println(..)`）：先由 `expr::try_exec_call`
-///    按 `name(expr)` 形式解析，参数是类型表达式，与命令无关；
-/// 2. **词式命令**（`echo`/`ps`/`kill`/`export`/…）：经 `tokenize_line` 分词并展开
-///    `$VAR`，首词为命令名，其余词以单空格重连成 `arg` 传给对应实现。
+/// 经 `tokenize_line` 按引号感知规则分词并展开 `$VAR`，首词为命令名，其余词
+/// 以单空格重连成 `arg` 传给对应实现（引号已在 `exec_echo` 处解析，故此处保留
+/// 引号字符）。
 pub(crate) fn exec_line(line: &[u8]) {
     let line = trim_bytes(line);
     if line.is_empty() || line.first() == Some(&b'#') {
@@ -194,12 +192,6 @@ pub(crate) fn exec_line(line: &[u8]) {
     } else {
         line
     };
-
-    // 函数调用语句（print(..)/println(..)）：与“词式命令”明确区分，先在此
-    // 尝试按 `name(expr)` 形式解析；命中则求值输出并结束，不进入命令分发。
-    if crate::expr::try_exec_call(line) {
-        return;
-    }
 
     let mut wbuf = [[0u8; WORD_CAP]; MAX_WORDS];
     let mut wlen = [0usize; MAX_WORDS];

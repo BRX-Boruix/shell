@@ -5,11 +5,9 @@
 //!
 //! 模块划分（按职责解耦，依赖单向无环）：
 //! - `util`    : 输出辅助与通用字节/文本工具
-//! - `num`     : 纯数值格式化与解析（被 `env`/`expr` 复用）
-//! - `env`     : 带类型变量表 + `export`/`env` 命令
-//! - `expr`    : 带类型表达式求值器 + `print`/`println`
+//! - `env`     : 纯字符串变量表 + `export`/`env` 命令
 //! - `tokenize`: 引号感知分词与 `$VAR` 展开
-//! - `commands`: 其余内建命令与命令分发
+//! - `commands`: 内建命令与命令分发
 //! - `main`    : 入口、REPL 循环、行读取
 
 #![no_std]
@@ -17,8 +15,6 @@
 
 mod commands;
 mod env;
-mod expr;
-mod num;
 mod tokenize;
 mod util;
 
