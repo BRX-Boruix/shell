@@ -99,22 +99,23 @@ fn string_content(s: &[u8]) -> Option<&[u8]> {
     None
 }
 
-// ---------- 算术表达式求值 ----------
+// ---------- 带类型表达式求值（print/println 专用迷你语言） ----------
+//
+// 语言：整数 / 浮点字面量、双引号字符串字面量、`$ident` 变量引用、括号，
+// 运算符 `+ - * /`（左结合）。`+` 若任一操作数为字符串则做拼接，否则数值加；
+// `- * /` 仅数值，字符串参与报类型错。
 
-/// 简单的递归下降解析器：支持整数 + `+ - * /`（左结合）+ 括号 + 一元负号 + 空格。
-struct Expr<'a> {
-    s: &'a [u8],
-    pos: usize,
-}
-
-/// 表达式求值错误类型（用于向用户输出友好错误，而非笼统的 "bad expression"）。
+/// 表达式求值错误类型（友好消息，而非笼统的 "bad expression"）。
 #[derive(Clone, Copy)]
 enum EvalErr {
-    Empty,     // 表达式为空（如 `print()`）
-    BadNumber, // 操作数不是合法整数
-    DivZero,   // 除以零
-    BadParen,  // 括号不匹配 / 缺少右括号
-    Trailing,  // 表达式后有多余字符
+    Empty,         // 表达式为空（如 `print()`）
+    BadNumber,     // 整数 / 数字字面量非法或溢出
+    BadFloat,      // 浮点字面量非法
+    DivZero,       // 除以零
+    BadParen,      // 括号不匹配 / 字符串未闭合
+    Trailing,      // 表达式后有多余字符
+    TypeMismatch,  // 对非数值类型使用了 - * / 等
+    BadEscape,     // 字符串转义非法
 }
 
 impl EvalErr {
@@ -123,14 +124,167 @@ impl EvalErr {
         match self {
             EvalErr::Empty => b"boruix: empty expression",
             EvalErr::BadNumber => b"boruix: invalid number in expression",
+            EvalErr::BadFloat => b"boruix: invalid number in expression",
             EvalErr::DivZero => b"boruix: division by zero",
             EvalErr::BadParen => b"boruix: mismatched parentheses",
             EvalErr::Trailing => b"boruix: unexpected trailing characters",
+            EvalErr::TypeMismatch => b"boruix: type mismatch (string used in arithmetic)",
+            EvalErr::BadEscape => b"boruix: invalid escape in string",
         }
     }
 }
 
-impl<'a> Expr<'a> {
+/// 表达式值（带类型）。字符串用定长缓冲（无 alloc）。
+const VAL_CAP: usize = 64;
+struct Val {
+    ty: u8, // 0=str 1=i64 2=f64
+    sbuf: [u8; VAL_CAP],
+    slen: usize,
+    i: i64,
+    f: f64,
+}
+
+impl Val {
+    fn str_(bytes: &[u8]) -> Val {
+        let mut sbuf = [0u8; VAL_CAP];
+        let l = bytes.len().min(VAL_CAP);
+        sbuf[..l].copy_from_slice(&bytes[..l]);
+        Val { ty: 0, sbuf, slen: l, i: 0, f: 0.0 }
+    }
+    fn i64_(v: i64) -> Val {
+        Val { ty: 1, sbuf: [0; VAL_CAP], slen: 0, i: v, f: 0.0 }
+    }
+    fn f64_(v: f64) -> Val {
+        Val { ty: 2, sbuf: [0; VAL_CAP], slen: 0, i: 0, f: v }
+    }
+    fn is_str(&self) -> bool {
+        self.ty == 0
+    }
+    /// 渲染为文本写入 `dst`，返回长度。
+    fn render(&self, dst: &mut [u8]) -> usize {
+        match self.ty {
+            0 => {
+                let mut o = 0;
+                for k in 0..self.slen {
+                    if o < dst.len() {
+                        dst[o] = self.sbuf[k];
+                        o += 1;
+                    }
+                }
+                o
+            }
+            1 => {
+                let mut buf = [0u8; 24];
+                let s = i64_to_dec(self.i, &mut buf);
+                let mut o = 0;
+                for &c in s {
+                    if o < dst.len() {
+                        dst[o] = c;
+                        o += 1;
+                    }
+                }
+                o
+            }
+            _ => {
+                let mut buf = [0u8; 32];
+                let s = f64_to_text(self.f, &mut buf);
+                let mut o = 0;
+                for &c in s {
+                    if o < dst.len() {
+                        dst[o] = c;
+                        o += 1;
+                    }
+                }
+                o
+            }
+        }
+    }
+}
+
+/// 变量名 → 带类型值（缺失 → 空字符串）。
+fn var_val(name: &[u8]) -> Val {
+    match env_get_kind(name) {
+        Some((EnvTy::Str, raw)) => Val::str_(raw),
+        Some((EnvTy::I64, raw)) if raw.len() >= 8 => {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&raw[..8]);
+            Val::i64_(i64::from_le_bytes(b))
+        }
+        Some((EnvTy::F64, raw)) if raw.len() >= 8 => {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&raw[..8]);
+            Val::f64_(f64::from_le_bytes(b))
+        }
+        _ => Val::str_(b""),
+    }
+}
+
+/// 一元负号（仅数值；字符串 → 类型错）。
+fn neg_val(v: Val) -> Result<Val, EvalErr> {
+    match v.ty {
+        1 => Ok(Val::i64_(-v.i)),
+        2 => Ok(Val::f64_(-v.f)),
+        _ => Err(EvalErr::TypeMismatch),
+    }
+}
+
+/// `+`：任一为字符串 → 拼接；否则数值加（混合 i64/f64 提升为 f64）。
+fn apply_add(a: Val, b: Val) -> Result<Val, EvalErr> {
+    if a.is_str() || b.is_str() {
+        let mut buf = [0u8; VAL_CAP * 2];
+        let mut o = a.render(&mut buf);
+        o += b.render(&mut buf[o..]);
+        Ok(Val::str_(&buf[..o.min(VAL_CAP)]))
+    } else {
+        apply_arith(a, b, b'+')
+    }
+}
+
+/// 数值二元运算（`- * /`；`+` 也走此路径做数值加）。字符串参与 → 类型错。
+fn apply_arith(a: Val, b: Val, op: u8) -> Result<Val, EvalErr> {
+    if a.is_str() || b.is_str() {
+        return Err(EvalErr::TypeMismatch);
+    }
+    if a.ty == 2 || b.ty == 2 {
+        let x = if a.ty == 2 { a.f } else { a.i as f64 };
+        let y = if b.ty == 2 { b.f } else { b.i as f64 };
+        let r = match op {
+            b'-' => x - y,
+            b'*' => x * y,
+            b'/' => {
+                if y == 0.0 {
+                    return Err(EvalErr::DivZero);
+                }
+                x / y
+            }
+            _ => x + y,
+        };
+        Ok(Val::f64_(r))
+    } else {
+        let x = a.i;
+        let y = b.i;
+        let r = match op {
+            b'-' => x.checked_sub(y).ok_or(EvalErr::BadNumber)?,
+            b'*' => x.checked_mul(y).ok_or(EvalErr::BadNumber)?,
+            b'/' => {
+                if y == 0 {
+                    return Err(EvalErr::DivZero);
+                }
+                x / y
+            }
+            _ => x.checked_add(y).ok_or(EvalErr::BadNumber)?,
+        };
+        Ok(Val::i64_(r))
+    }
+}
+
+/// 递归下降求值器。
+struct Ev<'a> {
+    s: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Ev<'a> {
     fn new(s: &'a [u8]) -> Self {
         Self { s, pos: 0 }
     }
@@ -152,50 +306,40 @@ impl<'a> Expr<'a> {
     }
 
     /// `expr := term (('+'|'-') term)*`
-    fn parse_expr(&mut self) -> Result<i64, EvalErr> {
-        let mut v = self.parse_term()?;
+    fn parse_expr(&mut self) -> Result<Val, EvalErr> {
+        let mut left = self.parse_term()?;
         loop {
             if self.eat(b'+') {
-                v = v
-                    .checked_add(self.parse_term()?)
-                    .ok_or(EvalErr::BadNumber)?;
+                left = apply_add(left, self.parse_term()?)?;
             } else if self.eat(b'-') {
-                v = v
-                    .checked_sub(self.parse_term()?)
-                    .ok_or(EvalErr::BadNumber)?;
+                left = apply_arith(left, self.parse_term()?, b'-')?;
             } else {
                 break;
             }
         }
-        Ok(v)
+        Ok(left)
     }
 
     /// `term := factor (('*'|'/') factor)*`
-    fn parse_term(&mut self) -> Result<i64, EvalErr> {
-        let mut v = self.parse_factor()?;
+    fn parse_term(&mut self) -> Result<Val, EvalErr> {
+        let mut left = self.parse_factor()?;
         loop {
             if self.eat(b'*') {
-                v = v
-                    .checked_mul(self.parse_factor()?)
-                    .ok_or(EvalErr::BadNumber)?;
+                left = apply_arith(left, self.parse_factor()?, b'*')?;
             } else if self.eat(b'/') {
-                let d = self.parse_factor()?;
-                if d == 0 {
-                    return Err(EvalErr::DivZero);
-                }
-                v = v / d;
+                left = apply_arith(left, self.parse_factor()?, b'/')?;
             } else {
                 break;
             }
         }
-        Ok(v)
+        Ok(left)
     }
 
-    /// `factor := NUMBER | '(' expr ')' | '-' factor | '+' factor`
-    fn parse_factor(&mut self) -> Result<i64, EvalErr> {
+    /// `factor := '-' factor | '+' factor | '(' expr ')' | STRING | $ident | NUMBER`
+    fn parse_factor(&mut self) -> Result<Val, EvalErr> {
         self.skip_ws();
         if self.eat(b'-') {
-            return Ok(-self.parse_factor()?);
+            return neg_val(self.parse_factor()?);
         }
         if self.eat(b'+') {
             return self.parse_factor();
@@ -207,27 +351,111 @@ impl<'a> Expr<'a> {
             }
             return Ok(v);
         }
-        // 数字
+        // 字符串字面量 `"..."`
+        if self.s.get(self.pos) == Some(&b'"') {
+            return self.parse_string();
+        }
+        // 变量引用 `$ident`
+        if self.s.get(self.pos) == Some(&b'$')
+            && self.pos + 1 < self.s.len()
+            && (self.s[self.pos + 1].is_ascii_alphanumeric() || self.s[self.pos + 1] == b'_')
+        {
+            let s = self.pos + 1;
+            let mut e = s;
+            while e < self.s.len() && (self.s[e].is_ascii_alphanumeric() || self.s[e] == b'_') {
+                e += 1;
+            }
+            let name = &self.s[s..e];
+            self.pos = e;
+            return Ok(var_val(name));
+        }
+        // 数字字面量（整数或浮点）
+        self.parse_number()
+    }
+
+    /// 解析双引号字符串（支持 `\\ \n \t \r \0 \"` 转义）。
+    fn parse_string(&mut self) -> Result<Val, EvalErr> {
+        self.pos += 1; // 跳过开引号
+        let mut sbuf = [0u8; VAL_CAP];
+        let mut slen = 0usize;
+        while self.pos < self.s.len() {
+            let c = self.s[self.pos];
+            if c == b'"' {
+                self.pos += 1;
+                return Ok(Val::str_(&sbuf[..slen]));
+            }
+            if c == b'\\' && self.pos + 1 < self.s.len() {
+                let nxt = self.s[self.pos + 1];
+                let e = match nxt {
+                    b'n' => b'\n',
+                    b't' => b'\t',
+                    b'r' => b'\r',
+                    b'0' => b'\0',
+                    b'\\' => b'\\',
+                    b'"' => b'"',
+                    _ => return Err(EvalErr::BadEscape),
+                };
+                if slen < VAL_CAP {
+                    sbuf[slen] = e;
+                    slen += 1;
+                }
+                self.pos += 2;
+            } else {
+                if slen < VAL_CAP {
+                    sbuf[slen] = c;
+                    slen += 1;
+                }
+                self.pos += 1;
+            }
+        }
+        Err(EvalErr::BadParen) // 未闭合引号
+    }
+
+    /// 解析数字字面量：整数（溢出降级 f64）/ 浮点。
+    fn parse_number(&mut self) -> Result<Val, EvalErr> {
         self.skip_ws();
         let start = self.pos;
         let mut is_digit = false;
-        while self.pos < self.s.len() && self.s[self.pos].is_ascii_digit() {
-            is_digit = true;
-            self.pos += 1;
+        let mut has_dot = false;
+        while self.pos < self.s.len() {
+            let c = self.s[self.pos];
+            if c.is_ascii_digit() {
+                is_digit = true;
+                self.pos += 1;
+            } else if c == b'.' && !has_dot {
+                has_dot = true;
+                self.pos += 1;
+            } else {
+                break;
+            }
         }
         if !is_digit {
             return Err(EvalErr::BadNumber);
         }
-        let txt = core::str::from_utf8(&self.s[start..self.pos]).map_err(|_| EvalErr::BadNumber)?;
-        txt.parse::<i64>().map_err(|_| EvalErr::BadNumber)
+        let txt = &self.s[start..self.pos];
+        if has_dot {
+            match parse_f64(txt) {
+                Some(v) => Ok(Val::f64_(v)),
+                None => Err(EvalErr::BadFloat),
+            }
+        } else {
+            let st = core::str::from_utf8(txt).map_err(|_| EvalErr::BadNumber)?;
+            match st.parse::<i64>() {
+                Ok(v) => Ok(Val::i64_(v)),
+                Err(_) => match parse_f64(txt) {
+                    Some(v) => Ok(Val::f64_(v)),
+                    None => Err(EvalErr::BadNumber),
+                },
+            }
+        }
     }
 
     /// 解析整个表达式，要求全部消费（无尾随垃圾）。
-    fn evaluate(src: &[u8]) -> Result<i64, EvalErr> {
+    fn evaluate(src: &[u8]) -> Result<Val, EvalErr> {
         if trim_bytes(src).is_empty() {
             return Err(EvalErr::Empty);
         }
-        let mut p = Expr::new(src);
+        let mut p = Ev::new(src);
         let v = p.parse_expr()?;
         p.skip_ws();
         if p.pos == p.s.len() {
@@ -266,6 +494,159 @@ fn i64_to_dec(v: i64, buf: &mut [u8; 24]) -> &[u8] {
     &buf[..j]
 }
 
+/// 把 `i64` 的小端 8 字节写入 `dst`，返回写入长度（用于 `:i64` 变量存储）。
+fn i64_to_le(v: i64, dst: &mut [u8; ENV_VAL]) -> usize {
+    let b = v.to_le_bytes();
+    dst[..8].copy_from_slice(&b);
+    8
+}
+
+/// 把 `f64` 的位模式小端 8 字节写入 `dst`，返回写入长度（用于 `:f64` 变量存储）。
+fn f64_to_le(v: f64, dst: &mut [u8; ENV_VAL]) -> usize {
+    let b = v.to_bits().to_le_bytes();
+    dst[..8].copy_from_slice(&b);
+    8
+}
+
+/// 解析十进制有符号整数（ASCII，忽略首尾空白）。失败返回 `None`。
+fn parse_i64(s: &[u8]) -> Option<i64> {
+    let s = trim_bytes(s);
+    if s.is_empty() {
+        return None;
+    }
+    core::str::from_utf8(s).ok()?.parse::<i64>().ok()
+}
+
+/// 解析十进制浮点字面量（可选符号 + 整数 + 可选小数；不含指数）。失败返回 `None`。
+fn parse_f64(s: &[u8]) -> Option<f64> {
+    let s = trim_bytes(s);
+    if s.is_empty() {
+        return None;
+    }
+    let mut i = 0;
+    let mut negative = false;
+    if s[i] == b'+' {
+        i += 1;
+    } else if s[i] == b'-' {
+        negative = true;
+        i += 1;
+    }
+    let mut int_part: u64 = 0;
+    let mut has_digit = false;
+    while i < s.len() && s[i].is_ascii_digit() {
+        int_part = int_part.wrapping_mul(10).wrapping_add((s[i] - b'0') as u64);
+        has_digit = true;
+        i += 1;
+    }
+    let mut frac_part: u64 = 0;
+    let mut frac_scale: u64 = 1;
+    if i < s.len() && s[i] == b'.' {
+        i += 1;
+        while i < s.len() && s[i].is_ascii_digit() {
+            if frac_scale < 1_000_000_000 {
+                frac_part = frac_part * 10 + (s[i] - b'0') as u64;
+                frac_scale *= 10;
+            }
+            has_digit = true;
+            i += 1;
+        }
+    }
+    if !has_digit || i != s.len() {
+        return None;
+    }
+    let mut v = int_part as f64;
+    if frac_scale > 1 {
+        v += (frac_part as f64) / (frac_scale as f64);
+    }
+    if negative {
+        v = -v;
+    }
+    Some(v)
+}
+
+/// 向下取整（no_std 下 `f64::floor` 未必可用，手写实现）。
+fn ffloor(v: f64) -> f64 {
+    let t = v as i64;
+    let tf = t as f64;
+    if tf <= v {
+        tf
+    } else {
+        tf - 1.0
+    }
+}
+
+/// 把 `f64` 格式化为十进制文本（最多 6 位小数、去尾零），写入 `buf`，返回有效长度。
+fn f64_to_text(v: f64, buf: &mut [u8; 32]) -> &[u8] {
+    if v.is_nan() {
+        return b"nan";
+    }
+    if v.is_infinite() {
+        return if v < 0.0 { b"-inf" } else { b"inf" };
+    }
+    let negative = v < 0.0;
+    let av = v.abs();
+    let int_part = ffloor(av) as u64;
+    let frac = av - ffloor(av);
+    let mut tmp = [0u8; 32];
+    let mut i = 0;
+    if int_part == 0 {
+        tmp[i] = b'0';
+        i += 1;
+    } else {
+        let mut n = int_part;
+        let mut t = [0u8; 24];
+        let mut ti = 0;
+        while n > 0 {
+            t[ti] = b'0' + (n % 10) as u8;
+            n /= 10;
+            ti += 1;
+        }
+        while ti > 0 {
+            ti -= 1;
+            tmp[i] = t[ti];
+            i += 1;
+        }
+    }
+    // 小数部分（最多 6 位，去尾零）
+    let mut dig = [0u8; 8];
+    let mut nd = 0;
+    let mut f = frac;
+    for _ in 0..6 {
+        if f == 0.0 {
+            break;
+        }
+        f *= 10.0;
+        dig[nd] = b'0' + ffloor(f) as u8;
+        nd += 1;
+        f -= ffloor(f);
+    }
+    while nd > 0 && dig[nd - 1] == b'0' {
+        nd -= 1;
+    }
+    let mut j = 0;
+    if negative {
+        buf[j] = b'-';
+        j += 1;
+    }
+    let mut k = 0;
+    while k < i {
+        buf[j] = tmp[k];
+        j += 1;
+        k += 1;
+    }
+    if nd > 0 {
+        buf[j] = b'.';
+        j += 1;
+        let mut m = 0;
+        while m < nd {
+            buf[j] = dig[m];
+            j += 1;
+            m += 1;
+        }
+    }
+    &buf[..j]
+}
+
 // ---------- 命令执行 ----------
 
 /// 执行 `echo <文本>`：输出一行。支持双引号字符串与转义。
@@ -280,8 +661,9 @@ fn exec_echo(arg: &[u8]) {
     }
 }
 
-/// 执行 `print(...)` / `println(...)`：参数为字符串字面量则原样输出（含转义），
-/// 否则作表达式求值。`newline=true`（`println`）时在末尾追加换行。
+/// 执行 `print(...)` / `println(...)`：把参数当作**带类型表达式**求值（字符串 /
+/// i64 / f64，`$ident` 按带类型变量引用解析），渲染后输出。`newline=true`
+/// （`println`）时在末尾追加换行。表达式非法时输出对应友好错误。
 fn exec_print(arg: &[u8], newline: bool) {
     let s = trim_bytes(arg);
     // 去掉外层括号
@@ -291,73 +673,87 @@ fn exec_print(arg: &[u8], newline: bool) {
         s
     };
 
-    if let Some(content) = string_content(inner) {
-        let mut buf = [0u8; 256];
-        let n = unescape(content, &mut buf);
-        out(&buf[..n]);
-        if newline {
-            out(b"\n");
-        }
-    } else {
-        match Expr::evaluate(inner) {
-            Ok(v) => {
-                let mut buf = [0u8; 24];
-                let s = i64_to_dec(v, &mut buf);
-                out(s);
-                if newline {
-                    out(b"\n");
-                }
-            }
-            Err(e) => {
-                out(e.message());
+    match Ev::evaluate(inner) {
+        Ok(v) => {
+            let mut buf = [0u8; 256];
+            let n = v.render(&mut buf);
+            out(&buf[..n]);
+            if newline {
                 out(b"\n");
             }
+        }
+        Err(e) => {
+            out(e.message());
+            out(b"\n");
         }
     }
 }
 
-// ---------- 环境变量（固定大小静态表，无 alloc） ----------
+// ---------- 环境变量（带类型的名字绑定，UNIX 超集） ----------
+//
+// 设计（讨论决定）：默认 `export X=文本` 永远是字符串（向后兼容 UNIX 语义）；
+// 可选 `:i64` / `:f64` / `:str` 注解声明类型。`print`/`println` 内的 `$ident`
+// 按"带类型变量引用"解析（求值器直接查 ENV 表），故 `+` 能按操作数类型在
+// "数值加 / 字符串拼接"间重载；命令行（echo/命令参数）的 `$VAR` 仍是文本形态替换。
 
 const MAX_ENV: usize = 32;
 const ENV_NAME: usize = 24;
 const ENV_VAL: usize = 64;
 
-/// 环境变量表：`(name, value, used)`。shell 单进程单线程裸机程序，用静态数组。
-static mut ENV_TABLE: [([u8; ENV_NAME], [u8; ENV_VAL], bool); MAX_ENV] =
-    [([0u8; ENV_NAME], [0u8; ENV_VAL], false); MAX_ENV];
+/// 变量类型标签（与存储布局一致）。
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnvTy {
+    Str = 0,
+    I64 = 1,
+    F64 = 2,
+}
+
+/// 环境变量表：`(name, value-bytes, ty, used)`。
+/// `Str` 的 value 为 UTF-8 原文；`I64`/`F64` 的 value 为 8 字节小端二进制。
+/// shell 单进程单线程裸机程序，用静态数组（无 alloc）。
+static mut ENV_TABLE: [([u8; ENV_NAME], [u8; ENV_VAL], u8, bool); MAX_ENV] =
+    [([0u8; ENV_NAME], [0u8; ENV_VAL], 0, false); MAX_ENV];
 static mut ENV_COUNT: usize = 0;
 
-/// 查找环境变量值（返回切片，不含结尾 0）。
-fn env_get(name: &[u8]) -> Option<&'static [u8]> {
+/// 按名字查找变量，返回 `(ty, 存储字节切片)`。
+fn env_get_kind(name: &[u8]) -> Option<(EnvTy, &'static [u8])> {
     unsafe {
         for i in 0..ENV_COUNT {
-            let (n, v, used) = &ENV_TABLE[i];
+            let (n, v, ty, used) = &ENV_TABLE[i];
             if *used && n[..name.len()] == *name && n[name.len()..].iter().all(|&b| b == 0) {
                 let mut len = 0;
                 while len < ENV_VAL && v[len] != 0 {
                     len += 1;
                 }
-                return Some(&v[..len]);
+                let t = match *ty {
+                    1 => EnvTy::I64,
+                    2 => EnvTy::F64,
+                    _ => EnvTy::Str,
+                };
+                return Some((t, &v[..len]));
             }
         }
     }
     None
 }
 
-/// 设置/覆盖环境变量。
-fn env_set(name: &[u8], val: &[u8]) {
+/// 设置/覆盖变量（带类型）。`val` 语义随 `ty`：Str 原样存 UTF-8；I64/F64 此处
+/// `val` 已是 8 字节小端二进制（由调用方解析好）。
+fn env_set_typed(name: &[u8], ty: EnvTy, val: &[u8]) {
     if name.is_empty() || name.len() > ENV_NAME {
         return;
     }
+    let vlen = val.len().min(ENV_VAL);
     unsafe {
         for i in 0..ENV_COUNT {
-            let (n, v, used) = &mut ENV_TABLE[i];
+            let (n, v, vt, used) = &mut ENV_TABLE[i];
             if *used && n[..name.len()] == *name && n[name.len()..].iter().all(|&b| b == 0) {
-                let l = val.len().min(ENV_VAL);
-                v[..l].copy_from_slice(&val[..l]);
-                for x in &mut v[l..] {
+                v[..vlen].copy_from_slice(&val[..vlen]);
+                for x in &mut v[vlen..] {
                     *x = 0;
                 }
+                *vt = ty as u8;
                 return;
             }
         }
@@ -370,14 +766,63 @@ fn env_set(name: &[u8], val: &[u8]) {
         for x in &mut ENV_TABLE[i].0[l..] {
             *x = 0;
         }
-        let l = val.len().min(ENV_VAL);
-        ENV_TABLE[i].1[..l].copy_from_slice(&val[..l]);
-        for x in &mut ENV_TABLE[i].1[l..] {
+        ENV_TABLE[i].1[..vlen].copy_from_slice(&val[..vlen]);
+        for x in &mut ENV_TABLE[i].1[vlen..] {
             *x = 0;
         }
-        ENV_TABLE[i].2 = true;
+        ENV_TABLE[i].2 = ty as u8;
+        ENV_TABLE[i].3 = true;
         ENV_COUNT += 1;
     }
+}
+
+/// 把变量渲染成文本形态写入 `dst`，返回有效长度。用于命令行 `$VAR` 文本替换；
+/// 缺失则写入空（替换为空串）。Str→原文；I64→十进制；F64→十进制（≤6 位小数）。
+fn env_render(name: &[u8], dst: &mut [u8]) -> usize {
+    let mut o = 0usize;
+    if let Some((ty, raw)) = env_get_kind(name) {
+        match ty {
+            EnvTy::Str => {
+                for &b in raw {
+                    if o < dst.len() {
+                        dst[o] = b;
+                        o += 1;
+                    }
+                }
+            }
+            EnvTy::I64 => {
+                if raw.len() >= 8 {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&raw[..8]);
+                    let v = i64::from_le_bytes(b);
+                    let mut buf = [0u8; 24];
+                    let s = i64_to_dec(v, &mut buf);
+                    for &c in s {
+                        if o < dst.len() {
+                            dst[o] = c;
+                            o += 1;
+                        }
+                    }
+                }
+            }
+            EnvTy::F64 => {
+                if raw.len() >= 8 {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&raw[..8]);
+                    let v = f64::from_le_bytes(b);
+                    let mut buf = [0u8; 32];
+                    let s = f64_to_text(v, &mut buf);
+                    for &c in s {
+                        if o < dst.len() {
+                            dst[o] = c;
+                            o += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    o
 }
 
 /// 单条命令最多参数词数（含命令名）。
@@ -418,14 +863,14 @@ fn tokenize_line(
         *wl = 0;
     };
 
-    // 把一个 `$VAR` 标识符（已定位 `[s, e)`）的展开值追加到当前词。
+    // 把一个 `$VAR` 标识符（已定位 `[s, e)`）的文本形态追加到当前词。
     let mut expand_at = |line: &[u8], s: usize, e: usize, word: &mut [u8; WORD_CAP], wl: &mut usize| {
-        if let Some(val) = env_get(&line[s..e]) {
-            for &b in val {
-                if *wl < WORD_CAP {
-                    word[*wl] = b;
-                    *wl += 1;
-                }
+        let mut tmp = [0u8; 64];
+        let n = env_render(&line[s..e], &mut tmp);
+        for k in 0..n {
+            if *wl < WORD_CAP {
+                word[*wl] = tmp[k];
+                *wl += 1;
             }
         }
     };
@@ -602,11 +1047,11 @@ fn cmd_sleep(arg: &[u8]) {
     }
 }
 
-/// `env`：列出全部环境变量。
+/// `env`：列出全部环境变量（`name[:TYPE]=value`；非字符串类型显示类型标注）。
 fn cmd_env() {
     unsafe {
         for i in 0..ENV_COUNT {
-            let (n, v, used) = &ENV_TABLE[i];
+            let (n, _v, ty, used) = &ENV_TABLE[i];
             if !*used {
                 continue;
             }
@@ -615,24 +1060,43 @@ fn cmd_env() {
                 nl += 1;
             }
             out(&n[..nl]);
-            out(b"=");
-            let mut vl = 0;
-            while vl < ENV_VAL && v[vl] != 0 {
-                vl += 1;
+            match *ty {
+                1 => out(b":i64"),
+                2 => out(b":f64"),
+                _ => {}
             }
-            out(&v[..vl]);
+            out(b"=");
+            let mut buf = [0u8; 80];
+            let o = env_render(&n[..nl], &mut buf);
+            out(&buf[..o]);
             out(b"\n");
         }
     }
 }
 
-/// `export NAME=VALUE`：设置环境变量。`VALUE` 两端若带引号（`"` 或 `'`）则剥除，
-/// 使 `export A="a b"` 存的值为 `a b` 而非含引号原文。
+/// `export [NAME[:TYPE]=VALUE]`：设置变量。`TYPE` 可为 `i64` / `f64` / `str`
+/// （缺省 `str`，永远字符串，向后兼容）。`VALUE` 两端若带引号则剥除。
+/// `i64`/`f64` 要求值为合法数字，否则报错；未知类型名回退为字符串。
 fn cmd_export(arg: &[u8]) {
     let a = trim_bytes(arg);
-    if let Some(pos) = a.iter().position(|&c| c == b'=') {
-        let name = &a[..pos];
-        let mut val = &a[pos + 1..];
+    if let Some(eq) = a.iter().position(|&c| c == b'=') {
+        // 在 `=` 之前解析可选 `:TYPE`。
+        let head = &a[..eq];
+        let mut name = head;
+        let mut ty = EnvTy::Str;
+        if let Some(colon) = head.iter().position(|&c| c == b':') {
+            let ts = &head[colon + 1..];
+            if ts == b"i64" {
+                ty = EnvTy::I64;
+            } else if ts == b"f64" {
+                ty = EnvTy::F64;
+            } else if ts == b"str" {
+                ty = EnvTy::Str;
+            } else {
+                name = head; // 未知类型：整体当名字（无注解）
+            }
+        }
+        let mut val = &a[eq + 1..];
         // 剥除值两端成对引号。
         if val.len() >= 2 {
             let f = val.first().copied().unwrap();
@@ -645,9 +1109,39 @@ fn cmd_export(arg: &[u8]) {
             out(b"export: empty name\n");
             return;
         }
-        env_set(name, val);
+        // 按类型解析并存储。
+        match ty {
+            EnvTy::Str => {
+                let mut vbuf = [0u8; ENV_VAL];
+                let l = val.len().min(ENV_VAL);
+                vbuf[..l].copy_from_slice(&val[..l]);
+                env_set_typed(name, EnvTy::Str, &vbuf[..l]);
+            }
+            EnvTy::I64 => match parse_i64(val) {
+                Some(v) => {
+                    let mut vbuf = [0u8; ENV_VAL];
+                    let l = i64_to_le(v, &mut vbuf);
+                    env_set_typed(name, EnvTy::I64, &vbuf[..l]);
+                }
+                None => {
+                    out(b"export: value not i64\n");
+                    return;
+                }
+            },
+            EnvTy::F64 => match parse_f64(val) {
+                Some(v) => {
+                    let mut vbuf = [0u8; ENV_VAL];
+                    let l = f64_to_le(v, &mut vbuf);
+                    env_set_typed(name, EnvTy::F64, &vbuf[..l]);
+                }
+                None => {
+                    out(b"export: value not f64\n");
+                    return;
+                }
+            },
+        }
     } else {
-        out(b"export: usage: export NAME=VALUE\n");
+        out(b"export: usage: export [NAME[:TYPE]=VALUE]\n");
     }
 }
 
@@ -783,10 +1277,14 @@ fn exec_line(line: &[u8]) {
     }
     let arg = &argbuf[..al];
 
+    // print/println 使用命令名之后的“原始”剩余字节，交由类型求值器解析
+    // $ident（不在 tokenize 阶段预先展开），其余命令沿用已展开的 arg。
+    let rest = trim_bytes(&line[wlen[0]..]);
+
     match name {
         b"echo" => exec_echo(arg),
-        b"print" => exec_print(arg, false),
-        b"println" => exec_print(arg, true),
+        b"print" => exec_print(rest, false),
+        b"println" => exec_print(rest, true),
         b"help" => cmd_help(),
         b"now" | b"time" => cmd_now(),
         b"uptime" => cmd_uptime(),
