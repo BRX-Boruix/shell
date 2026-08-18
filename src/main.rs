@@ -62,26 +62,35 @@ fn repl_loop() {
     }
 }
 
-/// 重绘当前行：回到行首、清到行尾、重印提示符与缓冲内容。
-/// 用于历史回溯与补全后刷新显示（光标始终在行尾）。
-fn redraw(buf: &[u8], n: usize) {
-    out(b"\r"); // 回到列首
-    out(b"\x1b[K"); // 清除至行尾
-    prompt();
-    out(&buf[..n]);
-}
-
 /// 重绘当前行并把光标停在 `cursor` 列（`0..=n`，从行首算起的字节索引）。
-/// 当 `cursor < n` 时，输出完毕后用 `CSI D` 把光标左移相应列数。
-/// 用于中间插入/删除或光标左右移动后的精确刷新。
+///
+/// 用**软件光标**：光标所在格的字符以反色（`SGR 7`）渲染，确保它始终可见——
+/// 裸机方块硬件光标会盖住所在格的字形（数据仍在，只是看不见），反色后无论硬件
+/// 光标如何绘制都看得到光标位置。光标在行尾时渲染一个反色空格。
+///
+/// `cursor < n` 时再把硬件光标左移回该列（对不支持隐藏光标的终端兜底）。
 fn redraw_at(buf: &[u8], n: usize, cursor: usize) {
     out(b"\r"); // 回到列首
     out(b"\x1b[K"); // 清除至行尾
     prompt();
-    out(&buf[..n]);
+    // 光标左侧
+    if cursor > 0 {
+        out(&buf[..cursor]);
+    }
+    // 光标格（反色）
+    out(b"\x1b[7m");
     if cursor < n {
-        // 光标右移 (n-cursor) 列后再左移回 -> 等效于把光标放在第 cursor 列。
-        // 直接左移 (n-cursor)：
+        out(&buf[cursor..cursor + 1]);
+    } else {
+        out(b" "); // 行尾：反色空格作光标
+    }
+    out(b"\x1b[0m");
+    // 光标右侧
+    if cursor + 1 < n {
+        out(&buf[cursor + 1..n]);
+    }
+    // 兜底：把硬件光标也移到该列（对支持但不隐藏光标的终端）。
+    if cursor < n {
         let back = n - cursor;
         let mut seq = [0u8; 8];
         let mut i = 0;
@@ -163,7 +172,7 @@ fn history_prev(
         }
         buf[..len].copy_from_slice(&HIST[idx][..len]);
         *n = len;
-        redraw(buf, *n);
+        redraw_at(buf, *n, *n);
     }
 }
 
@@ -197,7 +206,7 @@ fn history_next(
             }
         }
     }
-    redraw(buf, *n);
+    redraw_at(buf, *n, *n);
 }
 
 /// Tab 补全：补全光标处（行尾）的当前词。
@@ -291,7 +300,7 @@ fn tab_complete(buf: &mut [u8], n: &mut usize) {
         buf[ws..ws + rl].copy_from_slice(&rb[..rl]);
         *n = ws + rl;
     }
-    redraw(buf, *n);
+    redraw_at(buf, *n, *n);
 
     // 多个候选：列出全部。
     if mcnt > 1 {
@@ -301,7 +310,7 @@ fn tab_complete(buf: &mut [u8], n: &mut usize) {
             out(b" ");
         }
         out(b"\n");
-        redraw(buf, *n);
+        redraw_at(buf, *n, *n);
     }
 }
 
@@ -314,6 +323,8 @@ fn tab_complete(buf: &mut [u8], n: &mut usize) {
 /// 插入与 `Backspace`/`Delete` 删除、`↑`/`↓` 历史回溯、`Tab` 补全；方向键/编辑键/F 键
 /// 输出的 ANSI 转义序列在此被识别或吞掉，不污染命令行。
 fn read_line(buf: &mut [u8]) -> usize {
+    // 隐藏硬件光标：改用软件反色光标（见 `redraw_at`），避免方块光标盖住字符。
+    out(b"\x1b[?25l");
     let mut n = 0; // 当前行长度
     let mut cur = 0; // 光标位置（0..=n，字节索引）
     let mut off: Option<usize> = None; // 历史回溯偏移（None=新鲜输入）
@@ -462,6 +473,7 @@ fn read_line(buf: &mut [u8]) -> usize {
         }
     }
     history_push(&buf[..n]);
+    out(b"\x1b[?25h"); // 恢复硬件光标（命令输出回到正常光标）
     out(b"\n");
     n
 }
