@@ -40,6 +40,10 @@ pub(crate) fn tokenize_line(
         *wl = 0;
     };
 
+    // 判断 `$` 后是否跟一个可展开的变量名（普通标识符或特殊 `?`）。
+    // POSIX：`$?` 是退出码伪变量；普通变量名首字符为字母/下划线。
+    let is_var_char = |c: u8| c == b'?' || c.is_ascii_alphanumeric() || c == b'_';
+
     // 把一个 `$VAR` 标识符（已定位 `[s, e)`）的文本形态追加到当前词。
     let mut expand_at = |line: &[u8], s: usize, e: usize, word: &mut [u8; WORD_CAP], wl: &mut usize| {
         let mut tmp = [0u8; 64];
@@ -71,7 +75,12 @@ pub(crate) fn tokenize_line(
                 let ch = line[i];
                 if do_expand && ch == b'$' && i + 1 < n {
                     let nxt = line[i + 1];
-                    if nxt.is_ascii_alphanumeric() || nxt == b'_' {
+                    if nxt == b'?' {
+                        // 特殊伪变量 $?（退出码）
+                        expand_at(line, i + 1, i + 2, &mut word, &mut wl);
+                        i += 2;
+                        continue;
+                    } else if is_var_char(nxt) && nxt != b'?' {
                         let s = i + 1;
                         let mut e = s;
                         while e < n && (line[e].is_ascii_alphanumeric() || line[e] == b'_') {
@@ -97,10 +106,14 @@ pub(crate) fn tokenize_line(
             }
             continue;
         }
-        // 未加引号的普通字符（含裸 `$VAR`）。
+        // 未加引号的普通字符（含裸 `$VAR` / `$?`）。
         if c == b'$' && i + 1 < n {
             let nxt = line[i + 1];
-            if nxt.is_ascii_alphanumeric() || nxt == b'_' {
+            if nxt == b'?' {
+                expand_at(line, i + 1, i + 2, &mut word, &mut wl);
+                i += 2;
+                continue;
+            } else if is_var_char(nxt) && nxt != b'?' {
                 let s = i + 1;
                 let mut e = s;
                 while e < n && (line[e].is_ascii_alphanumeric() || line[e] == b'_') {
