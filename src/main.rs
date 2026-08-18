@@ -21,7 +21,7 @@ mod util;
 use crate::commands::{command_names, exec_line};
 use crate::env::for_each_env_name;
 use crate::util::{out, outln, prompt};
-use libsys::{read, write, yield_now, STDOUT};
+use libsys::{read, yield_now};
 
 /// 标准输入文件描述符。
 const STDIN: u64 = 0;
@@ -69,6 +69,31 @@ fn redraw(buf: &[u8], n: usize) {
     out(b"\x1b[K"); // 清除至行尾
     prompt();
     out(&buf[..n]);
+}
+
+/// 重绘当前行并把光标停在 `cursor` 列（`0..=n`，从行首算起的字节索引）。
+/// 当 `cursor < n` 时，输出完毕后用 `CSI D` 把光标左移相应列数。
+/// 用于中间插入/删除或光标左右移动后的精确刷新。
+fn redraw_at(buf: &[u8], n: usize, cursor: usize) {
+    out(b"\r"); // 回到列首
+    out(b"\x1b[K"); // 清除至行尾
+    prompt();
+    out(&buf[..n]);
+    if cursor < n {
+        // 光标右移 (n-cursor) 列后再左移回 -> 等效于把光标放在第 cursor 列。
+        // 直接左移 (n-cursor)：
+        let back = n - cursor;
+        let mut seq = [0u8; 8];
+        let mut i = 0;
+        seq[i] = b'\x1b'; i += 1;
+        seq[i] = b'['; i += 1;
+        if back >= 10 {
+            seq[i] = b'0' + (back / 10) as u8; i += 1;
+        }
+        seq[i] = b'0' + (back % 10) as u8; i += 1;
+        seq[i] = b'D'; i += 1;
+        out(&seq[..i]);
+    }
 }
 
 /// 把一行压入历史（空行或与前一条重复则忽略）。
@@ -285,13 +310,16 @@ fn tab_complete(buf: &mut [u8], n: &mut usize) {
 /// 逐字符 `read(0, &1)`：内核键盘缓冲有字符则回显并暂存；空则返回
 /// `WouldBlock`（`Err`），此处先让出 CPU 再继续，避免忙等。
 ///
-/// 支持：退格（删除行尾字符）、`↑`/`↓` 历史回溯、Tab 补全；方向键/编辑键/F 键
+/// 支持完整行编辑：光标左右移动（`←`/`→`）、行首/行尾（`Home`/`End`）、在光标处
+/// 插入与 `Backspace`/`Delete` 删除、`↑`/`↓` 历史回溯、`Tab` 补全；方向键/编辑键/F 键
 /// 输出的 ANSI 转义序列在此被识别或吞掉，不污染命令行。
 fn read_line(buf: &mut [u8]) -> usize {
-    let mut n = 0;
+    let mut n = 0; // 当前行长度
+    let mut cur = 0; // 光标位置（0..=n，字节索引）
     let mut off: Option<usize> = None; // 历史回溯偏移（None=新鲜输入）
     let mut draft = [0u8; LINE_CAP];
     let mut draft_len = 0usize;
+    let mut csi_param: u8 = 0; // CSI 数字参数（Home/End/Delete 识别用）
     // 转义序列丢弃状态机：键盘驱动对方向键/编辑键/F 键输出 ANSI 序列（如 `↑`→
     // `\x1b[A`，Insert→`\x1b[2~`，F1→`\x1bOP`）。此处按状态机解析或吞掉。
     // 0=普通 1=已遇 ESC 2=CSI 参数/中间字节 3=SS3 单字节终结。
@@ -308,6 +336,7 @@ fn read_line(buf: &mut [u8]) -> usize {
                             // ESC 后：期待引导字节 '['(CSI) 或 'O'(SS3)。
                             if c == b'[' {
                                 esc_state = 2;
+                                csi_param = 0;
                             } else if c == b'O' {
                                 esc_state = 3;
                             } else {
@@ -315,12 +344,60 @@ fn read_line(buf: &mut [u8]) -> usize {
                             }
                         }
                         2 => {
-                            // CSI：终结字节(0x40..=0x7E)触发动作；参数/中间字节继续。
-                            if (0x40..=0x7E).contains(&c) {
+                            // CSI：参数/中间字节继续，终结字节(0x40..=0x7E)触发动作。
+                            if c.is_ascii_digit() {
+                                csi_param = c; // 仅取首个数字参数（1/3/4）
+                            } else if (0x40..=0x7E).contains(&c) {
                                 match c {
-                                    b'A' => history_prev(buf, &mut n, &mut off, &mut draft, &mut draft_len),
-                                    b'B' => history_next(buf, &mut n, &mut off, &mut draft, &mut draft_len),
-                                    _ => {} // ←/→/Home/End 等：暂忽略
+                                    b'A' => {
+                                        history_prev(buf, &mut n, &mut off, &mut draft, &mut draft_len);
+                                        cur = n; // 整行替换，光标置尾
+                                    }
+                                    b'B' => {
+                                        history_next(buf, &mut n, &mut off, &mut draft, &mut draft_len);
+                                        cur = n;
+                                    }
+                                    b'C' => {
+                                        if cur < n {
+                                            cur += 1;
+                                        }
+                                        redraw_at(buf, n, cur);
+                                    }
+                                    b'D' => {
+                                        if cur > 0 {
+                                            cur -= 1;
+                                        }
+                                        redraw_at(buf, n, cur);
+                                    }
+                                    b'H' => {
+                                        cur = 0;
+                                        redraw_at(buf, n, cur);
+                                    }
+                                    b'F' => {
+                                        cur = n;
+                                        redraw_at(buf, n, cur);
+                                    }
+                                    b'~' => {
+                                        // 数字参数：1=Home 3=Delete 4=End。
+                                        match csi_param {
+                                            b'1' => cur = 0,
+                                            b'4' => cur = n,
+                                            b'3' => {
+                                                if cur < n {
+                                                    // 删除光标处字符（左移）。
+                                                    let mut k = cur;
+                                                    while k + 1 < n {
+                                                        buf[k] = buf[k + 1];
+                                                        k += 1;
+                                                    }
+                                                    n -= 1;
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                        redraw_at(buf, n, cur);
+                                    }
+                                    _ => {}
                                 }
                                 esc_state = 0;
                             } else if !(0x20..=0x3F).contains(&c) {
@@ -342,23 +419,38 @@ fn read_line(buf: &mut [u8]) -> usize {
                 if c == 0x09 {
                     // Tab：补全当前词。
                     tab_complete(buf, &mut n);
+                    cur = n; // 补全发生在行尾，光标置尾
                     continue;
                 }
                 if c == b'\n' || c == b'\r' {
                     break; // 行结束
                 } else if c == 0x7F || c == 0x08 {
-                    // 退格（DEL 0x7F 或 BS 0x08）：删除上一个已输入字符，
-                    // 并向终端发送擦除序列（BS + 空格 + BS）刷新光标。
-                    if n > 0 {
+                    // 退格（DEL 0x7F 或 BS 0x08）：删除光标左侧字符。
+                    if cur > 0 {
+                        let mut k = cur - 1;
+                        while k + 1 < n {
+                            buf[k] = buf[k + 1];
+                            k += 1;
+                        }
                         n -= 1;
-                        out(b"\x08 \x08");
+                        cur -= 1;
+                        redraw_at(buf, n, cur);
                     }
-                } else {
-                    // 回显 + 暂存
-                    let _ = write(STDOUT, &one);
-                    buf[n] = c;
-                    n += 1;
+                } else if c >= 0x20 {
+                    // 可打印字符：在光标处插入。
+                    if n < buf.len() {
+                        let mut k = n;
+                        while k > cur {
+                            buf[k] = buf[k - 1];
+                            k -= 1;
+                        }
+                        buf[cur] = c;
+                        n += 1;
+                        cur += 1;
+                        redraw_at(buf, n, cur);
+                    }
                 }
+                // 其余控制字符（其它）忽略。
             }
             Ok(_) => {
                 // 读到 0 字节：无更多数据，继续尝试。
