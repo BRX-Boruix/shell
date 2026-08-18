@@ -80,15 +80,20 @@ fn unescape(src: &[u8], buf: &mut [u8]) -> usize {
     n
 }
 
-/// 提取双引号字符串的内容（去掉首尾引号）。找不到闭合引号返回 `None`。
+/// 提取引号字符串的内容（去掉首尾引号）。支持双引号 `"` 与单引号 `'`。
+/// 双引号内层支持 `\"` 转义；单引号内层为字面量（tok 已保证其内 `$` 不展开）。
+/// 找不到闭合引号返回 `None`。
 fn string_content(s: &[u8]) -> Option<&[u8]> {
     let s = trim_bytes(s);
-    if s.first() == Some(&b'"') {
-        // 找闭合引号
-        for i in 1..s.len() {
-            if s[i] == b'"' && s[i - 1] != b'\\' {
-                return Some(&s[1..i]);
-            }
+    let q = *s.first()?;
+    if q != b'"' && q != b'\'' {
+        return None;
+    }
+    // 找闭合引号（双引号支持 \" 转义）。
+    for i in 1..s.len() {
+        let c = s[i];
+        if c == q && s[i - 1] != b'\\' {
+            return Some(&s[1..i]);
         }
     }
     None
@@ -375,37 +380,123 @@ fn env_set(name: &[u8], val: &[u8]) {
     }
 }
 
-/// 把输入中的 `$NAME` 展开为环境变量值，写入 `dst`，返回有效长度。
-/// 非变量上下文的 `$` 原样保留；变量名含 `[A-Za-z0-9_]`。
-fn expand_vars(src: &[u8], dst: &mut [u8]) -> usize {
-    let mut o = 0usize;
+/// 单条命令最多参数词数（含命令名）。
+const MAX_WORDS: usize = 16;
+/// 单个词的最大字节数（与环境变量 VALUE 上限对齐）。
+const WORD_CAP: usize = 64;
+
+/// 把一行拆成词（尊重引号），并对每个词做 `$VAR` 展开。
+///
+/// 语义（贴近 POSIX shell）：
+/// - 空白（` ` / `\t`）分词；
+/// - 双引号 `"..."`：内部展开 `$VAR` 并去除引号，整体作为一个词；
+/// - 单引号 `'...'`：字面量，**不**展开 `$VAR`，整体作为一个词；
+/// - 引号可在词内拼接，如 `a"b"c` → `abc`；
+/// - 未加引号的 `$VAR` 仍展开，其值若含空白会参与下一次分词。
+///
+/// 词内容写入 `wbuf`（每项 `WORD_CAP` 字节）、长度写入 `wlen`，返回词数。
+/// 变量值经 `env_get` 取静态切片，缺失则该 `$VAR` 替换为空。
+fn tokenize_line(
+    line: &[u8],
+    wbuf: &mut [[u8; WORD_CAP]; MAX_WORDS],
+    wlen: &mut [usize; MAX_WORDS],
+) -> usize {
+    let mut nwords = 0usize;
+    let mut word = [0u8; WORD_CAP];
+    let mut wl = 0usize;
     let mut i = 0usize;
-    while i < src.len() && o < dst.len() {
-        if src[i] == b'$' && i + 1 < src.len() {
-            let c = src[i + 1];
-            if c.is_ascii_alphanumeric() || c == b'_' {
-                let start = i + 1;
-                let mut end = start;
-                while end < src.len() && (src[end].is_ascii_alphanumeric() || src[end] == b'_') {
-                    end += 1;
+    let n = line.len();
+
+    // 把当前正在累积的词提交到 wbuf（词非空且未满）。
+    let mut commit = |word: &[u8; WORD_CAP], wl: &mut usize, wbuf: &mut [[u8; WORD_CAP]; MAX_WORDS], wlen: &mut [usize; MAX_WORDS], nwords: &mut usize| {
+        if *wl > 0 && *nwords < MAX_WORDS {
+            let l = (*wl).min(WORD_CAP);
+            wbuf[*nwords][..l].copy_from_slice(&word[..l]);
+            wlen[*nwords] = l;
+            *nwords += 1;
+        }
+        *wl = 0;
+    };
+
+    // 把一个 `$VAR` 标识符（已定位 `[s, e)`）的展开值追加到当前词。
+    let mut expand_at = |line: &[u8], s: usize, e: usize, word: &mut [u8; WORD_CAP], wl: &mut usize| {
+        if let Some(val) = env_get(&line[s..e]) {
+            for &b in val {
+                if *wl < WORD_CAP {
+                    word[*wl] = b;
+                    *wl += 1;
                 }
-                if let Some(val) = env_get(&src[start..end]) {
-                    for &b in val {
-                        if o < dst.len() {
-                            dst[o] = b;
-                            o += 1;
+            }
+        }
+    };
+
+    while i < n {
+        let c = line[i];
+        if c == b' ' || c == b'\t' {
+            commit(&word, &mut wl, wbuf, wlen, &mut nwords);
+            i += 1;
+            continue;
+        }
+        if c == b'"' || c == b'\'' {
+            let q = c;
+            let do_expand = q == b'"'; // 单引号内不展开
+            if wl < WORD_CAP {
+                word[wl] = q; // 保留起始引号字符
+                wl += 1;
+            }
+            i += 1;
+            while i < n && line[i] != q {
+                let ch = line[i];
+                if do_expand && ch == b'$' && i + 1 < n {
+                    let nxt = line[i + 1];
+                    if nxt.is_ascii_alphanumeric() || nxt == b'_' {
+                        let s = i + 1;
+                        let mut e = s;
+                        while e < n && (line[e].is_ascii_alphanumeric() || line[e] == b'_') {
+                            e += 1;
                         }
+                        expand_at(line, s, e, &mut word, &mut wl);
+                        i = e;
+                        continue;
                     }
                 }
-                i = end;
+                if wl < WORD_CAP {
+                    word[wl] = ch;
+                    wl += 1;
+                }
+                i += 1;
+            }
+            if i < n {
+                if wl < WORD_CAP {
+                    word[wl] = q; // 保留闭合引号字符
+                    wl += 1;
+                }
+                i += 1; // 跳过闭合引号
+            }
+            continue;
+        }
+        // 未加引号的普通字符（含裸 `$VAR`）。
+        if c == b'$' && i + 1 < n {
+            let nxt = line[i + 1];
+            if nxt.is_ascii_alphanumeric() || nxt == b'_' {
+                let s = i + 1;
+                let mut e = s;
+                while e < n && (line[e].is_ascii_alphanumeric() || line[e] == b'_') {
+                    e += 1;
+                }
+                expand_at(line, s, e, &mut word, &mut wl);
+                i = e;
                 continue;
             }
         }
-        dst[o] = src[i];
-        o += 1;
+        if wl < WORD_CAP {
+            word[wl] = c;
+            wl += 1;
+        }
         i += 1;
     }
-    o
+    commit(&word, &mut wl, wbuf, wlen, &mut nwords);
+    nwords
 }
 
 /// 把 `u64` 格式化为十进制字节，写入 `buf`，返回有效长度。
@@ -535,12 +626,21 @@ fn cmd_env() {
     }
 }
 
-/// `export NAME=VALUE`：设置环境变量。
+/// `export NAME=VALUE`：设置环境变量。`VALUE` 两端若带引号（`"` 或 `'`）则剥除，
+/// 使 `export A="a b"` 存的值为 `a b` 而非含引号原文。
 fn cmd_export(arg: &[u8]) {
     let a = trim_bytes(arg);
     if let Some(pos) = a.iter().position(|&c| c == b'=') {
         let name = &a[..pos];
-        let val = &a[pos + 1..];
+        let mut val = &a[pos + 1..];
+        // 剥除值两端成对引号。
+        if val.len() >= 2 {
+            let f = val.first().copied().unwrap();
+            let l = val.last().copied().unwrap();
+            if (f == b'"' && l == b'"') || (f == b'\'' && l == b'\'') {
+                val = &val[1..val.len() - 1];
+            }
+        }
         if name.is_empty() {
             out(b"export: empty name\n");
             return;
@@ -642,14 +742,10 @@ fn cmd_kill(arg: &[u8]) {
 
 /// 执行一行命令。以 `;` 结尾可省略。空行/注释(`#`)跳过。
 ///
-/// 整行先做 `$VAR` 环境变量展开（`$`-后接 `[A-Za-z0-9_]` 即视为变量名），
-/// 再按首个空白/`(` 切出命令名与参数。
+/// 先经 `tokenize_line` 按引号感知规则分词并展开 `$VAR`，首词为命令名，其余词
+/// 以单空格重新连接成 `arg` 传给各命令（引号已在 `exec_echo`/`exec_print` 处解析，
+/// 故此处保留引号字符）。
 fn exec_line(line: &[u8]) {
-    // 环境变量展开缓冲（行最长 256）。
-    let mut exp = [0u8; 256];
-    let len = expand_vars(line, &mut exp);
-    let line = &exp[..len];
-
     let line = trim_bytes(line);
     if line.is_empty() || line.first() == Some(&b'#') {
         return;
@@ -661,13 +757,31 @@ fn exec_line(line: &[u8]) {
         line
     };
 
-    // 命令名：第一个空白或 '(' 前
-    let name_len = line
-        .iter()
-        .position(|&c| c == b' ' || c == b'\t' || c == b'(')
-        .unwrap_or(line.len());
-    let name = &line[..name_len];
-    let arg = &line[name_len..];
+    let mut wbuf = [[0u8; WORD_CAP]; MAX_WORDS];
+    let mut wlen = [0usize; MAX_WORDS];
+    let nw = tokenize_line(line, &mut wbuf, &mut wlen);
+    if nw == 0 {
+        return;
+    }
+    let name = &wbuf[0][..wlen[0]];
+
+    // 重建参数：剩余词以单空格连接（词内引号保留、VAR 已展开）。
+    let mut argbuf = [0u8; 256];
+    let mut al = 0usize;
+    for k in 1..nw {
+        if al > 0 && al < argbuf.len() {
+            argbuf[al] = b' ';
+            al += 1;
+        }
+        let w = &wbuf[k][..wlen[k]];
+        for &b in w {
+            if al < argbuf.len() {
+                argbuf[al] = b;
+                al += 1;
+            }
+        }
+    }
+    let arg = &argbuf[..al];
 
     match name {
         b"echo" => exec_echo(arg),
