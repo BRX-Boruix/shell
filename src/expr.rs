@@ -369,10 +369,13 @@ impl<'a> Ev<'a> {
     }
 }
 
-/// 执行 `print(...)` / `println(...)`：把参数当作**带类型表达式**求值（字符串 /
-/// i64 / f64，`$ident` 按带类型变量引用解析），渲染后输出。`newline=true`
-/// （`println`）时在末尾追加换行。表达式非法时输出对应友好错误。
-pub(crate) fn exec_print(arg: &[u8], newline: bool) {
+/// 求值并执行 `print(...)` / `println(...)`：把参数当作**带类型表达式**求值
+/// （字符串 / i64 / f64，`$ident` 按带类型变量引用解析），渲染后输出。
+/// `newline=true`（`println`）时在末尾追加换行。表达式非法时输出对应友好错误。
+///
+/// 这是"求值器能力"，不是命令；命令层 `cmd_print`/`cmd_println` 负责把它接进
+/// 统一命令分发（传入原始 `rest` 而非展开后的 `arg`）。
+pub(crate) fn eval_print(arg: &[u8], newline: bool) {
     let s = trim_bytes(arg);
     // 去掉外层括号
     let inner = if s.starts_with(b"(") && s.ends_with(b")") {

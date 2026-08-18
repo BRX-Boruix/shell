@@ -138,7 +138,7 @@ pub(crate) fn env_render(name: &[u8], dst: &mut [u8]) -> usize {
 }
 
 /// `env`：列出全部环境变量（`name[:TYPE]=value`；非字符串类型显示类型标注）。
-pub(crate) fn cmd_env() {
+pub(crate) fn cmd_env(_arg: &[u8], _rest: &[u8]) {
     unsafe {
         for i in 0..ENV_COUNT {
             let (n, _v, ty, used) = &ENV_TABLE[i];
@@ -167,7 +167,7 @@ pub(crate) fn cmd_env() {
 /// `export [NAME[:TYPE]=VALUE]`：设置变量。`TYPE` 可为 `i64` / `f64` / `str`
 /// （缺省 `str`，永远字符串，向后兼容）。`VALUE` 两端若带引号则剥除。
 /// `i64`/`f64` 要求值为合法数字，否则报错；未知类型名回退为字符串。
-pub(crate) fn cmd_export(arg: &[u8]) {
+pub(crate) fn cmd_export(arg: &[u8], _rest: &[u8]) {
     let a = crate::util::trim_bytes(arg);
     if let Some(eq) = a.iter().position(|&c| c == b'=') {
         // 在 `=` 之前解析可选 `:TYPE`。
