@@ -5,9 +5,12 @@
 //!
 //! 命令集：
 //! - `echo <文本>`：输出一行文本（支持双引号字符串与 `\n` 等转义）。
-//! - `print("字符串")`：输出字符串字面量（支持 `\n`/`\t`/`\\`/`\"` 转义）。
-//! - `print(<算术表达式>)`：解析并求值 `+ - * /` 四则运算（含括号、空格、
-//!   一元负号），输出十进制结果。
+//! - `print("字符串")` / `print(<算术表达式>)`：输出内容（不换行）。
+//!   字符串字面量支持 `\n`/`\t`/`\\`/`\"` 转义；表达式求值 `+ - * /` 四则运算
+//!   （含括号、空格、一元负号），输出十进制结果。
+//! - `println(...)`：同 `print(...)`，但在末尾追加换行。
+//! - 任意不可识别的命令名报 `boruix: unknown command: <名字>`；
+//!   表达式错误（空/非法数字/除零/括号不匹配/尾随字符）给出对应友好消息。
 
 #![no_std]
 #![no_main]
@@ -98,6 +101,29 @@ struct Expr<'a> {
     pos: usize,
 }
 
+/// 表达式求值错误类型（用于向用户输出友好错误，而非笼统的 "bad expression"）。
+#[derive(Clone, Copy)]
+enum EvalErr {
+    Empty,     // 表达式为空（如 `print()`）
+    BadNumber, // 操作数不是合法整数
+    DivZero,   // 除以零
+    BadParen,  // 括号不匹配 / 缺少右括号
+    Trailing,  // 表达式后有多余字符
+}
+
+impl EvalErr {
+    /// 友好错误消息（统一 `boruix:` 前缀，与未知命令报错风格一致）。
+    fn message(self) -> &'static [u8] {
+        match self {
+            EvalErr::Empty => b"boruix: empty expression",
+            EvalErr::BadNumber => b"boruix: invalid number in expression",
+            EvalErr::DivZero => b"boruix: division by zero",
+            EvalErr::BadParen => b"boruix: mismatched parentheses",
+            EvalErr::Trailing => b"boruix: unexpected trailing characters",
+        }
+    }
+}
+
 impl<'a> Expr<'a> {
     fn new(s: &'a [u8]) -> Self {
         Self { s, pos: 0 }
@@ -120,44 +146,50 @@ impl<'a> Expr<'a> {
     }
 
     /// `expr := term (('+'|'-') term)*`
-    fn parse_expr(&mut self) -> Option<i64> {
+    fn parse_expr(&mut self) -> Result<i64, EvalErr> {
         let mut v = self.parse_term()?;
         loop {
             if self.eat(b'+') {
-                v = v.checked_add(self.parse_term()?)?;
+                v = v
+                    .checked_add(self.parse_term()?)
+                    .ok_or(EvalErr::BadNumber)?;
             } else if self.eat(b'-') {
-                v = v.checked_sub(self.parse_term()?)?;
+                v = v
+                    .checked_sub(self.parse_term()?)
+                    .ok_or(EvalErr::BadNumber)?;
             } else {
                 break;
             }
         }
-        Some(v)
+        Ok(v)
     }
 
     /// `term := factor (('*'|'/') factor)*`
-    fn parse_term(&mut self) -> Option<i64> {
+    fn parse_term(&mut self) -> Result<i64, EvalErr> {
         let mut v = self.parse_factor()?;
         loop {
             if self.eat(b'*') {
-                v = v.checked_mul(self.parse_factor()?)?;
+                v = v
+                    .checked_mul(self.parse_factor()?)
+                    .ok_or(EvalErr::BadNumber)?;
             } else if self.eat(b'/') {
                 let d = self.parse_factor()?;
                 if d == 0 {
-                    return None; // 除零
+                    return Err(EvalErr::DivZero);
                 }
                 v = v / d;
             } else {
                 break;
             }
         }
-        Some(v)
+        Ok(v)
     }
 
     /// `factor := NUMBER | '(' expr ')' | '-' factor | '+' factor`
-    fn parse_factor(&mut self) -> Option<i64> {
+    fn parse_factor(&mut self) -> Result<i64, EvalErr> {
         self.skip_ws();
         if self.eat(b'-') {
-            return self.parse_factor().map(|v| -v);
+            return Ok(-self.parse_factor()?);
         }
         if self.eat(b'+') {
             return self.parse_factor();
@@ -165,9 +197,9 @@ impl<'a> Expr<'a> {
         if self.eat(b'(') {
             let v = self.parse_expr()?;
             if !self.eat(b')') {
-                return None; // 缺右括号
+                return Err(EvalErr::BadParen);
             }
-            return Some(v);
+            return Ok(v);
         }
         // 数字
         self.skip_ws();
@@ -178,21 +210,24 @@ impl<'a> Expr<'a> {
             self.pos += 1;
         }
         if !is_digit {
-            return None;
+            return Err(EvalErr::BadNumber);
         }
-        let txt = core::str::from_utf8(&self.s[start..self.pos]).ok()?;
-        txt.parse::<i64>().ok()
+        let txt = core::str::from_utf8(&self.s[start..self.pos]).map_err(|_| EvalErr::BadNumber)?;
+        txt.parse::<i64>().map_err(|_| EvalErr::BadNumber)
     }
 
     /// 解析整个表达式，要求全部消费（无尾随垃圾）。
-    fn evaluate(src: &[u8]) -> Option<i64> {
+    fn evaluate(src: &[u8]) -> Result<i64, EvalErr> {
+        if trim_bytes(src).is_empty() {
+            return Err(EvalErr::Empty);
+        }
         let mut p = Expr::new(src);
         let v = p.parse_expr()?;
         p.skip_ws();
         if p.pos == p.s.len() {
-            Some(v)
+            Ok(v)
         } else {
-            None
+            Err(EvalErr::Trailing)
         }
     }
 }
@@ -239,8 +274,9 @@ fn exec_echo(arg: &[u8]) {
     }
 }
 
-/// 执行 `print(参数)`：参数为字符串字面量则输出（含转义），否则作表达式求值。
-fn exec_print(arg: &[u8]) {
+/// 执行 `print(...)` / `println(...)`：参数为字符串字面量则原样输出（含转义），
+/// 否则作表达式求值。`newline=true`（`println`）时在末尾追加换行。
+fn exec_print(arg: &[u8], newline: bool) {
     let s = trim_bytes(arg);
     // 去掉外层括号
     let inner = if s.starts_with(b"(") && s.ends_with(b")") {
@@ -253,14 +289,23 @@ fn exec_print(arg: &[u8]) {
         let mut buf = [0u8; 256];
         let n = unescape(content, &mut buf);
         out(&buf[..n]);
+        if newline {
+            out(b"\n");
+        }
     } else {
         match Expr::evaluate(inner) {
-            Some(v) => {
+            Ok(v) => {
                 let mut buf = [0u8; 24];
                 let s = i64_to_dec(v, &mut buf);
                 out(s);
+                if newline {
+                    out(b"\n");
+                }
             }
-            None => out(b"<error: bad expression>"),
+            Err(e) => {
+                out(e.message());
+                out(b"\n");
+            }
         }
     }
 }
@@ -288,7 +333,8 @@ fn exec_line(line: &[u8]) {
 
     match name {
         b"echo" => exec_echo(arg),
-        b"print" => exec_print(arg),
+        b"print" => exec_print(arg, false),
+        b"println" => exec_print(arg, true),
         other => {
             out(b"boruix: unknown command: ");
             out(other);
