@@ -1,54 +1,25 @@
 //! 内建命令实现与命令分发。
 //!
-//! 设计：命令是一等公民——`COMMANDS` 是一张 `(名字, 处理函数)` 静态表；所有命令
-//! 处理函数统一为 `cmd_*` 且签名一致 `fn(arg, rest)`。`exec_line` 只负责分词、构造
-//! 参数、查表分发，不再把"解析"与"命令实现"混在一起。求值器能力（`eval_print`）
-//! 不属于命令，由 `cmd_print`/`cmd_println` 接到分发里。
+//! 各 `cmd_*` 对应一条 shell 内建命令；`exec_echo` 处理 `echo`；
+//! `exec_line` 负责分词、参数重建并把命令名分派到对应实现。
 
 use crate::env::{cmd_env, cmd_export};
-use crate::expr::eval_print;
 use crate::tokenize::{tokenize_line, MAX_WORDS, WORD_CAP};
 use crate::util::{out, outln, parse_u64, string_content, trim_bytes, u64_to_dec, unescape};
 use libsys::{info, kill, now, ps, sleep, PsEntry};
 use libsys::nr::{INFO_BOOT_MS, INFO_CPU_COUNT, INFO_VERSION};
 use libsys::signal::LIST;
 
-/// 命令处理函数签名。`arg` 为 token 展开后的参数字符串；`rest` 为命令名之后的
-/// 原始剩余字节（`print`/`println` 需要它来保留未展开的 `$ident`；其它命令忽略）。
-type CommandFn = fn(arg: &[u8], rest: &[u8]);
-
 /// 列出全部内建命令。
-fn cmd_help(_arg: &[u8], _rest: &[u8]) {
+fn cmd_help() {
     out(
         b"builtins: echo print println help now time uptime version uname cpu \
 sleep clear env export ps kill signal\n",
     );
 }
 
-/// `echo <文本>`：输出一行。支持双引号字符串与转义。
-fn cmd_echo(arg: &[u8], _rest: &[u8]) {
-    if let Some(content) = string_content(arg) {
-        let mut buf = [0u8; 256];
-        let n = unescape(content, &mut buf);
-        outln(&buf[..n]);
-    } else {
-        // 裸文本（无引号）：去掉首尾空白后原样输出。
-        outln(trim_bytes(arg));
-    }
-}
-
-/// `print(...)`：表达式求值后输出（不换行）。委托给求值器，传入原始 `rest`。
-fn cmd_print(_arg: &[u8], rest: &[u8]) {
-    eval_print(rest, false);
-}
-
-/// `println(...)`：表达式求值后输出并换行。
-fn cmd_println(_arg: &[u8], rest: &[u8]) {
-    eval_print(rest, true);
-}
-
 /// `now`/`time`：单调时钟（纳秒）。
-fn cmd_now(_arg: &[u8], _rest: &[u8]) {
+fn cmd_now() {
     let ns = now();
     let mut b = [0u8; 24];
     out(b"now: ");
@@ -61,7 +32,7 @@ fn cmd_now(_arg: &[u8], _rest: &[u8]) {
 }
 
 /// `uptime`：开机至今。
-fn cmd_uptime(_arg: &[u8], _rest: &[u8]) {
+fn cmd_uptime() {
     let ms = info(INFO_BOOT_MS).unwrap_or(0);
     let mut b = [0u8; 24];
     out(b"uptime: ");
@@ -72,7 +43,7 @@ fn cmd_uptime(_arg: &[u8], _rest: &[u8]) {
 }
 
 /// `version`/`uname`：内核版本。
-fn cmd_version(_arg: &[u8], _rest: &[u8]) {
+fn cmd_version() {
     let v = info(INFO_VERSION).unwrap_or(0);
     let mut b = [0u8; 24];
     out(b"BORUIX v");
@@ -85,7 +56,7 @@ fn cmd_version(_arg: &[u8], _rest: &[u8]) {
 }
 
 /// `cpu`：在线 CPU 数。
-fn cmd_cpu(_arg: &[u8], _rest: &[u8]) {
+fn cmd_cpu() {
     let c = info(INFO_CPU_COUNT).unwrap_or(0);
     let mut b = [0u8; 24];
     out(b"cpus: ");
@@ -94,7 +65,7 @@ fn cmd_cpu(_arg: &[u8], _rest: &[u8]) {
 }
 
 /// `sleep <秒>`：睡眠（内核当前为忙等实现）。
-fn cmd_sleep(arg: &[u8], _rest: &[u8]) {
+fn cmd_sleep(arg: &[u8]) {
     let a = trim_bytes(arg);
     match parse_u64(a) {
         Some(secs) => {
@@ -104,13 +75,8 @@ fn cmd_sleep(arg: &[u8], _rest: &[u8]) {
     }
 }
 
-/// `clear`：清屏（ANSI 转义）。
-fn cmd_clear(_arg: &[u8], _rest: &[u8]) {
-    out(b"\x1b[2J\x1b[H");
-}
-
 /// `ps`：列出存活进程。
-fn cmd_ps(_arg: &[u8], _rest: &[u8]) {
+fn cmd_ps() {
     let mut buf = [PsEntry { pid: 0, state: 0, _pad: [0; 3] }; 32];
     match ps(&mut buf) {
         Ok(n) => {
@@ -134,7 +100,7 @@ fn cmd_ps(_arg: &[u8], _rest: &[u8]) {
 }
 
 /// 列出已知信号（供 `kill -l` / `signal`）。
-fn cmd_signal_list(_arg: &[u8], _rest: &[u8]) {
+fn cmd_signal_list() {
     out(b"signals:\n");
     let mut b = [0u8; 24];
     for (num, name) in LIST {
@@ -146,10 +112,10 @@ fn cmd_signal_list(_arg: &[u8], _rest: &[u8]) {
 }
 
 /// `kill [-s SIG|-SIG|-l] <pid>`：向进程发送信号。
-fn cmd_kill(arg: &[u8], _rest: &[u8]) {
+fn cmd_kill(arg: &[u8]) {
     let a = trim_bytes(arg);
     if a == b"-l" {
-        cmd_signal_list(b"", b"");
+        cmd_signal_list();
         return;
     }
     let mut sig: u64 = 15; // 默认 SIGTERM
@@ -171,7 +137,7 @@ fn cmd_kill(arg: &[u8], _rest: &[u8]) {
         if tok.starts_with(b"-") {
             let body = &tok[1..];
             if body == b"l" {
-                cmd_signal_list(b"", b"");
+                cmd_signal_list();
                 return;
             }
             let num = if body.starts_with(b"s") { &body[1..] } else { body };
@@ -198,31 +164,25 @@ fn cmd_kill(arg: &[u8], _rest: &[u8]) {
     }
 }
 
-/// 命令表：`(名字, 处理函数)`。新增命令只需在此登记一行。
-static COMMANDS: &[(&[u8], CommandFn)] = &[
-    (b"echo", cmd_echo),
-    (b"print", cmd_print),
-    (b"println", cmd_println),
-    (b"help", cmd_help),
-    (b"now", cmd_now),
-    (b"time", cmd_now),
-    (b"uptime", cmd_uptime),
-    (b"version", cmd_version),
-    (b"uname", cmd_version),
-    (b"cpu", cmd_cpu),
-    (b"sleep", cmd_sleep),
-    (b"clear", cmd_clear),
-    (b"env", cmd_env),
-    (b"export", cmd_export),
-    (b"ps", cmd_ps),
-    (b"kill", cmd_kill),
-    (b"signal", cmd_signal_list),
-];
+/// 执行 `echo <文本>`：输出一行。支持双引号字符串与转义。
+fn exec_echo(arg: &[u8]) {
+    if let Some(content) = string_content(arg) {
+        let mut buf = [0u8; 256];
+        let n = unescape(content, &mut buf);
+        outln(&buf[..n]);
+    } else {
+        // 裸文本（无引号）：去掉首尾空白后原样输出。
+        outln(trim_bytes(arg));
+    }
+}
 
-/// 执行一行命令。以 `;` 结尾可省略。空行/注释(`#`)跳过。
+/// 执行一行输入。以 `;` 结尾可省略。空行/注释(`#`)跳过。
 ///
-/// 职责（纯分发）：分词 → 重建展开后的 `arg` → 截取原始 `rest` → 在 `COMMANDS`
-/// 表中按名字查命令并调用。命令的具体行为全在各 `cmd_*` 里，这里不再掺入实现。
+/// 两类语句在此分流：
+/// 1. **函数调用语句**（`print(..)`/`println(..)`）：先由 `expr::try_exec_call`
+///    按 `name(expr)` 形式解析，参数是类型表达式，与命令无关；
+/// 2. **词式命令**（`echo`/`ps`/`kill`/`export`/…）：经 `tokenize_line` 分词并展开
+///    `$VAR`，首词为命令名，其余词以单空格重连成 `arg` 传给对应实现。
 pub(crate) fn exec_line(line: &[u8]) {
     let line = trim_bytes(line);
     if line.is_empty() || line.first() == Some(&b'#') {
@@ -234,6 +194,12 @@ pub(crate) fn exec_line(line: &[u8]) {
     } else {
         line
     };
+
+    // 函数调用语句（print(..)/println(..)）：与“词式命令”明确区分，先在此
+    // 尝试按 `name(expr)` 形式解析；命中则求值输出并结束，不进入命令分发。
+    if crate::expr::try_exec_call(line) {
+        return;
+    }
 
     let mut wbuf = [[0u8; WORD_CAP]; MAX_WORDS];
     let mut wlen = [0usize; MAX_WORDS];
@@ -261,17 +227,24 @@ pub(crate) fn exec_line(line: &[u8]) {
     }
     let arg = &argbuf[..al];
 
-    // 命令名之后的原始剩余字节（print/println 需要未展开的 $ident）。
-    let rest = trim_bytes(&line[wlen[0]..]);
-
-    // 查表分发。
-    for (cmd, handler) in COMMANDS {
-        if name == *cmd {
-            handler(arg, rest);
-            return;
+    match name {
+        b"echo" => exec_echo(arg),
+        b"help" => cmd_help(),
+        b"now" | b"time" => cmd_now(),
+        b"uptime" => cmd_uptime(),
+        b"version" | b"uname" => cmd_version(),
+        b"cpu" => cmd_cpu(),
+        b"sleep" => cmd_sleep(arg),
+        b"clear" => out(b"\x1b[2J\x1b[H"),
+        b"env" => cmd_env(),
+        b"export" => cmd_export(arg),
+        b"ps" => cmd_ps(),
+        b"kill" => cmd_kill(arg),
+        b"signal" => cmd_signal_list(),
+        other => {
+            out(b"boruix: unknown command: ");
+            out(other);
+            out(b"\n");
         }
     }
-    out(b"boruix: unknown command: ");
-    out(name);
-    out(b"\n");
 }

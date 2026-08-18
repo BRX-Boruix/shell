@@ -369,21 +369,12 @@ impl<'a> Ev<'a> {
     }
 }
 
-/// 求值并执行 `print(...)` / `println(...)`：把参数当作**带类型表达式**求值
-/// （字符串 / i64 / f64，`$ident` 按带类型变量引用解析），渲染后输出。
-/// `newline=true`（`println`）时在末尾追加换行。表达式非法时输出对应友好错误。
-///
-/// 这是"求值器能力"，不是命令；命令层 `cmd_print`/`cmd_println` 负责把它接进
-/// 统一命令分发（传入原始 `rest` 而非展开后的 `arg`）。
-pub(crate) fn eval_print(arg: &[u8], newline: bool) {
-    let s = trim_bytes(arg);
-    // 去掉外层括号
-    let inner = if s.starts_with(b"(") && s.ends_with(b")") {
-        &s[1..s.len() - 1]
-    } else {
-        s
-    };
-
+/// 求值并输出一个**表达式**（`print`/`println` 的参数体）。
+/// `inner` 应为已去掉外层括号的裸表达式；按带类型求值（字符串 / i64 / f64，
+/// `$ident` 按带类型变量引用解析），渲染后输出。`newline=true`（`println`）
+/// 时在末尾追加换行。表达式非法时输出对应友好错误。
+fn print_expr(inner: &[u8], newline: bool) {
+    let inner = trim_bytes(inner);
     match Ev::evaluate(inner) {
         Ok(v) => {
             let mut buf = [0u8; 256];
@@ -397,5 +388,86 @@ pub(crate) fn eval_print(arg: &[u8], newline: bool) {
             out(e.message());
             out(b"\n");
         }
+    }
+}
+
+/// 试解析整行是否为**函数调用语句** `name(expr)`（如 `print(...)` / `println(...)`），
+/// 与词式命令（`echo ...`、`ps` 等）明确区分。
+///
+/// 命中已知函数则求值并输出，返回 `true`（调用方无需再走命令分发）；否则返回
+/// `false`（交由命令分发处理）。
+pub(crate) fn try_exec_call(line: &[u8]) -> bool {
+    let s = trim_bytes(line);
+    if s.is_empty() {
+        return false;
+    }
+    // 读标识符（函数名）。
+    let mut i = 0;
+    while i < s.len() && (s[i].is_ascii_alphanumeric() || s[i] == b'_') {
+        i += 1;
+    }
+    let name = &s[..i];
+    if name.is_empty() {
+        return false;
+    }
+    // 跳空白后必须是 '('。
+    let mut j = i;
+    while j < s.len() && s[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j >= s.len() || s[j] != b'(' {
+        return false;
+    }
+    // 找匹配的右括号（处理嵌套与字符串内的括号/转义）。
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut k = j;
+    let mut closed = None;
+    while k < s.len() {
+        let c = s[k];
+        if in_str {
+            if c == b'\\' && k + 1 < s.len() {
+                k += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_str = false;
+            }
+            k += 1;
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    closed = Some(k);
+                    break;
+                }
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    let close = match closed {
+        Some(c) => c,
+        None => return false, // 未闭合
+    };
+    // 右括号后只允许空白（严格语句，避免误吞后续命令）。
+    if !trim_bytes(&s[close + 1..]).is_empty() {
+        return false;
+    }
+    let inner = &s[j + 1..close];
+    match name {
+        b"print" => {
+            print_expr(inner, false);
+            true
+        }
+        b"println" => {
+            print_expr(inner, true);
+            true
+        }
+        _ => false, // 未知函数名：不当作调用
     }
 }
