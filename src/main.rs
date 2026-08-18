@@ -375,11 +375,50 @@ fn repl_loop() {
 /// `WouldBlock`（`Err`），此处先让出 CPU 再继续，避免忙等。
 fn read_line(buf: &mut [u8]) -> usize {
     let mut n = 0;
+    // 转义序列丢弃状态机：键盘驱动对方向键/编辑键/F 键输出 ANSI 序列（如 `↑`→
+    // `\x1b[A`，Insert→`\x1b[2~`，F1→`\x1bOP`）。此处吞掉整个序列，避免污染命令行
+    // （行编辑留作后续；现阶段这些键仅被忽略而不报错）。
+    // 0=普通 1=已遇 ESC 2=CSI 参数/中间字节 3=SS3 单字节终结。
+    let mut esc_state: u8 = 0;
     while n < buf.len() {
         let mut one = [0u8; 1];
         match libsys::read(STDIN, &mut one) {
             Ok(got) if got == 1 => {
                 let c = one[0];
+                // 正处于转义序列中：按状态机吞掉剩余字节。
+                if esc_state != 0 {
+                    match esc_state {
+                        1 => {
+                            // ESC 后：期待引导字节 '['(CSI) 或 'O'(SS3)。
+                            if c == b'[' {
+                                esc_state = 2;
+                            } else if c == b'O' {
+                                esc_state = 3;
+                            } else {
+                                esc_state = 0; // 未知引导，停止丢弃（本字节忽略）
+                            }
+                        }
+                        2 => {
+                            // CSI：参数(0x30..=0x3F)/中间(0x20..=0x2F)继续，
+                            // 终结字节(0x40..=0x7E)结束；其余视为畸形停止。
+                            if (0x40..=0x7E).contains(&c) {
+                                esc_state = 0;
+                            } else if !(0x20..=0x3F).contains(&c) {
+                                esc_state = 0;
+                            }
+                        }
+                        3 => {
+                            esc_state = 0; // SS3：下一字节即终结
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                if c == 0x1B {
+                    // ESC：开始丢弃整个转义序列。
+                    esc_state = 1;
+                    continue;
+                }
                 if c == b'\n' || c == b'\r' {
                     break; // 行结束
                 } else if c == 0x7F || c == 0x08 {
