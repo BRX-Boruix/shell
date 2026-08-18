@@ -6,12 +6,112 @@
 /// 所有内建命令名（供 Tab 补全使用）。
 pub(crate) const COMMANDS: &[&[u8]] = &[
     b"echo", b"help", b"now", b"time", b"uptime", b"version", b"uname", b"cpu", b"sleep",
-    b"clear", b"env", b"export", b"unset", b"ps", b"kill", b"signal",
+    b"clear", b"env", b"export", b"unset", b"ps", b"kill", b"signal", b"alias", b"unalias",
+    b"which",
 ];
 
 /// 返回内建命令名列表（供补全遍历）。
 pub(crate) fn command_names() -> &'static [&'static [u8]] {
     COMMANDS
+}
+
+/// 别名表容量。
+const MAX_ALIAS: usize = 16;
+const ALIAS_NAME: usize = 16;
+const ALIAS_VAL: usize = 64;
+
+/// 命令别名表：`(name, value, used)`。仅展开命令行首词（见 `exec_line`）。
+static mut ALIAS_TABLE: [([u8; ALIAS_NAME], [u8; ALIAS_VAL], bool); MAX_ALIAS] =
+    [([0u8; ALIAS_NAME], [0u8; ALIAS_VAL], false); MAX_ALIAS];
+static mut ALIAS_COUNT: usize = 0;
+
+/// 查别名，返回其值切片（缺失 `None`）。
+pub(crate) fn alias_get(name: &[u8]) -> Option<&'static [u8]> {
+    unsafe {
+        for i in 0..ALIAS_COUNT {
+            let (n, v, used) = &ALIAS_TABLE[i];
+            if *used && n[..name.len()] == *name && n[name.len()..].iter().all(|&b| b == 0) {
+                let mut len = 0;
+                while len < ALIAS_VAL && v[len] != 0 {
+                    len += 1;
+                }
+                return Some(&v[..len]);
+            }
+        }
+    }
+    None
+}
+
+/// 设置/覆盖别名。
+pub(crate) fn alias_set(name: &[u8], val: &[u8]) {
+    if name.is_empty() || name.len() > ALIAS_NAME {
+        return;
+    }
+    let vlen = val.len().min(ALIAS_VAL);
+    unsafe {
+        for i in 0..ALIAS_COUNT {
+            let (n, v, used) = &mut ALIAS_TABLE[i];
+            if *used && n[..name.len()] == *name && n[name.len()..].iter().all(|&b| b == 0) {
+                v[..vlen].copy_from_slice(&val[..vlen]);
+                for x in &mut v[vlen..] {
+                    *x = 0;
+                }
+                return;
+            }
+        }
+        if ALIAS_COUNT >= MAX_ALIAS {
+            return;
+        }
+        let i = ALIAS_COUNT;
+        let l = name.len();
+        ALIAS_TABLE[i].0[..l].copy_from_slice(name);
+        for x in &mut ALIAS_TABLE[i].0[l..] {
+            *x = 0;
+        }
+        ALIAS_TABLE[i].1[..vlen].copy_from_slice(&val[..vlen]);
+        for x in &mut ALIAS_TABLE[i].1[vlen..] {
+            *x = 0;
+        }
+        ALIAS_TABLE[i].2 = true;
+        ALIAS_COUNT += 1;
+    }
+}
+
+/// 删除别名（软删除）。
+pub(crate) fn alias_unset(name: &[u8]) {
+    if name.is_empty() || name.len() > ALIAS_NAME {
+        return;
+    }
+    unsafe {
+        for i in 0..ALIAS_COUNT {
+            let (n, _v, used) = &mut ALIAS_TABLE[i];
+            if *used && n[..name.len()] == *name && n[name.len()..].iter().all(|&b| b == 0) {
+                *used = false;
+                return;
+            }
+        }
+    }
+}
+
+/// 遍历所有已定义别名（供 `alias` 无参列出）。
+pub(crate) fn for_each_alias<F: FnMut(&'static [u8], &'static [u8])>(mut f: F) {
+    unsafe {
+        for i in 0..ALIAS_COUNT {
+            let (n, v, used) = &ALIAS_TABLE[i];
+            if !*used {
+                continue;
+            }
+            let mut nl = 0;
+            while nl < ALIAS_NAME && n[nl] != 0 {
+                nl += 1;
+            }
+            let mut vl = 0;
+            while vl < ALIAS_VAL && v[vl] != 0 {
+                vl += 1;
+            }
+            f(&n[..nl], &v[..vl]);
+        }
+    }
 }
 
 use crate::env::{cmd_env, cmd_export, env_unset, set_last_status};
@@ -25,7 +125,7 @@ use libsys::signal::LIST;
 fn cmd_help() -> u8 {
     out(
         b"builtins: echo help now time uptime version uname cpu \
-sleep clear env export unset ps kill signal\n",
+sleep clear env export unset ps kill signal alias unalias which\n",
     );
     0
 }
@@ -225,6 +325,105 @@ fn cmd_unset(arg: &[u8]) -> u8 {
     0
 }
 
+/// `alias` / `alias NAME=VALUE` / `alias NAME`：列出全部、设置或查询别名。
+/// 返回：0 正常，1 空名字。
+fn cmd_alias(arg: &[u8]) -> u8 {
+    let a = trim_bytes(arg);
+    if a.is_empty() {
+        for_each_alias(|n, v| {
+            out(n);
+            out(b"='");
+            out(v);
+            out(b"'\n");
+        });
+        return 0;
+    }
+    if let Some(eq) = a.iter().position(|&c| c == b'=') {
+        let name = &a[..eq];
+        let val = &a[eq + 1..];
+        if name.is_empty() {
+            out(b"alias: empty name\n");
+            return 1;
+        }
+        alias_set(name, val);
+        0
+    } else {
+        // 仅查询单个别名
+        match alias_get(a) {
+            Some(v) => {
+                out(a);
+                out(b"='");
+                out(v);
+                out(b"'\n");
+            }
+            None => {
+                out(b"alias: ");
+                out(a);
+                out(b": not found\n");
+            }
+        }
+        0
+    }
+}
+
+/// `unalias NAME...`：删除一个或多个别名（空格分隔）。缺失的名字静默忽略。
+/// 返回 0。
+fn cmd_unalias(arg: &[u8]) -> u8 {
+    let a = trim_bytes(arg);
+    let mut i = 0;
+    while i < a.len() {
+        while i < a.len() && a[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= a.len() {
+            break;
+        }
+        let start = i;
+        while i < a.len() && !a[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        alias_unset(&a[start..i]);
+    }
+    0
+}
+
+/// `which NAME...`：报告每个名字是别名还是内建命令，否则 not found。
+/// 返回：0 正常，1 用法错误（无参数）。
+fn cmd_which(arg: &[u8]) -> u8 {
+    let a = trim_bytes(arg);
+    if a.is_empty() {
+        out(b"which: usage: which <name...>\n");
+        return 1;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        while i < a.len() && a[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= a.len() {
+            break;
+        }
+        let start = i;
+        while i < a.len() && !a[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let name = &a[start..i];
+        if let Some(av) = alias_get(name) {
+            out(name);
+            out(b" is aliased to '");
+            out(av);
+            out(b"'\n");
+        } else if command_names().iter().any(|c| c == &name) {
+            out(name);
+            out(b" is a shell builtin\n");
+        } else {
+            out(name);
+            out(b": not found\n");
+        }
+    }
+    0
+}
+
 /// 去掉行内注释：从第一个**未加引号**的 `#` 起截到行尾。
 /// 双引号/单引号内的 `#` 不当作注释（如 `echo "a#b"`）。
 fn strip_comment(line: &[u8]) -> &[u8] {
@@ -288,6 +487,46 @@ pub(crate) fn exec_line(line: &[u8]) {
     if nw == 0 {
         return;
     }
+    // 暂存首词到栈上，避免持有 wbuf 的不可变借用跨过下面的重新分词。
+    let mut oname = [0u8; WORD_CAP];
+    let onlen = wlen[0].min(WORD_CAP);
+    oname[..onlen].copy_from_slice(&wbuf[0][..onlen]);
+
+    // 别名展开：仅替换首词一次（若展开后的首词仍是该别名则停止，防自环）。
+    let mut expanded = [0u8; 512];
+    let mut active: &[u8] = line;
+    if let Some(av) = alias_get(&oname[..onlen]) {
+        let rest = &line[onlen..]; // 首词之后的剩余部分（含前导空白）
+        let mut el = av.len().min(ALIAS_VAL);
+        expanded[..el].copy_from_slice(&av[..el]);
+        for &b in rest {
+            if el < expanded.len() {
+                expanded[el] = b;
+                el += 1;
+            }
+        }
+        let nw2 = tokenize_line(&expanded[..el], &mut wbuf, &mut wlen);
+        // 展开后首词与原首词比较（均来自栈上/刚写入，不持有旧借用）。
+        let new_len = wlen[0].min(WORD_CAP);
+        let mut same = new_len == onlen;
+        if same {
+            for k in 0..new_len {
+                if wbuf[0][k] != oname[k] {
+                    same = false;
+                    break;
+                }
+            }
+        }
+        if nw2 > 0 && !same {
+            active = &expanded[..el];
+        }
+    }
+
+    // 按最终（可能已展开）的命令行重新分词。
+    let nw = tokenize_line(active, &mut wbuf, &mut wlen);
+    if nw == 0 {
+        return;
+    }
     let name = &wbuf[0][..wlen[0]];
 
     // 重建参数：剩余词以单空格连接（词内引号保留、VAR 已展开）。
@@ -326,6 +565,9 @@ pub(crate) fn exec_line(line: &[u8]) {
         b"ps" => cmd_ps(),
         b"kill" => cmd_kill(arg),
         b"signal" => cmd_signal_list(),
+        b"alias" => cmd_alias(arg),
+        b"unalias" => cmd_unalias(arg),
+        b"which" => cmd_which(arg),
         other => {
             out(b"boruix: unknown command: ");
             out(other);
