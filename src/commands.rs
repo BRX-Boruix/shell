@@ -340,7 +340,16 @@ fn cmd_alias(arg: &[u8]) -> u8 {
     }
     if let Some(eq) = a.iter().position(|&c| c == b'=') {
         let name = &a[..eq];
-        let val = &a[eq + 1..];
+        let mut val = &a[eq + 1..];
+        // 剥除值两端成对引号（如 `alias g='echo hi'` 的 `'...'`），
+        // 否则引号会被原样存下、展开时变成字面命令名的一部分。
+        if val.len() >= 2 {
+            let f = val.first().copied().unwrap();
+            let l = val.last().copied().unwrap();
+            if (f == b'"' && l == b'"') || (f == b'\'' && l == b'\'') {
+                val = &val[1..val.len() - 1];
+            }
+        }
         if name.is_empty() {
             out(b"alias: empty name\n");
             return 1;
