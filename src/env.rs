@@ -82,6 +82,24 @@ pub(crate) fn env_render(name: &[u8], dst: &mut [u8]) -> usize {
     o
 }
 
+/// 遍历所有已定义变量名（供 Tab 补全）。对每个名字调用 `f`。
+/// 名字切片来自 `static` 表，生命周期为 `'static`，便于调用方暂存引用。
+pub(crate) fn for_each_env_name<F: FnMut(&'static [u8])>(mut f: F) {
+    unsafe {
+        for i in 0..ENV_COUNT {
+            let (n, _v, used) = &ENV_TABLE[i];
+            if !*used {
+                continue;
+            }
+            let mut len = 0;
+            while len < ENV_NAME && n[len] != 0 {
+                len += 1;
+            }
+            f(&n[..len]);
+        }
+    }
+}
+
 /// `env`：列出全部环境变量（`name=value`）。
 pub(crate) fn cmd_env() {
     unsafe {

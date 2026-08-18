@@ -3,6 +3,17 @@
 //! 各 `cmd_*` 对应一条 shell 内建命令；`exec_echo` 处理 `echo`；
 //! `exec_line` 负责分词、参数重建并把命令名分派到对应实现。
 
+/// 所有内建命令名（供 Tab 补全使用）。
+pub(crate) const COMMANDS: &[&[u8]] = &[
+    b"echo", b"help", b"now", b"time", b"uptime", b"version", b"uname", b"cpu", b"sleep",
+    b"clear", b"env", b"export", b"ps", b"kill", b"signal",
+];
+
+/// 返回内建命令名列表（供补全遍历）。
+pub(crate) fn command_names() -> &'static [&'static [u8]] {
+    COMMANDS
+}
+
 use crate::env::{cmd_env, cmd_export};
 use crate::tokenize::{tokenize_line, MAX_WORDS, WORD_CAP};
 use crate::util::{out, outln, parse_u64, string_content, trim_bytes, u64_to_dec, unescape};
