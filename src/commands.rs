@@ -7,7 +7,7 @@
 pub(crate) const COMMANDS: &[&[u8]] = &[
     b"echo", b"help", b"now", b"time", b"uptime", b"version", b"uname", b"cpu", b"sleep",
     b"clear", b"env", b"export", b"unset", b"ps", b"kill", b"signal", b"alias", b"unalias",
-    b"which",
+    b"which", b"jobs",
 ];
 
 /// 返回内建命令名列表（供补全遍历）。
@@ -117,6 +117,110 @@ pub(crate) fn for_each_alias<F: FnMut(&'static [u8], &'static [u8])>(mut f: F) {
 use crate::env::{cmd_env, cmd_export, env_unset, set_last_status};
 use crate::tokenize::{tokenize_line, MAX_WORDS, WORD_CAP};
 use crate::util::{out, outln, parse_u64, string_content, trim_bytes, u64_to_dec, unescape};
+
+/// 作业表容量（同时存在的后台作业上限）。
+const JOB_MAX: usize = 16;
+/// 作业命令文本最大字节数。
+const JOB_CMD: usize = 64;
+
+/// 后台作业表：`(pid, cmd, used)`。索引 `i` 对应作业号 `i+1`（供 `%n` 引用）。
+/// 作业由主 shell 经 `exec(shell, cmd)` 拉起，独立地址空间并行运行，跑完自退。
+static mut JOBS: [(u32, [u8; JOB_CMD], bool); JOB_MAX] =
+    [(0u32, [0u8; JOB_CMD], false); JOB_MAX];
+
+/// 登记一个后台作业，返回作业号（1 基，供 `%n` 引用）。表满时覆盖最旧槽（0）。
+pub(crate) fn job_add(pid: u32, cmd: &[u8]) -> usize {
+    unsafe {
+        let mut slot = 0usize;
+        for i in 0..JOB_MAX {
+            if !JOBS[i].2 {
+                slot = i;
+                break;
+            }
+            if i == JOB_MAX - 1 {
+                slot = 0; // 全满：覆盖最旧
+            }
+        }
+        JOBS[slot].0 = pid;
+        let l = cmd.len().min(JOB_CMD);
+        JOBS[slot].1[..l].copy_from_slice(&cmd[..l]);
+        for x in &mut JOBS[slot].1[l..] {
+            *x = 0;
+        }
+        JOBS[slot].2 = true;
+        slot + 1
+    }
+}
+
+/// 按作业号（1 基）取 pid；越界或空槽返回 `None`。
+fn job_pid(idx: usize) -> Option<u32> {
+    if idx == 0 || idx > JOB_MAX {
+        return None;
+    }
+    unsafe {
+        if JOBS[idx - 1].2 {
+            Some(JOBS[idx - 1].0)
+        } else {
+            None
+        }
+    }
+}
+
+/// 删除作业（如 `kill %n` 后）。
+fn job_remove(idx: usize) {
+    if idx == 0 || idx > JOB_MAX {
+        return;
+    }
+    unsafe {
+        JOBS[idx - 1].2 = false;
+    }
+}
+
+/// 当前存活进程 pid 集合（供 `jobs` 判定状态）。
+fn alive_pids() -> [u32; 32] {
+    let mut snap = [PsEntry { pid: 0, state: 0, _pad: [0; 3] }; 32];
+    let mut set = [0u32; 32];
+    if let Ok(n) = ps(&mut snap) {
+        for k in 0..n.min(set.len()) {
+            set[k] = snap[k].pid;
+        }
+    }
+    set
+}
+
+/// `jobs`：列出全部后台作业及其存活状态（`ps` 判定 Running/Done）。返回 0。
+fn cmd_jobs() -> u8 {
+    let alive = alive_pids();
+    let mut b = [0u8; 24];
+    unsafe {
+        for i in 0..JOB_MAX {
+            if !JOBS[i].2 {
+                continue;
+            }
+            let (pid, cmd, _) = &JOBS[i];
+            let mut live = false;
+            for k in 0..alive.len() {
+                if alive[k] == *pid {
+                    live = true;
+                    break;
+                }
+            }
+            out(b"[");
+            out(u64_to_dec((i + 1) as u64, &mut b));
+            out(b"] ");
+            out(u64_to_dec(*pid as u64, &mut b));
+            out(b" ");
+            out(if live { b"Running " } else { b"Done    " });
+            let mut cl = 0;
+            while cl < JOB_CMD && cmd[cl] != 0 {
+                cl += 1;
+            }
+            out(&cmd[..cl]);
+            out(b"\n");
+        }
+    }
+    0
+}
 use libsys::{info, kill, now, ps, sleep, PsEntry};
 use libsys::nr::{INFO_BOOT_MS, INFO_CPU_COUNT, INFO_VERSION};
 use libsys::signal::LIST;
@@ -260,6 +364,31 @@ fn cmd_kill(arg: &[u8]) -> u8 {
             i += 1;
         }
         let tok = &a[start..i];
+        // `kill %n`：按作业号（1 基）引用后台作业。
+        if tok.first() == Some(&b'%') {
+            match parse_u64(&tok[1..]) {
+                Some(v) => match job_pid(v as usize) {
+                    Some(p) => {
+                        pid = p as u64;
+                        have_pid = true;
+                        job_remove(v as usize);
+                    }
+                    None => {
+                        out(b"kill: no such job: ");
+                        out(tok);
+                        out(b"\n");
+                        return 1;
+                    }
+                },
+                None => {
+                    out(b"kill: bad job spec: ");
+                    out(tok);
+                    out(b"\n");
+                    return 1;
+                }
+            }
+            continue;
+        }
         if tok.starts_with(b"-") {
             let body = &tok[1..];
             if body == b"l" {
@@ -577,6 +706,7 @@ pub(crate) fn exec_line(line: &[u8]) {
         b"alias" => cmd_alias(arg),
         b"unalias" => cmd_unalias(arg),
         b"which" => cmd_which(arg),
+        b"jobs" => cmd_jobs(),
         other => {
             out(b"boruix: unknown command: ");
             out(other);

@@ -18,10 +18,10 @@ mod env;
 mod tokenize;
 mod util;
 
-use crate::commands::{command_names, exec_line};
-use crate::env::for_each_env_name;
-use crate::util::{out, outln, prompt};
-use libsys::{read, yield_now};
+use crate::commands::{command_names, exec_line, job_add};
+use crate::env::{for_each_env_name, last_status};
+use crate::util::{out, outln, prompt, u64_to_dec};
+use libsys::{exec, read, yield_now, nr::PROG_SHELL};
 
 /// 标准输入文件描述符。
 const STDIN: u64 = 0;
@@ -39,7 +39,28 @@ static mut HIST_COUNT: usize = 0;
 /// shell 入口（libsys `_start` 调用）：输出横幅并进入 REPL 循环。
 /// 返回退出码。
 #[unsafe(no_mangle)]
-pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
+pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
+    // 一次性命令模式：内核 `exec(shell, cmd)` 启动时 `argc>=1`，`argv[0]` 即命令行。
+    // 执行该命令后退出（不进 REPL），用于后台作业。退出码沿用最后一条命令的 `$?`。
+    if argc >= 1 && !argv.is_null() {
+        let cmd = unsafe { *argv };
+        if !cmd.is_null() {
+            let mut buf = [0u8; LINE_CAP];
+            let mut n = 0usize;
+            unsafe {
+                let mut p = cmd;
+                while n < LINE_CAP && *p != 0 {
+                    buf[n] = *p;
+                    n += 1;
+                    p = p.add(1);
+                }
+            }
+            if n > 0 {
+                exec_line(&buf[..n]);
+            }
+            return last_status() as i32;
+        }
+    }
     outln(b"BORUIX shell (PID 2)");
     repl_loop();
     0
@@ -49,6 +70,8 @@ pub extern "C" fn user_main(_argc: isize, _argv: *const *const u8) -> i32 {
 ///
 /// 经 `read` 系统调用从内核键盘输入缓冲逐字符读行；缓冲空（`WouldBlock`）时
 /// 让出 CPU 并重试（键盘是异步中断驱动，无输入时不忙等）。空行与 `#` 注释跳过。
+/// 行尾独立的 `&`（非 `&&`）表示后台作业：另起一个 shell 进程执行该命令，
+/// 当前 shell 立即返回继续交互（`spawn_background`）。
 fn repl_loop() {
     let mut line = [0u8; LINE_CAP];
     loop {
@@ -58,7 +81,63 @@ fn repl_loop() {
             // 读到空行（直接回车）：继续下一轮。
             continue;
         }
-        exec_line(&line[..n]);
+        let raw = &line[..n];
+        match background_split(raw) {
+            Some(cmd) => spawn_background(cmd),
+            None => exec_line(raw),
+        }
+    }
+}
+
+/// 解析行尾的 `&`：若行尾（跳过空白）为单个 `&` 且前一词不是 `&&`，返回其前的
+/// 命令文本（已去尾空白）；否则返回 `None`（前台执行）。引号内 `&` 不计（简化：
+/// 后台作业命令一般不含引号嵌套 `&`）。
+fn background_split(line: &[u8]) -> Option<&[u8]> {
+    let n = line.len();
+    let mut i = n;
+    while i > 0 && line[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if i == 0 || line[i - 1] != b'&' {
+        return None;
+    }
+    let amp = i - 1;
+    // `&&` 视为非后台（脚本与/列表，本 shell 未实现，仍按前台处理）。
+    let mut j = amp;
+    while j > 0 && line[j - 1].is_ascii_whitespace() {
+        j -= 1;
+    }
+    if j > 0 && line[j - 1] == b'&' {
+        return None;
+    }
+    let mut k = amp;
+    while k > 0 && line[k - 1].is_ascii_whitespace() {
+        k -= 1;
+    }
+    if k == 0 {
+        return None;
+    }
+    Some(&line[..k])
+}
+
+/// 启动后台作业：以 `exec(shell, cmd)` 拉起一个独立 shell 进程执行 `cmd`，
+/// 登记作业表后打印 `[job] pid cmd`，立即返回（不等待）。新进程跑完自动退出。
+fn spawn_background(cmd: &[u8]) {
+    match exec(PROG_SHELL, cmd) {
+        Ok(pid) => {
+            let idx = job_add(pid as u32, cmd);
+            let mut b = [0u8; 24];
+            out(b"[");
+            out(u64_to_dec(idx as u64, &mut b));
+            out(b"] ");
+            out(u64_to_dec(pid, &mut b));
+            out(b" ");
+            out(cmd);
+            out(b"\n");
+        }
+        Err(_) => {
+            out(b"boruix: background exec failed\n");
+        }
     }
 }
 
