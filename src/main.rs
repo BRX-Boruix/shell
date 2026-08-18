@@ -336,11 +336,19 @@ fn read_line(buf: &mut [u8]) -> usize {
                 let c = one[0];
                 if c == b'\n' || c == b'\r' {
                     break; // 行结束
+                } else if c == 0x7F || c == 0x08 {
+                    // 退格（DEL 0x7F 或 BS 0x08）：删除上一个已输入字符，
+                    // 并向终端发送擦除序列（BS + 空格 + BS）刷新光标。
+                    if n > 0 {
+                        n -= 1;
+                        out(b"\x08 \x08");
+                    }
+                } else {
+                    // 回显 + 暂存
+                    let _ = write(STDOUT, &one);
+                    buf[n] = c;
+                    n += 1;
                 }
-                // 回显 + 暂存
-                let _ = write(STDOUT, &one);
-                buf[n] = c;
-                n += 1;
             }
             Ok(_) => {
                 // 读到 0 字节：无更多数据，继续尝试。
