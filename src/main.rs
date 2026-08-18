@@ -62,36 +62,20 @@ fn repl_loop() {
     }
 }
 
-/// 重绘当前行并把光标停在 `cursor` 列（`0..=n`，从行首算起的字节索引）。
+/// 重绘当前行并把**硬件光标**精确停在 `cursor` 列（`0..=n`，从行首算起的字节索引）。
 ///
-/// 用**软件光标**：光标所在格的字符以反色（`SGR 7`）渲染，确保它始终可见——
-/// 裸机方块硬件光标会盖住所在格的字形（数据仍在，只是看不见），反色后无论硬件
-/// 光标如何绘制都看得到光标位置。光标在行尾时渲染一个反色空格。
-///
-/// `cursor < n` 时再把硬件光标左移回该列（对不支持隐藏光标的终端兜底）。
+/// 采用标准硬件光标（不使用软件反色光标）：先整行重绘（`\r` + 清到行尾），再把
+/// 硬件光标从行尾左移 `(n - cursor)` 格，使其落在编辑位置。这样无论终端是否支持
+/// 隐藏光标（`?25l`），始终只有一个光标且位置正确；块光标本身即高亮所在字符，
+/// 不会出现「光标卡在原地 / 多个光标」的问题。
 fn redraw_at(buf: &[u8], n: usize, cursor: usize) {
     out(b"\r"); // 回到列首
     out(b"\x1b[K"); // 清除至行尾
     prompt();
-    // 光标左侧
-    if cursor > 0 {
-        out(&buf[..cursor]);
-    }
-    // 光标格（反色）
-    out(b"\x1b[7m");
-    if cursor < n {
-        out(&buf[cursor..cursor + 1]);
-    } else {
-        out(b" "); // 行尾：反色空格作光标
-    }
-    out(b"\x1b[0m");
-    // 光标右侧
-    if cursor + 1 < n {
-        out(&buf[cursor + 1..n]);
-    }
-    // 兜底：把硬件光标也移到该列（对支持但不隐藏光标的终端）。
-    if cursor < n {
-        let back = n - cursor;
+    out(&buf[..n]); // 整行重绘，硬件光标现在在行尾
+    // 左移 (n - cursor) 格，使硬件光标停在编辑位置。
+    let back = n - cursor;
+    if back > 0 {
         let mut seq = [0u8; 8];
         let mut i = 0;
         seq[i] = b'\x1b'; i += 1;
@@ -323,8 +307,6 @@ fn tab_complete(buf: &mut [u8], n: &mut usize) {
 /// 插入与 `Backspace`/`Delete` 删除、`↑`/`↓` 历史回溯、`Tab` 补全；方向键/编辑键/F 键
 /// 输出的 ANSI 转义序列在此被识别或吞掉，不污染命令行。
 fn read_line(buf: &mut [u8]) -> usize {
-    // 隐藏硬件光标：改用软件反色光标（见 `redraw_at`），避免方块光标盖住字符。
-    out(b"\x1b[?25l");
     let mut n = 0; // 当前行长度
     let mut cur = 0; // 光标位置（0..=n，字节索引）
     let mut off: Option<usize> = None; // 历史回溯偏移（None=新鲜输入）
@@ -473,7 +455,6 @@ fn read_line(buf: &mut [u8]) -> usize {
         }
     }
     history_push(&buf[..n]);
-    out(b"\x1b[?25h"); // 恢复硬件光标（命令输出回到正常光标）
     out(b"\n");
     n
 }
