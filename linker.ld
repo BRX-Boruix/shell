@@ -33,6 +33,16 @@ SECTIONS
         *(COMMON)
     }
 
+    . = ALIGN(0x1000);
+
+    /* GOT / PLT 全局偏移表：必须保留并映射（RW），否则 `copy_from_slice` 等对
+     * `memcpy` 的 PLT 间接跳转（`jmp *(%rip)`）会读到被丢弃的 GOT 条目（落在未映射
+     * 的 vaddr 0），触发 page fault。内核 `linker.ld` 即未丢弃 `.got`。 */
+    .got : {
+        *(.got .got.*)
+        *(.got.plt)
+    }
+
     /DISCARD/ : {
         *(.eh_frame*)
         *(.note .note.*)
@@ -49,7 +59,5 @@ SECTIONS
         *(.rela.plt)
         *(.rel.dyn)
         *(.rel.plt)
-        *(.got)
-        *(.got.plt)
     }
 }

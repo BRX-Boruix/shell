@@ -15,7 +15,8 @@
 #![no_std]
 #![no_main]
 
-use libsys::{write, STDOUT};
+use libsys::{info, kill, now, ps, sleep, write, PsEntry, STDOUT};
+use libsys::nr::{INFO_BOOT_MS, INFO_CPU_COUNT, INFO_VERSION};
 
 // ---------- 输出辅助 ----------
 
@@ -310,8 +311,345 @@ fn exec_print(arg: &[u8], newline: bool) {
     }
 }
 
+// ---------- 环境变量（固定大小静态表，无 alloc） ----------
+
+const MAX_ENV: usize = 32;
+const ENV_NAME: usize = 24;
+const ENV_VAL: usize = 64;
+
+/// 环境变量表：`(name, value, used)`。shell 单进程单线程裸机程序，用静态数组。
+static mut ENV_TABLE: [([u8; ENV_NAME], [u8; ENV_VAL], bool); MAX_ENV] =
+    [([0u8; ENV_NAME], [0u8; ENV_VAL], false); MAX_ENV];
+static mut ENV_COUNT: usize = 0;
+
+/// 查找环境变量值（返回切片，不含结尾 0）。
+fn env_get(name: &[u8]) -> Option<&'static [u8]> {
+    unsafe {
+        for i in 0..ENV_COUNT {
+            let (n, v, used) = &ENV_TABLE[i];
+            if *used && n[..name.len()] == *name && n[name.len()..].iter().all(|&b| b == 0) {
+                let mut len = 0;
+                while len < ENV_VAL && v[len] != 0 {
+                    len += 1;
+                }
+                return Some(&v[..len]);
+            }
+        }
+    }
+    None
+}
+
+/// 设置/覆盖环境变量。
+fn env_set(name: &[u8], val: &[u8]) {
+    if name.is_empty() || name.len() > ENV_NAME {
+        return;
+    }
+    unsafe {
+        for i in 0..ENV_COUNT {
+            let (n, v, used) = &mut ENV_TABLE[i];
+            if *used && n[..name.len()] == *name && n[name.len()..].iter().all(|&b| b == 0) {
+                let l = val.len().min(ENV_VAL);
+                v[..l].copy_from_slice(&val[..l]);
+                for x in &mut v[l..] {
+                    *x = 0;
+                }
+                return;
+            }
+        }
+        if ENV_COUNT >= MAX_ENV {
+            return;
+        }
+        let i = ENV_COUNT;
+        let l = name.len();
+        ENV_TABLE[i].0[..l].copy_from_slice(name);
+        for x in &mut ENV_TABLE[i].0[l..] {
+            *x = 0;
+        }
+        let l = val.len().min(ENV_VAL);
+        ENV_TABLE[i].1[..l].copy_from_slice(&val[..l]);
+        for x in &mut ENV_TABLE[i].1[l..] {
+            *x = 0;
+        }
+        ENV_TABLE[i].2 = true;
+        ENV_COUNT += 1;
+    }
+}
+
+/// 把输入中的 `$NAME` 展开为环境变量值，写入 `dst`，返回有效长度。
+/// 非变量上下文的 `$` 原样保留；变量名含 `[A-Za-z0-9_]`。
+fn expand_vars(src: &[u8], dst: &mut [u8]) -> usize {
+    let mut o = 0usize;
+    let mut i = 0usize;
+    while i < src.len() && o < dst.len() {
+        if src[i] == b'$' && i + 1 < src.len() {
+            let c = src[i + 1];
+            if c.is_ascii_alphanumeric() || c == b'_' {
+                let start = i + 1;
+                let mut end = start;
+                while end < src.len() && (src[end].is_ascii_alphanumeric() || src[end] == b'_') {
+                    end += 1;
+                }
+                if let Some(val) = env_get(&src[start..end]) {
+                    for &b in val {
+                        if o < dst.len() {
+                            dst[o] = b;
+                            o += 1;
+                        }
+                    }
+                }
+                i = end;
+                continue;
+            }
+        }
+        dst[o] = src[i];
+        o += 1;
+        i += 1;
+    }
+    o
+}
+
+/// 把 `u64` 格式化为十进制字节，写入 `buf`，返回有效长度。
+fn u64_to_dec(v: u64, buf: &mut [u8; 24]) -> &[u8] {
+    if v == 0 {
+        buf[0] = b'0';
+        return &buf[..1];
+    }
+    let mut tmp = [0u8; 24];
+    let mut i = 0;
+    let mut n = v;
+    while n > 0 {
+        tmp[i] = (n % 10) as u8 + b'0';
+        n /= 10;
+        i += 1;
+    }
+    let mut j = 0;
+    while i > 0 {
+        i -= 1;
+        buf[j] = tmp[i];
+        j += 1;
+    }
+    &buf[..j]
+}
+
+/// 解析十进制无符号整数。
+fn parse_u64(s: &[u8]) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for &c in s {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + (c - b'0') as u64;
+    }
+    Some(v)
+}
+
+/// 列出全部内建命令。
+fn cmd_help() {
+    out(
+        b"builtins: echo print println help now time uptime version uname cpu \
+sleep clear env export ps kill signal\n",
+    );
+}
+
+/// `now`/`time`：单调时钟（纳秒）。
+fn cmd_now() {
+    let ns = now();
+    let mut b = [0u8; 24];
+    out(b"now: ");
+    out(u64_to_dec(ns, &mut b));
+    out(b" ns (");
+    out(u64_to_dec(ns / 1_000_000_000, &mut b));
+    out(b".");
+    out(u64_to_dec((ns % 1_000_000_000) / 1_000_000, &mut b));
+    out(b" s)\n");
+}
+
+/// `uptime`：开机至今。
+fn cmd_uptime() {
+    let ms = info(INFO_BOOT_MS).unwrap_or(0);
+    let mut b = [0u8; 24];
+    out(b"uptime: ");
+    out(u64_to_dec(ms / 1000, &mut b));
+    out(b".");
+    out(u64_to_dec(ms % 1000, &mut b));
+    out(b" s\n");
+}
+
+/// `version`/`uname`：内核版本。
+fn cmd_version() {
+    let v = info(INFO_VERSION).unwrap_or(0);
+    let mut b = [0u8; 24];
+    out(b"BORUIX v");
+    out(u64_to_dec((v >> 16) & 0xff, &mut b));
+    out(b".");
+    out(u64_to_dec((v >> 8) & 0xff, &mut b));
+    out(b".");
+    out(u64_to_dec(v & 0xff, &mut b));
+    out(b"\n");
+}
+
+/// `cpu`：在线 CPU 数。
+fn cmd_cpu() {
+    let c = info(INFO_CPU_COUNT).unwrap_or(0);
+    let mut b = [0u8; 24];
+    out(b"cpus: ");
+    out(u64_to_dec(c, &mut b));
+    out(b"\n");
+}
+
+/// `sleep <秒>`：睡眠（内核当前为忙等实现）。
+fn cmd_sleep(arg: &[u8]) {
+    let a = trim_bytes(arg);
+    match parse_u64(a) {
+        Some(secs) => {
+            let _ = sleep(secs * 1_000_000_000);
+        }
+        None => out(b"sleep: usage: sleep <seconds>\n"),
+    }
+}
+
+/// `env`：列出全部环境变量。
+fn cmd_env() {
+    unsafe {
+        for i in 0..ENV_COUNT {
+            let (n, v, used) = &ENV_TABLE[i];
+            if !*used {
+                continue;
+            }
+            let mut nl = 0;
+            while nl < ENV_NAME && n[nl] != 0 {
+                nl += 1;
+            }
+            out(&n[..nl]);
+            out(b"=");
+            let mut vl = 0;
+            while vl < ENV_VAL && v[vl] != 0 {
+                vl += 1;
+            }
+            out(&v[..vl]);
+            out(b"\n");
+        }
+    }
+}
+
+/// `export NAME=VALUE`：设置环境变量。
+fn cmd_export(arg: &[u8]) {
+    let a = trim_bytes(arg);
+    if let Some(pos) = a.iter().position(|&c| c == b'=') {
+        let name = &a[..pos];
+        let val = &a[pos + 1..];
+        if name.is_empty() {
+            out(b"export: empty name\n");
+            return;
+        }
+        env_set(name, val);
+    } else {
+        out(b"export: usage: export NAME=VALUE\n");
+    }
+}
+
+/// `ps`：列出存活进程。
+fn cmd_ps() {
+    let mut buf = [PsEntry { pid: 0, state: 0, _pad: [0; 3] }; 32];
+    match ps(&mut buf) {
+        Ok(n) => {
+            out(b"PID  STATE\n");
+            let mut b = [0u8; 24];
+            for e in &buf[..n] {
+                out(u64_to_dec(e.pid as u64, &mut b));
+                out(b"   ");
+                let st: &[u8] = match e.state {
+                    1 => &b"Ready"[..],
+                    2 => &b"Running"[..],
+                    3 => &b"Blocked"[..],
+                    _ => &b"?"[..],
+                };
+                out(st);
+                out(b"\n");
+            }
+        }
+        Err(_) => out(b"ps: failed\n"),
+    }
+}
+
+/// 列出已知信号（供 `kill -l` / `signal`）。
+fn cmd_signal_list() {
+    out(b"signals:\n");
+    let mut b = [0u8; 24];
+    for (num, name) in libsys::signal::LIST {
+        out(u64_to_dec(*num as u64, &mut b));
+        out(b" ");
+        out(name.as_bytes());
+        out(b"\n");
+    }
+}
+
+/// `kill [-s SIG|-SIG|-l] <pid>`：向进程发送信号。
+fn cmd_kill(arg: &[u8]) {
+    let a = trim_bytes(arg);
+    if a == b"-l" {
+        cmd_signal_list();
+        return;
+    }
+    let mut sig: u64 = 15; // 默认 SIGTERM
+    let mut pid: u64 = 0;
+    let mut have_pid = false;
+    let mut i = 0;
+    while i < a.len() {
+        while i < a.len() && a[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= a.len() {
+            break;
+        }
+        let start = i;
+        while i < a.len() && !a[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let tok = &a[start..i];
+        if tok.starts_with(b"-") {
+            let body = &tok[1..];
+            if body == b"l" {
+                cmd_signal_list();
+                return;
+            }
+            let num = if body.starts_with(b"s") { &body[1..] } else { body };
+            if let Some(v) = parse_u64(num) {
+                sig = v;
+            }
+        } else if let Some(v) = parse_u64(tok) {
+            pid = v;
+            have_pid = true;
+        }
+    }
+    if !have_pid {
+        out(b"kill: usage: kill [-s SIG|-SIG|-l] <pid>\n");
+        return;
+    }
+    match kill(pid, sig) {
+        Ok(_) => {}
+        Err(e) => {
+            let mut b = [0u8; 24];
+            out(b"kill: failed (errno ");
+            out(u64_to_dec(e.to_errno() as u64, &mut b));
+            out(b")\n");
+        }
+    }
+}
+
 /// 执行一行命令。以 `;` 结尾可省略。空行/注释(`#`)跳过。
+///
+/// 整行先做 `$VAR` 环境变量展开（`$`-后接 `[A-Za-z0-9_]` 即视为变量名），
+/// 再按首个空白/`(` 切出命令名与参数。
 fn exec_line(line: &[u8]) {
+    // 环境变量展开缓冲（行最长 256）。
+    let mut exp = [0u8; 256];
+    let len = expand_vars(line, &mut exp);
+    let line = &exp[..len];
+
     let line = trim_bytes(line);
     if line.is_empty() || line.first() == Some(&b'#') {
         return;
@@ -335,6 +673,18 @@ fn exec_line(line: &[u8]) {
         b"echo" => exec_echo(arg),
         b"print" => exec_print(arg, false),
         b"println" => exec_print(arg, true),
+        b"help" => cmd_help(),
+        b"now" | b"time" => cmd_now(),
+        b"uptime" => cmd_uptime(),
+        b"version" | b"uname" => cmd_version(),
+        b"cpu" => cmd_cpu(),
+        b"sleep" => cmd_sleep(arg),
+        b"clear" => out(b"\x1b[2J\x1b[H"),
+        b"env" => cmd_env(),
+        b"export" => cmd_export(arg),
+        b"ps" => cmd_ps(),
+        b"kill" => cmd_kill(arg),
+        b"signal" => cmd_signal_list(),
         other => {
             out(b"boruix: unknown command: ");
             out(other);
