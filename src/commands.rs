@@ -15,28 +15,24 @@ pub(crate) fn command_names() -> &'static [&'static [u8]] {
     COMMANDS
 }
 
-/// 别名表容量。
-const MAX_ALIAS: usize = 16;
-const ALIAS_NAME: usize = 16;
-const ALIAS_VAL: usize = 64;
+extern crate alloc;
 
-/// 命令别名表：`(name, value, used)`。仅展开命令行首词（见 `exec_line`）。
-static mut ALIAS_TABLE: [([u8; ALIAS_NAME], [u8; ALIAS_VAL], bool); MAX_ALIAS] =
-    [([0u8; ALIAS_NAME], [0u8; ALIAS_VAL], false); MAX_ALIAS];
-static mut ALIAS_COUNT: usize = 0;
+use alloc::vec::Vec;
+use spin::Mutex;
 
-/// 查别名，返回其值切片（缺失 `None`）。
-pub(crate) fn alias_get(name: &[u8]) -> Option<&'static [u8]> {
-    unsafe {
-        for i in 0..ALIAS_COUNT {
-            let (n, v, used) = &ALIAS_TABLE[i];
-            if *used && n[..name.len()] == *name && n[name.len()..].iter().all(|&b| b == 0) {
-                let mut len = 0;
-                while len < ALIAS_VAL && v[len] != 0 {
-                    len += 1;
-                }
-                return Some(&v[..len]);
-            }
+struct AliasEntry {
+    name: Vec<u8>,
+    val: Vec<u8>,
+}
+
+static ALIAS_TABLE: Mutex<Vec<AliasEntry>> = Mutex::new(Vec::new());
+
+/// 查别名，返回复制的值（缺失 `None`）。
+pub(crate) fn alias_get(name: &[u8]) -> Option<Vec<u8>> {
+    let tbl = ALIAS_TABLE.lock();
+    for entry in tbl.iter() {
+        if entry.name.as_slice() == name {
+            return Some(entry.val.clone());
         }
     }
     None
@@ -44,180 +40,108 @@ pub(crate) fn alias_get(name: &[u8]) -> Option<&'static [u8]> {
 
 /// 设置/覆盖别名。
 pub(crate) fn alias_set(name: &[u8], val: &[u8]) {
-    if name.is_empty() || name.len() > ALIAS_NAME {
+    if name.is_empty() {
         return;
     }
-    let vlen = val.len().min(ALIAS_VAL);
-    unsafe {
-        for i in 0..ALIAS_COUNT {
-            let (n, v, used) = &mut ALIAS_TABLE[i];
-            if *used && n[..name.len()] == *name && n[name.len()..].iter().all(|&b| b == 0) {
-                v[..vlen].copy_from_slice(&val[..vlen]);
-                for x in &mut v[vlen..] {
-                    *x = 0;
-                }
-                return;
-            }
-        }
-        if ALIAS_COUNT >= MAX_ALIAS {
+    let mut tbl = ALIAS_TABLE.lock();
+    for entry in tbl.iter_mut() {
+        if entry.name.as_slice() == name {
+            entry.val.clear();
+            entry.val.extend_from_slice(val);
             return;
         }
-        let i = ALIAS_COUNT;
-        let l = name.len();
-        ALIAS_TABLE[i].0[..l].copy_from_slice(name);
-        for x in &mut ALIAS_TABLE[i].0[l..] {
-            *x = 0;
-        }
-        ALIAS_TABLE[i].1[..vlen].copy_from_slice(&val[..vlen]);
-        for x in &mut ALIAS_TABLE[i].1[vlen..] {
-            *x = 0;
-        }
-        ALIAS_TABLE[i].2 = true;
-        ALIAS_COUNT += 1;
     }
+    tbl.push(AliasEntry {
+        name: name.to_vec(),
+        val: val.to_vec(),
+    });
 }
 
-/// 删除别名（软删除）。
+/// 删除别名。
 pub(crate) fn alias_unset(name: &[u8]) {
-    if name.is_empty() || name.len() > ALIAS_NAME {
+    if name.is_empty() {
         return;
     }
-    unsafe {
-        for i in 0..ALIAS_COUNT {
-            let (n, _v, used) = &mut ALIAS_TABLE[i];
-            if *used && n[..name.len()] == *name && n[name.len()..].iter().all(|&b| b == 0) {
-                *used = false;
-                return;
-            }
-        }
+    let mut tbl = ALIAS_TABLE.lock();
+    if let Some(pos) = tbl.iter().position(|e| e.name.as_slice() == name) {
+        tbl.remove(pos);
     }
 }
 
 /// 遍历所有已定义别名（供 `alias` 无参列出）。
-pub(crate) fn for_each_alias<F: FnMut(&'static [u8], &'static [u8])>(mut f: F) {
-    unsafe {
-        for i in 0..ALIAS_COUNT {
-            let (n, v, used) = &ALIAS_TABLE[i];
-            if !*used {
-                continue;
-            }
-            let mut nl = 0;
-            while nl < ALIAS_NAME && n[nl] != 0 {
-                nl += 1;
-            }
-            let mut vl = 0;
-            while vl < ALIAS_VAL && v[vl] != 0 {
-                vl += 1;
-            }
-            f(&n[..nl], &v[..vl]);
-        }
+pub(crate) fn for_each_alias<F: FnMut(&[u8], &[u8])>(mut f: F) {
+    let tbl = ALIAS_TABLE.lock();
+    for entry in tbl.iter() {
+        f(entry.name.as_slice(), entry.val.as_slice());
     }
 }
 
 use crate::env::{cmd_env, cmd_export, env_unset, set_last_status};
-use crate::tokenize::{tokenize_line, MAX_WORDS, WORD_CAP};
+use crate::tokenize::tokenize_line;
 use crate::util::{out, outln, parse_u64, string_content, trim_bytes, u64_to_dec, unescape};
 
-/// 作业表容量（同时存在的后台作业上限）。
-const JOB_MAX: usize = 16;
-/// 作业命令文本最大字节数。
-const JOB_CMD: usize = 64;
+/// 后台作业条目。
+struct JobEntry {
+    pid: u32,
+    cmd: Vec<u8>,
+    active: bool,
+}
 
-/// 后台作业表：`(pid, cmd, used)`。索引 `i` 对应作业号 `i+1`（供 `%n` 引用）。
-/// 作业由主 shell 经 `exec(shell, cmd)` 拉起，独立地址空间并行运行，跑完自退。
-static mut JOBS: [(u32, [u8; JOB_CMD], bool); JOB_MAX] =
-    [(0u32, [0u8; JOB_CMD], false); JOB_MAX];
+static JOBS: Mutex<Vec<JobEntry>> = Mutex::new(Vec::new());
 
-/// 登记一个后台作业，返回作业号（1 基，供 `%n` 引用）。表满时覆盖最旧槽（0）。
+/// 登记一个后台作业，返回作业号（1 基，供 `%n` 引用）。
 pub(crate) fn job_add(pid: u32, cmd: &[u8]) -> usize {
-    unsafe {
-        let mut slot = 0usize;
-        for i in 0..JOB_MAX {
-            if !JOBS[i].2 {
-                slot = i;
-                break;
-            }
-            if i == JOB_MAX - 1 {
-                slot = 0; // 全满：覆盖最旧
-            }
-        }
-        JOBS[slot].0 = pid;
-        let l = cmd.len().min(JOB_CMD);
-        JOBS[slot].1[..l].copy_from_slice(&cmd[..l]);
-        for x in &mut JOBS[slot].1[l..] {
-            *x = 0;
-        }
-        JOBS[slot].2 = true;
-        slot + 1
-    }
+    let mut jobs = JOBS.lock();
+    jobs.push(JobEntry {
+        pid,
+        cmd: cmd.to_vec(),
+        active: true,
+    });
+    jobs.len()
 }
 
 /// 按作业号（1 基）取 pid；越界或空槽返回 `None`。
 fn job_pid(idx: usize) -> Option<u32> {
-    if idx == 0 || idx > JOB_MAX {
+    if idx == 0 {
         return None;
     }
-    unsafe {
-        if JOBS[idx - 1].2 {
-            Some(JOBS[idx - 1].0)
-        } else {
-            None
-        }
+    let jobs = JOBS.lock();
+    if idx <= jobs.len() && jobs[idx - 1].active {
+        Some(jobs[idx - 1].pid)
+    } else {
+        None
     }
 }
 
 /// 删除作业（如 `kill %n` 后）。
 fn job_remove(idx: usize) {
-    if idx == 0 || idx > JOB_MAX {
+    if idx == 0 {
         return;
     }
-    unsafe {
-        JOBS[idx - 1].2 = false;
+    let mut jobs = JOBS.lock();
+    if idx <= jobs.len() {
+        jobs[idx - 1].active = false;
     }
 }
 
-/// 当前存活进程 pid 集合（供 `jobs` 判定状态）。
-fn alive_pids() -> [u32; 32] {
-    let mut snap = [PsEntry { pid: 0, state: 0, _pad: [0; 3] }; 32];
-    let mut set = [0u32; 32];
-    if let Ok(n) = ps(&mut snap) {
-        for k in 0..n.min(set.len()) {
-            set[k] = snap[k].pid;
-        }
-    }
-    set
-}
-
-/// `jobs`：列出全部后台作业及其存活状态（`ps` 判定 Running/Done）。返回 0。
+/// `jobs`：列出全部后台作业及其存活状态（`ps_list` 判定 Running/Done）。返回 0。
 fn cmd_jobs() -> u8 {
-    let alive = alive_pids();
+    let alive = libsys::ps_list().unwrap_or_default();
     let mut b = [0u8; 24];
-    unsafe {
-        for i in 0..JOB_MAX {
-            if !JOBS[i].2 {
-                continue;
-            }
-            let (pid, cmd, _) = &JOBS[i];
-            let mut live = false;
-            for k in 0..alive.len() {
-                if alive[k] == *pid {
-                    live = true;
-                    break;
-                }
-            }
-            out(b"[");
-            out(u64_to_dec((i + 1) as u64, &mut b));
-            out(b"] ");
-            out(u64_to_dec(*pid as u64, &mut b));
-            out(b" ");
-            out(if live { b"Running " } else { b"Done    " });
-            let mut cl = 0;
-            while cl < JOB_CMD && cmd[cl] != 0 {
-                cl += 1;
-            }
-            out(&cmd[..cl]);
-            out(b"\n");
+    let jobs = JOBS.lock();
+    for (i, job) in jobs.iter().enumerate() {
+        if !job.active {
+            continue;
         }
+        let live = alive.iter().any(|p| p.pid == job.pid);
+        out(b"[");
+        out(u64_to_dec((i + 1) as u64, &mut b));
+        out(b"] ");
+        out(u64_to_dec(job.pid as u64, &mut b));
+        out(b" ");
+        out(if live { b"Running " } else { b"Done    " });
+        out(&job.cmd);
+        out(b"\n");
     }
     0
 }
@@ -462,7 +386,7 @@ fn cmd_alias(arg: &[u8]) -> u8 {
         for_each_alias(|n, v| {
             out(n);
             out(b"='");
-            out(v);
+            out(&v);
             out(b"'\n");
         });
         return 0;
@@ -491,7 +415,7 @@ fn cmd_alias(arg: &[u8]) -> u8 {
             Some(v) => {
                 out(a);
                 out(b"='");
-                out(v);
+                out(&v);
                 out(b"'\n");
             }
             None => {
@@ -549,7 +473,7 @@ fn cmd_which(arg: &[u8]) -> u8 {
         if let Some(av) = alias_get(name) {
             out(name);
             out(b" is aliased to '");
-            out(av);
+            out(&av);
             out(b"'\n");
         } else if command_names().iter().any(|c| c == &name) {
             out(name);
@@ -619,71 +543,41 @@ pub(crate) fn exec_line(line: &[u8]) {
     // 行内注释（引号外的 # 起截到行尾）
     let line = strip_comment(line);
 
-    let mut wbuf = [[0u8; WORD_CAP]; MAX_WORDS];
-    let mut wlen = [0usize; MAX_WORDS];
-    let nw = tokenize_line(line, &mut wbuf, &mut wlen);
-    if nw == 0 {
+    let words = tokenize_line(line);
+    if words.is_empty() {
         return;
     }
-    // 暂存首词到栈上，避免持有 wbuf 的不可变借用跨过下面的重新分词。
-    let mut oname = [0u8; WORD_CAP];
-    let onlen = wlen[0].min(WORD_CAP);
-    oname[..onlen].copy_from_slice(&wbuf[0][..onlen]);
+    let oname = words[0].clone();
 
     // 别名展开：仅替换首词一次（若展开后的首词仍是该别名则停止，防自环）。
-    let mut expanded = [0u8; 512];
+    let mut expanded = Vec::new();
     let mut active: &[u8] = line;
-    if let Some(av) = alias_get(&oname[..onlen]) {
-        let rest = &line[onlen..]; // 首词之后的剩余部分（含前导空白）
-        let mut el = av.len().min(ALIAS_VAL);
-        expanded[..el].copy_from_slice(&av[..el]);
-        for &b in rest {
-            if el < expanded.len() {
-                expanded[el] = b;
-                el += 1;
-            }
-        }
-        let nw2 = tokenize_line(&expanded[..el], &mut wbuf, &mut wlen);
-        // 展开后首词与原首词比较（均来自栈上/刚写入，不持有旧借用）。
-        let new_len = wlen[0].min(WORD_CAP);
-        let mut same = new_len == onlen;
-        if same {
-            for k in 0..new_len {
-                if wbuf[0][k] != oname[k] {
-                    same = false;
-                    break;
-                }
-            }
-        }
-        if nw2 > 0 && !same {
-            active = &expanded[..el];
+    if let Some(av) = alias_get(&oname) {
+        let rest = &line[oname.len()..]; // 首词之后的剩余部分（含前导空白）
+        expanded.extend_from_slice(&av);
+        expanded.extend_from_slice(rest);
+        let words2 = tokenize_line(&expanded);
+        if !words2.is_empty() && words2[0] != oname {
+            active = &expanded;
         }
     }
 
     // 按最终（可能已展开）的命令行重新分词。
-    let nw = tokenize_line(active, &mut wbuf, &mut wlen);
-    if nw == 0 {
+    let final_words = tokenize_line(active);
+    if final_words.is_empty() {
         return;
     }
-    let name = &wbuf[0][..wlen[0]];
+    let name = final_words[0].as_slice();
 
     // 重建参数：剩余词以单空格连接（词内引号保留、VAR 已展开）。
-    let mut argbuf = [0u8; 256];
-    let mut al = 0usize;
-    for k in 1..nw {
-        if al > 0 && al < argbuf.len() {
-            argbuf[al] = b' ';
-            al += 1;
+    let mut argbuf = Vec::new();
+    for (k, w) in final_words.iter().enumerate().skip(1) {
+        if k > 1 {
+            argbuf.push(b' ');
         }
-        let w = &wbuf[k][..wlen[k]];
-        for &b in w {
-            if al < argbuf.len() {
-                argbuf[al] = b;
-                al += 1;
-            }
-        }
+        argbuf.extend_from_slice(w);
     }
-    let arg = &argbuf[..al];
+    let arg = argbuf.as_slice();
 
     let status = match name {
         b"echo" => exec_echo(arg),
