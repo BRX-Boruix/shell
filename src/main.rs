@@ -155,16 +155,10 @@ fn redraw_at(buf: &[u8], n: usize, cursor: usize) {
     // 左移 (n - cursor) 格，使硬件光标停在编辑位置。
     let back = n - cursor;
     if back > 0 {
-        let mut seq = [0u8; 8];
-        let mut i = 0;
-        seq[i] = b'\x1b'; i += 1;
-        seq[i] = b'['; i += 1;
-        if back >= 10 {
-            seq[i] = b'0' + (back / 10) as u8; i += 1;
-        }
-        seq[i] = b'0' + (back % 10) as u8; i += 1;
-        seq[i] = b'D'; i += 1;
-        out(&seq[..i]);
+        let mut b = [0u8; 24];
+        out(b"\x1b[");
+        out(u64_to_dec(back as u64, &mut b));
+        out(b"D");
     }
 }
 
@@ -396,7 +390,7 @@ fn read_line(buf: &mut [u8]) -> usize {
     // `\x1b[A`，Insert→`\x1b[2~`，F1→`\x1bOP`）。此处按状态机解析或吞掉。
     // 0=普通 1=已遇 ESC 2=CSI 参数/中间字节 3=SS3 单字节终结。
     let mut esc_state: u8 = 0;
-    while n < buf.len() {
+    loop {
         let mut one = [0u8; 1];
         match read(STDIN, &mut one) {
             Ok(got) if got == 1 => {
@@ -511,16 +505,26 @@ fn read_line(buf: &mut [u8]) -> usize {
                 } else if c >= 0x20 {
                     // 可打印字符：在光标处插入。
                     if n < buf.len() {
-                        let mut k = n;
-                        while k > cur {
-                            buf[k] = buf[k - 1];
-                            k -= 1;
+                        if cur == n {
+                            // 优化：在行尾追加字符时，直接输出单个字符，避免整行重绘导致终端跨行时刷屏混乱
+                            buf[cur] = c;
+                            n += 1;
+                            cur += 1;
+                            let single = [c];
+                            out(&single);
+                        } else {
+                            let mut k = n;
+                            while k > cur {
+                                buf[k] = buf[k - 1];
+                                k -= 1;
+                            }
+                            buf[cur] = c;
+                            n += 1;
+                            cur += 1;
+                            redraw_at(buf, n, cur);
                         }
-                        buf[cur] = c;
-                        n += 1;
-                        cur += 1;
-                        redraw_at(buf, n, cur);
                     }
+                    // 若超过缓冲容量 (buf.len)，忽略多余字符，等待用户回车，不提前退出
                 }
                 // 其余控制字符（其它）忽略。
             }
