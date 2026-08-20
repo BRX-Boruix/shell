@@ -229,11 +229,11 @@ fn print_value(val: &JsonValue, prefix: &str) {
             let total = fields.len();
             for (idx, (k, v)) in fields.iter().enumerate() {
                 let is_last = idx + 1 == total;
-                let branch = if is_last { "└── " } else { "├── " };
+                let branch = if is_last { "`-- " } else { "|-- " };
                 let next_prefix = if is_last {
                     alloc::format!("{}    ", prefix)
                 } else {
-                    alloc::format!("{}│   ", prefix)
+                    alloc::format!("{}|   ", prefix)
                 };
 
                 match v {
@@ -257,11 +257,11 @@ fn print_value(val: &JsonValue, prefix: &str) {
             let total = items.len();
             for (idx, v) in items.iter().enumerate() {
                 let is_last = idx + 1 == total;
-                let branch = if is_last { "└── " } else { "├── " };
+                let branch = if is_last { "`-- " } else { "|-- " };
                 let next_prefix = if is_last {
                     alloc::format!("{}    ", prefix)
                 } else {
-                    alloc::format!("{}│   ", prefix)
+                    alloc::format!("{}|   ", prefix)
                 };
 
                 match v {

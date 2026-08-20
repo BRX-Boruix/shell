@@ -573,9 +573,9 @@ fn cmd_ls(arg: &[u8]) -> u8 {
                 let mut b = [0u8; 24];
                 for entry in &entries {
                     let (type_badge, color, indicator): (&str, &[u8], &str) = match entry.node_type.as_str() {
-                        "Directory" => ("<DIR>   ", b"\x1b[1;34m", "/"),
-                        "Symlink" => ("<LNK>   ", b"\x1b[1;36m", "@"),
-                        "Device" => ("<DEV>   ", b"\x1b[1;33m", "%"),
+                        "dir" | "Directory" => ("<DIR>   ", b"\x1b[1;34m", "/"),
+                        "link" | "Symlink" => ("<LNK>   ", b"\x1b[1;36m", "@"),
+                        "chardev" | "blkdev" | "Device" => ("<DEV>   ", b"\x1b[1;33m", "%"),
                         _ => {
                             if entry.name.ends_with(".elf") {
                                 ("<BIN>   ", b"\x1b[1;32m", "*")
@@ -601,9 +601,9 @@ fn cmd_ls(arg: &[u8]) -> u8 {
                 // 简洁彩色网格模式
                 for entry in &entries {
                     let (color, indicator): (&[u8], &str) = match entry.node_type.as_str() {
-                        "Directory" => (b"\x1b[1;34m", "/"),
-                        "Symlink" => (b"\x1b[1;36m", "@"),
-                        "Device" => (b"\x1b[1;33m", "%"),
+                        "dir" | "Directory" => (b"\x1b[1;34m", "/"),
+                        "link" | "Symlink" => (b"\x1b[1;36m", "@"),
+                        "chardev" | "blkdev" | "Device" => (b"\x1b[1;33m", "%"),
                         _ => {
                             if entry.name.ends_with(".elf") {
                                 (b"\x1b[1;32m", "*")
@@ -811,14 +811,14 @@ fn print_vfs_tree(dir_path: &str, prefix: &str) {
     let total = entries.len();
     for (idx, entry) in entries.iter().enumerate() {
         let is_last = idx + 1 == total;
-        let branch = if is_last { "└── " } else { "├── " };
+        let branch = if is_last { "`-- " } else { "|-- " };
         let next_prefix = if is_last {
             alloc::format!("{}    ", prefix)
         } else {
-            alloc::format!("{}│   ", prefix)
+            alloc::format!("{}|   ", prefix)
         };
 
-        let is_dir = entry.node_type == "Directory";
+        let is_dir = entry.node_type == "dir" || entry.node_type == "Directory";
         if is_dir {
             out(alloc::format!("{}{}{}/\n", prefix, branch, entry.name).as_bytes());
             let sub_path = if dir_path == "/" {
