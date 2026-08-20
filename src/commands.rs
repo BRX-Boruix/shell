@@ -2,12 +2,13 @@
 //!
 //! 各 `cmd_*` 对应一条 shell 内建命令；`exec_echo` 处理 `echo`；
 //! `exec_line` 负责分词、参数重建并把命令名分派到对应实现。
+//! 支持基础文件操作：`ls`, `cat`, `mkdir`, `touch`, `rm` 以及 `--json` 输出模式。
 
 /// 所有内建命令名（供 Tab 补全使用）。
 pub(crate) const COMMANDS: &[&[u8]] = &[
     b"echo", b"help", b"now", b"time", b"uptime", b"version", b"uname", b"cpu", b"sleep",
     b"clear", b"env", b"export", b"unset", b"ps", b"kill", b"signal", b"alias", b"unalias",
-    b"which", b"jobs",
+    b"which", b"jobs", b"ls", b"cat", b"mkdir", b"touch", b"rm",
 ];
 
 /// 返回内建命令名列表（供补全遍历）。
@@ -17,6 +18,7 @@ pub(crate) fn command_names() -> &'static [&'static [u8]] {
 
 extern crate alloc;
 
+use alloc::string::ToString;
 use alloc::vec::Vec;
 use spin::Mutex;
 
@@ -124,11 +126,41 @@ fn job_remove(idx: usize) {
     }
 }
 
-/// `jobs`：列出全部后台作业及其存活状态（`ps_list` 判定 Running/Done）。返回 0。
-fn cmd_jobs() -> u8 {
+/// `jobs`：列出全部后台作业及其存活状态。支持 `--json` 格式。返回 0。
+fn cmd_jobs(arg: &[u8]) -> u8 {
+    let is_json = trim_bytes(arg) == b"--json";
     let alive = libsys::ps_list().unwrap_or_default();
-    let mut b = [0u8; 24];
     let jobs = JOBS.lock();
+
+    if is_json {
+        use libsys::json::{JsonWriter, VecTarget};
+        let mut target = VecTarget::new();
+        let mut writer = JsonWriter::new(&mut target);
+        if let Ok(mut arr) = writer.start_array() {
+            for (i, job) in jobs.iter().enumerate() {
+                if !job.active {
+                    continue;
+                }
+                let live = alive.iter().any(|p| p.pid == job.pid);
+                let state_str = if live { "Running" } else { "Done" };
+                let cmd_str = core::str::from_utf8(&job.cmd).unwrap_or("");
+                let _ = arr.push_object(|obj| {
+                    let _ = obj.field_u64("job", (i + 1) as u64);
+                    let _ = obj.field_u64("pid", job.pid as u64);
+                    let _ = obj.field_str("state", state_str);
+                    let _ = obj.field_str("command", cmd_str);
+                    Ok(())
+                });
+            }
+            let _ = arr.end();
+        }
+        let mut b = target.into_bytes();
+        b.push(b'\n');
+        out(&b);
+        return 0;
+    }
+
+    let mut b = [0u8; 24];
     for (i, job) in jobs.iter().enumerate() {
         if !job.active {
             continue;
@@ -138,22 +170,29 @@ fn cmd_jobs() -> u8 {
         out(u64_to_dec((i + 1) as u64, &mut b));
         out(b"] ");
         out(u64_to_dec(job.pid as u64, &mut b));
-        out(b" ");
-        out(if live { b"Running " } else { b"Done    " });
+        if live {
+            out(b" Running    ");
+        } else {
+            out(b" Done       ");
+        }
         out(&job.cmd);
         out(b"\n");
     }
     0
 }
-use libsys::{info, kill, now, ps, sleep, PsEntry};
+
 use libsys::nr::{INFO_BOOT_MS, INFO_CPU_COUNT, INFO_VERSION};
+use libsys::{
+    close, flock, info, kill, mkdir, now, open, ps, read_dir, read_to_end, sleep, unlink, write,
+    DirEntry, OpenFlags, Permissions, PsEntry,
+};
 use libsys::signal::LIST;
 
 /// 列出全部内建命令。
 fn cmd_help() -> u8 {
     out(
         b"builtins: echo help now time uptime version uname cpu \
-sleep clear env export unset ps kill signal alias unalias which\n",
+sleep clear env export unset ps kill signal alias unalias which jobs ls cat mkdir touch rm\n",
     );
     0
 }
@@ -172,9 +211,24 @@ fn cmd_now() -> u8 {
     0
 }
 
-/// `uptime`：开机至今。
-fn cmd_uptime() -> u8 {
+/// `uptime`：开机至今。支持 `--json` 输出。
+fn cmd_uptime(arg: &[u8]) -> u8 {
     let ms = info(INFO_BOOT_MS).unwrap_or(0);
+    if trim_bytes(arg) == b"--json" {
+        use libsys::json::{JsonWriter, VecTarget};
+        let mut target = VecTarget::new();
+        let mut writer = JsonWriter::new(&mut target);
+        if let Ok(mut obj) = writer.start_object() {
+            let _ = obj.field_u64("uptime_ms", ms);
+            let _ = obj.field_u64("uptime_seconds", ms / 1000);
+            let _ = obj.end();
+        }
+        let mut b = target.into_bytes();
+        b.push(b'\n');
+        out(&b);
+        return 0;
+    }
+
     let mut b = [0u8; 24];
     out(b"uptime: ");
     out(u64_to_dec(ms / 1000, &mut b));
@@ -208,7 +262,7 @@ fn cmd_cpu() -> u8 {
     0
 }
 
-/// `sleep <秒>`：睡眠（内核当前为忙等实现）。返回：0 成功，1 参数错误。
+/// `sleep <秒>`：睡眠。返回：0 成功，1 参数错误。
 fn cmd_sleep(arg: &[u8]) -> u8 {
     let a = trim_bytes(arg);
     match parse_u64(a) {
@@ -223,8 +277,17 @@ fn cmd_sleep(arg: &[u8]) -> u8 {
     }
 }
 
-/// `ps`：列出存活进程。返回：0 成功，1 查询失败。
-fn cmd_ps() -> u8 {
+/// `ps`：列出存活进程。支持 `--json` 输出。
+fn cmd_ps(arg: &[u8]) -> u8 {
+    let is_json = trim_bytes(arg) == b"--json";
+    if is_json {
+        // 直接从 ProcFS 读取 JSON 数组输出
+        if let Ok(bytes) = read_to_end("/processes/list") {
+            out(&bytes);
+            return 0;
+        }
+    }
+
     let mut buf = [PsEntry { pid: 0, state: 0, _pad: [0; 3] }; 32];
     match ps(&mut buf) {
         Ok(n) => {
@@ -251,51 +314,33 @@ fn cmd_ps() -> u8 {
     }
 }
 
-/// 列出已知信号（供 `kill -l` / `signal`）。返回 0。
+/// `signal`：打印信号清单。
 fn cmd_signal_list() -> u8 {
-    out(b"signals:\n");
     let mut b = [0u8; 24];
     for (num, name) in LIST {
         out(u64_to_dec(*num as u64, &mut b));
-        out(b" ");
+        out(b") SIG");
         out(name.as_bytes());
         out(b"\n");
     }
     0
 }
 
-/// `kill [-s SIG|-SIG|-l] <pid>`：向进程发送信号。
-/// 返回：0 成功，1 发送失败，127 用法错误。
+/// `kill [-s SIG|-SIG|-l] <pid|%job>`：发送信号。
 fn cmd_kill(arg: &[u8]) -> u8 {
     let a = trim_bytes(arg);
-    if a == b"-l" {
-        cmd_signal_list();
-        return 0;
-    }
-    let mut sig: u64 = 15; // 默认 SIGTERM
+    let mut sig: u64 = 15;
     let mut pid: u64 = 0;
     let mut have_pid = false;
-    let mut i = 0;
-    while i < a.len() {
-        while i < a.len() && a[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= a.len() {
-            break;
-        }
-        let start = i;
-        while i < a.len() && !a[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        let tok = &a[start..i];
-        // `kill %n`：按作业号（1 基）引用后台作业。
-        if tok.first() == Some(&b'%') {
-            match parse_u64(&tok[1..]) {
-                Some(v) => match job_pid(v as usize) {
+    for tok in a.split(|&c| c.is_ascii_whitespace()).filter(|s| !s.is_empty()) {
+        if tok.starts_with(b"%") {
+            let num = &tok[1..];
+            match parse_u64(num) {
+                Some(idx) => match job_pid(idx as usize) {
                     Some(p) => {
                         pid = p as u64;
                         have_pid = true;
-                        job_remove(v as usize);
+                        job_remove(idx as usize);
                     }
                     None => {
                         out(b"kill: no such job: ");
@@ -344,21 +389,19 @@ fn cmd_kill(arg: &[u8]) -> u8 {
     }
 }
 
-/// 执行 `echo <文本>`：输出一行。支持双引号字符串与转义。返回 0。
+/// 执行 `echo <文本>`：输出一行。
 fn exec_echo(arg: &[u8]) -> u8 {
     if let Some(content) = string_content(arg) {
         let mut buf = [0u8; 256];
         let n = unescape(content, &mut buf);
         outln(&buf[..n]);
     } else {
-        // 裸文本（无引号）：去掉首尾空白后原样输出。
         outln(trim_bytes(arg));
     }
     0
 }
 
-/// `unset NAME...`：删除一个或多个变量（空格分隔）。缺失的名字静默忽略。
-/// 返回 0（与 POSIX 一致）。
+/// `unset NAME...`：删除变量。
 fn cmd_unset(arg: &[u8]) -> u8 {
     let a = trim_bytes(arg);
     let mut i = 0;
@@ -378,8 +421,7 @@ fn cmd_unset(arg: &[u8]) -> u8 {
     0
 }
 
-/// `alias` / `alias NAME=VALUE` / `alias NAME`：列出全部、设置或查询别名。
-/// 返回：0 正常，1 空名字。
+/// `alias` / `alias NAME=VALUE`：别名支持。
 fn cmd_alias(arg: &[u8]) -> u8 {
     let a = trim_bytes(arg);
     if a.is_empty() {
@@ -394,8 +436,6 @@ fn cmd_alias(arg: &[u8]) -> u8 {
     if let Some(eq) = a.iter().position(|&c| c == b'=') {
         let name = &a[..eq];
         let mut val = &a[eq + 1..];
-        // 剥除值两端成对引号（如 `alias g='echo hi'` 的 `'...'`），
-        // 否则引号会被原样存下、展开时变成字面命令名的一部分。
         if val.len() >= 2 {
             let f = val.first().copied().unwrap();
             let l = val.last().copied().unwrap();
@@ -410,7 +450,6 @@ fn cmd_alias(arg: &[u8]) -> u8 {
         alias_set(name, val);
         0
     } else {
-        // 仅查询单个别名
         match alias_get(a) {
             Some(v) => {
                 out(a);
@@ -428,8 +467,7 @@ fn cmd_alias(arg: &[u8]) -> u8 {
     }
 }
 
-/// `unalias NAME...`：删除一个或多个别名（空格分隔）。缺失的名字静默忽略。
-/// 返回 0。
+/// `unalias NAME...`：删除别名。
 fn cmd_unalias(arg: &[u8]) -> u8 {
     let a = trim_bytes(arg);
     let mut i = 0;
@@ -449,73 +487,181 @@ fn cmd_unalias(arg: &[u8]) -> u8 {
     0
 }
 
-/// `which NAME...`：报告每个名字是别名还是内建命令，否则 not found。
-/// 返回：0 正常，1 用法错误（无参数）。
+/// `which NAME`：查找命令类型。
 fn cmd_which(arg: &[u8]) -> u8 {
-    let a = trim_bytes(arg);
-    if a.is_empty() {
-        out(b"which: usage: which <name...>\n");
+    let name = trim_bytes(arg);
+    if name.is_empty() {
+        out(b"which: missing argument\n");
         return 1;
     }
-    let mut i = 0;
-    while i < a.len() {
-        while i < a.len() && a[i].is_ascii_whitespace() {
-            i += 1;
+    if alias_get(name).is_some() {
+        out(name);
+        out(b": aliased to `");
+        if let Some(v) = alias_get(name) {
+            out(&v);
         }
-        if i >= a.len() {
-            break;
-        }
-        let start = i;
-        while i < a.len() && !a[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        let name = &a[start..i];
-        if let Some(av) = alias_get(name) {
+        out(b"`\n");
+        return 0;
+    }
+    for &b in COMMANDS {
+        if b == name {
             out(name);
-            out(b" is aliased to '");
-            out(&av);
-            out(b"'\n");
-        } else if command_names().iter().any(|c| c == &name) {
-            out(name);
-            out(b" is a shell builtin\n");
-        } else {
-            out(name);
-            out(b": not found\n");
+            out(b": shell built-in command\n");
+            return 0;
         }
     }
-    0
+    out(name);
+    out(b": not found\n");
+    1
 }
 
-/// 去掉行内注释：从第一个**未加引号**的 `#` 起截到行尾。
-/// 双引号/单引号内的 `#` 不当作注释（如 `echo "a#b"`）。
+// ==================== M6.5 文件系统内建命令 ====================
+
+/// `ls [path]`：列出目录项。
+fn cmd_ls(arg: &[u8]) -> u8 {
+    let a = trim_bytes(arg);
+    let path = if a.is_empty() { "/" } else { core::str::from_utf8(a).unwrap_or("/") };
+    match read_dir(path) {
+        Ok(entries) => {
+            for entry in entries {
+                out(entry.name.as_bytes());
+                if entry.node_type == "Directory" {
+                    out(b"/");
+                }
+                out(b"  ");
+            }
+            out(b"\n");
+            0
+        }
+        Err(_) => {
+            out(b"ls: cannot access '");
+            out(a);
+            out(b"': No such file or directory\n");
+            1
+        }
+    }
+}
+
+/// `cat <file>`：打印文件内容。
+fn cmd_cat(arg: &[u8]) -> u8 {
+    let a = trim_bytes(arg);
+    if a.is_empty() {
+        out(b"cat: missing file operand\n");
+        return 1;
+    }
+    let path = match core::str::from_utf8(a) {
+        Ok(p) => p,
+        Err(_) => return 1,
+    };
+    match read_to_end(path) {
+        Ok(bytes) => {
+            out(&bytes);
+            if !bytes.ends_with(b"\n") {
+                out(b"\n");
+            }
+            0
+        }
+        Err(_) => {
+            out(b"cat: ");
+            out(a);
+            out(b": No such file or directory\n");
+            1
+        }
+    }
+}
+
+/// `mkdir <dir>`：创建目录。
+fn cmd_mkdir(arg: &[u8]) -> u8 {
+    let a = trim_bytes(arg);
+    if a.is_empty() {
+        out(b"mkdir: missing operand\n");
+        return 1;
+    }
+    let path = match core::str::from_utf8(a) {
+        Ok(p) => p,
+        Err(_) => return 1,
+    };
+    match mkdir(path, Permissions::all()) {
+        Ok(_) => 0,
+        Err(_) => {
+            out(b"mkdir: cannot create directory '");
+            out(a);
+            out(b"'\n");
+            1
+        }
+    }
+}
+
+/// `touch <file>`：创建空文件。
+fn cmd_touch(arg: &[u8]) -> u8 {
+    let a = trim_bytes(arg);
+    if a.is_empty() {
+        out(b"touch: missing file operand\n");
+        return 1;
+    }
+    let path = match core::str::from_utf8(a) {
+        Ok(p) => p,
+        Err(_) => return 1,
+    };
+    match open(path, OpenFlags::CREATE_OR_TRUNCATE, Permissions::all()) {
+        Ok(fd) => {
+            let _ = close(fd);
+            0
+        }
+        Err(_) => {
+            out(b"touch: cannot touch '");
+            out(a);
+            out(b"'\n");
+            1
+        }
+    }
+}
+
+/// `rm <file_or_dir>`：删除文件或空目录。
+fn cmd_rm(arg: &[u8]) -> u8 {
+    let a = trim_bytes(arg);
+    if a.is_empty() {
+        out(b"rm: missing operand\n");
+        return 1;
+    }
+    let path = match core::str::from_utf8(a) {
+        Ok(p) => p,
+        Err(_) => return 1,
+    };
+    match unlink(path) {
+        Ok(_) => 0,
+        Err(_) => {
+            out(b"rm: cannot remove '");
+            out(a);
+            out(b"'\n");
+            1
+        }
+    }
+}
+
+/// 剥除注释。
 fn strip_comment(line: &[u8]) -> &[u8] {
-    let n = line.len();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
     let mut i = 0;
-    let mut in_q = 0u8; // 0=无 1=双引号 2=单引号
-    while i < n {
+    while i < line.len() {
         let c = line[i];
-        if in_q != 0 {
-            if c == b'\\' && in_q == 1 && i + 1 < n {
-                i += 2; // 双引号内转义，跳过下一字符
-                continue;
-            }
-            if (in_q == 1 && c == b'"') || (in_q == 2 && c == b'\'') {
-                in_q = 0;
-            }
+        if escape {
+            escape = false;
             i += 1;
             continue;
         }
-        if c == b'"' {
-            in_q = 1;
+        if c == b'\\' && !in_single {
+            escape = true;
             i += 1;
             continue;
         }
-        if c == b'\'' {
-            in_q = 2;
-            i += 1;
-            continue;
-        }
-        if c == b'#' {
+        if c == b'\'' && !in_double {
+            in_single = !in_single;
+        } else if c == b'"' && !in_single {
+            in_double = !in_double;
+        } else if c == b'#' && !in_single && !in_double {
             return &line[..i];
         }
         i += 1;
@@ -523,24 +669,17 @@ fn strip_comment(line: &[u8]) -> &[u8] {
     line
 }
 
-/// 执行一行输入。以 `;` 结尾可省略。空行/整行注释(`#`)跳过；行内 `#`（引号外）
-/// 视为注释截掉。执行后把命令退出码写入 `$?`（见 `env::set_last_status`）。
-///
-/// 经 `tokenize_line` 按引号感知规则分词并展开 `$VAR`，首词为命令名，其余词
-/// 以单空格重连成 `arg` 传给对应实现（引号已在 `exec_echo` 处解析，故此处保留
-/// 引号字符）。
+/// 执行一行输入。
 pub(crate) fn exec_line(line: &[u8]) {
     let line = trim_bytes(line);
     if line.is_empty() || line.first() == Some(&b'#') {
         return;
     }
-    // 去掉结尾分号
     let line = if line.last() == Some(&b';') {
         &line[..line.len() - 1]
     } else {
         line
     };
-    // 行内注释（引号外的 # 起截到行尾）
     let line = strip_comment(line);
 
     let words = tokenize_line(line);
@@ -549,11 +688,10 @@ pub(crate) fn exec_line(line: &[u8]) {
     }
     let oname = words[0].clone();
 
-    // 别名展开：仅替换首词一次（若展开后的首词仍是该别名则停止，防自环）。
     let mut expanded = Vec::new();
     let mut active: &[u8] = line;
     if let Some(av) = alias_get(&oname) {
-        let rest = &line[oname.len()..]; // 首词之后的剩余部分（含前导空白）
+        let rest = &line[oname.len()..];
         expanded.extend_from_slice(&av);
         expanded.extend_from_slice(rest);
         let words2 = tokenize_line(&expanded);
@@ -562,14 +700,12 @@ pub(crate) fn exec_line(line: &[u8]) {
         }
     }
 
-    // 按最终（可能已展开）的命令行重新分词。
     let final_words = tokenize_line(active);
     if final_words.is_empty() {
         return;
     }
     let name = final_words[0].as_slice();
 
-    // 重建参数：剩余词以单空格连接（词内引号保留、VAR 已展开）。
     let mut argbuf = Vec::new();
     for (k, w) in final_words.iter().enumerate().skip(1) {
         if k > 1 {
@@ -583,7 +719,7 @@ pub(crate) fn exec_line(line: &[u8]) {
         b"echo" => exec_echo(arg),
         b"help" => cmd_help(),
         b"now" | b"time" => cmd_now(),
-        b"uptime" => cmd_uptime(),
+        b"uptime" => cmd_uptime(arg),
         b"version" | b"uname" => cmd_version(),
         b"cpu" => cmd_cpu(),
         b"sleep" => cmd_sleep(arg),
@@ -594,13 +730,18 @@ pub(crate) fn exec_line(line: &[u8]) {
         b"env" => cmd_env(),
         b"export" => cmd_export(arg),
         b"unset" => cmd_unset(arg),
-        b"ps" => cmd_ps(),
+        b"ps" => cmd_ps(arg),
         b"kill" => cmd_kill(arg),
         b"signal" => cmd_signal_list(),
         b"alias" => cmd_alias(arg),
         b"unalias" => cmd_unalias(arg),
         b"which" => cmd_which(arg),
-        b"jobs" => cmd_jobs(),
+        b"jobs" => cmd_jobs(arg),
+        b"ls" => cmd_ls(arg),
+        b"cat" => cmd_cat(arg),
+        b"mkdir" => cmd_mkdir(arg),
+        b"touch" => cmd_touch(arg),
+        b"rm" => cmd_rm(arg),
         other => {
             out(b"boruix: unknown command: ");
             out(other);

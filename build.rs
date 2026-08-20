@@ -5,7 +5,10 @@
 //! `-no-pie`：强制生成 ET_EXEC（非 PIE），因内核 ELF 加载器只接受 ET_EXEC。
 
 fn main() {
-    let dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
-    println!("cargo:rustc-link-arg=-T{}/linker.ld", dir);
-    println!("cargo:rustc-link-arg=-no-pie");
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "none" {
+        let dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+        println!("cargo:rustc-link-arg=-T{}/linker.ld", dir);
+        println!("cargo:rustc-link-arg=-no-pie");
+    }
 }

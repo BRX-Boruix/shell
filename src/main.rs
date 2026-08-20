@@ -10,8 +10,11 @@
 //! - `commands`: 内建命令与命令分发
 //! - `main`    : 入口、REPL 循环、行读取（含历史与 Tab 补全）
 
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
+
+#[cfg(test)]
+extern crate std;
 
 extern crate alloc;
 
@@ -197,6 +200,23 @@ fn history_next(
     redraw_at(buf, cur);
 }
 
+/// Smart-Case 智能匹配：如果输入前缀全为小写，则忽略大小写模糊匹配；若输入含大写字母，则严格匹配。
+fn smart_case_match(prefix: &[u8], candidate: &[u8]) -> bool {
+    if candidate.len() < prefix.len() {
+        return false;
+    }
+    let has_uppercase = prefix.iter().any(|b| b.is_ascii_uppercase());
+    if has_uppercase {
+        &candidate[..prefix.len()] == prefix
+    } else {
+        let cand_prefix = &candidate[..prefix.len()];
+        cand_prefix
+            .iter()
+            .zip(prefix.iter())
+            .all(|(c, p)| c.to_ascii_lowercase() == *p)
+    }
+}
+
 fn tab_complete(buf: &mut Vec<u8>) {
     let mut ws = 0usize;
     for k in 0..buf.len() {
@@ -216,13 +236,13 @@ fn tab_complete(buf: &mut Vec<u8>) {
     let mut matches: Vec<Vec<u8>> = Vec::new();
     if is_cmd {
         for name in command_names() {
-            if name.len() >= prefix.len() && &name[..prefix.len()] == prefix {
+            if smart_case_match(prefix, name) {
                 matches.push(name.to_vec());
             }
         }
     } else {
         for_each_env_name(|name| {
-            if name.len() >= prefix.len() && &name[..prefix.len()] == prefix {
+            if smart_case_match(prefix, name) {
                 matches.push(name.to_vec());
             }
         });
@@ -396,4 +416,26 @@ fn read_line() -> Vec<u8> {
     history_push(&buf);
     out(b"\n");
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_smart_case_match() {
+        // 全小写前缀：模糊匹配（忽略大小写）
+        assert!(smart_case_match(b"ver", b"version"));
+        assert!(smart_case_match(b"ver", b"VERSION"));
+        assert!(smart_case_match(b"ps", b"ps"));
+        assert!(smart_case_match(b"ps", b"PS_FLAG"));
+        assert!(smart_case_match(b"cat", b"cat"));
+        assert!(smart_case_match(b"ls", b"ls"));
+
+        // 含有大写前缀：严格区分大小写
+        assert!(smart_case_match(b"Ver", b"Version"));
+        assert!(!smart_case_match(b"Ver", b"version"));
+        assert!(smart_case_match(b"PS", b"PS_FLAG"));
+        assert!(!smart_case_match(b"PS", b"ps"));
+    }
 }
