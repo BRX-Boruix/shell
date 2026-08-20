@@ -517,25 +517,113 @@ fn cmd_which(arg: &[u8]) -> u8 {
 
 // ==================== M6.5 文件系统内建命令 ====================
 
-/// `ls [path]`：列出目录项。
+/// `ls [-l] [--json] [path]`：列出目录项（带颜色高亮与类型区分标识）。
+///
+/// 特殊显示规则：
+/// - **目录（Directory）**：蓝粗体 `\x1b[1;34m` + 尾部 `/`（如 `binaries/`）
+/// - **可执行文件（.elf）**：亮绿体 `\x1b[1;32m` + 尾部 `*`（如 `shell.elf*`）
+/// - **符号链接（Symlink）**：青色 `\x1b[1;36m` + 尾部 `@`
+/// - **设备/特殊节点（Device）**：黄色 `\x1b[1;33m` + 尾部 `%`
+/// - **普通文本/数据文件**：默认白色
+/// - 支持 `ls -l` 详细长列表模式（显示类型、字节大小、名称）
+/// - 支持 `ls --json` 结构化输出
 fn cmd_ls(arg: &[u8]) -> u8 {
     let a = trim_bytes(arg);
-    let path = if a.is_empty() { "/" } else { core::str::from_utf8(a).unwrap_or("/") };
+    let mut long_mode = false;
+    let mut json_mode = false;
+    let mut path = "/";
+
+    for tok in a.split(|&c| c.is_ascii_whitespace()).filter(|s| !s.is_empty()) {
+        if tok == b"-l" {
+            long_mode = true;
+        } else if tok == b"--json" {
+            json_mode = true;
+        } else if !tok.starts_with(b"-") {
+            if let Ok(p) = core::str::from_utf8(tok) {
+                path = p;
+            }
+        }
+    }
+
     match read_dir(path) {
         Ok(entries) => {
-            for entry in entries {
-                out(entry.name.as_bytes());
-                if entry.node_type == "Directory" {
-                    out(b"/");
+            if json_mode {
+                use libsys::json::{JsonWriter, VecTarget};
+                let mut target = VecTarget::new();
+                let mut writer = JsonWriter::new(&mut target);
+                if let Ok(mut arr) = writer.start_array() {
+                    for entry in &entries {
+                        let _ = arr.push_object(|obj| {
+                            let _ = obj.field_str("name", &entry.name);
+                            let _ = obj.field_str("type", &entry.node_type);
+                            let _ = obj.field_u64("size", entry.size);
+                            Ok(())
+                        });
+                    }
+                    let _ = arr.end();
                 }
-                out(b"  ");
+                let mut b = target.into_bytes();
+                b.push(b'\n');
+                out(&b);
+                return 0;
             }
-            out(b"\n");
+
+            if long_mode {
+                out(b"TYPE        SIZE   NAME\n");
+                let mut b = [0u8; 24];
+                for entry in &entries {
+                    let (type_badge, color, indicator): (&str, &[u8], &str) = match entry.node_type.as_str() {
+                        "Directory" => ("<DIR>   ", b"\x1b[1;34m", "/"),
+                        "Symlink" => ("<LNK>   ", b"\x1b[1;36m", "@"),
+                        "Device" => ("<DEV>   ", b"\x1b[1;33m", "%"),
+                        _ => {
+                            if entry.name.ends_with(".elf") {
+                                ("<BIN>   ", b"\x1b[1;32m", "*")
+                            } else {
+                                ("<FILE>  ", b"\x1b[0m", "")
+                            }
+                        }
+                    };
+                    out(type_badge.as_bytes());
+                    let size_bytes = u64_to_dec(entry.size, &mut b);
+                    let pad = 8usize.saturating_sub(size_bytes.len());
+                    for _ in 0..pad {
+                        out(b" ");
+                    }
+                    out(size_bytes);
+                    out(b"   ");
+                    out(color);
+                    out(entry.name.as_bytes());
+                    out(indicator.as_bytes());
+                    out(b"\x1b[0m\n");
+                }
+            } else {
+                // 简洁彩色网格模式
+                for entry in &entries {
+                    let (color, indicator): (&[u8], &str) = match entry.node_type.as_str() {
+                        "Directory" => (b"\x1b[1;34m", "/"),
+                        "Symlink" => (b"\x1b[1;36m", "@"),
+                        "Device" => (b"\x1b[1;33m", "%"),
+                        _ => {
+                            if entry.name.ends_with(".elf") {
+                                (b"\x1b[1;32m", "*")
+                            } else {
+                                (b"\x1b[0m", "")
+                            }
+                        }
+                    };
+                    out(color);
+                    out(entry.name.as_bytes());
+                    out(indicator.as_bytes());
+                    out(b"\x1b[0m  ");
+                }
+                out(b"\n");
+            }
             0
         }
         Err(_) => {
             out(b"ls: cannot access '");
-            out(a);
+            out(path.as_bytes());
             out(b"': No such file or directory\n");
             1
         }
