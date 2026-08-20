@@ -21,6 +21,7 @@ extern crate alloc;
 mod commands;
 mod env;
 mod tokenize;
+pub mod tree_json;
 mod util;
 
 use alloc::vec::Vec;

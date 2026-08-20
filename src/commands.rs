@@ -8,7 +8,7 @@
 pub(crate) const COMMANDS: &[&[u8]] = &[
     b"echo", b"help", b"now", b"time", b"uptime", b"version", b"uname", b"cpu", b"sleep",
     b"clear", b"env", b"export", b"unset", b"ps", b"kill", b"signal", b"alias", b"unalias",
-    b"which", b"jobs", b"ls", b"cat", b"mkdir", b"touch", b"rm",
+    b"which", b"jobs", b"ls", b"cat", b"mkdir", b"touch", b"rm", b"tree", b"jtree",
 ];
 
 /// 返回内建命令名列表（供补全遍历）。
@@ -639,6 +639,112 @@ fn cmd_rm(arg: &[u8]) -> u8 {
     }
 }
 
+/// `jtree <path_or_json_string>`：自动树状可视化展示 JSON 结构（对象、数组、键值对）。
+fn cmd_jtree(arg: &[u8]) -> u8 {
+    let a = trim_bytes(arg);
+    if a.is_empty() {
+        out(b"jtree: usage: jtree <file_path|json_string>\n");
+        return 1;
+    }
+
+    let input_str = match core::str::from_utf8(a) {
+        Ok(s) => s,
+        Err(_) => {
+            out(b"jtree: invalid utf-8 string\n");
+            return 1;
+        }
+    };
+
+    // 1. 如果是以 '{' 或 '[' 开始，直接作为 JSON 字符串解析
+    if input_str.starts_with('{') || input_str.starts_with('[') {
+        let mut parser = crate::tree_json::JsonParser::new(input_str);
+        match parser.parse() {
+            Ok(val) => {
+                crate::tree_json::print_tree(&val, Some("json"));
+                0
+            }
+            Err(e) => {
+                out(b"jtree: json parse error: ");
+                out(e.as_bytes());
+                out(b"\n");
+                1
+            }
+        }
+    } else {
+        // 2. 作为 VFS 文件路径读取后解析
+        match read_to_end(input_str) {
+            Ok(bytes) => {
+                let file_str = match core::str::from_utf8(&bytes) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        out(b"jtree: file content is not valid utf-8\n");
+                        return 1;
+                    }
+                };
+                let mut parser = crate::tree_json::JsonParser::new(file_str);
+                match parser.parse() {
+                    Ok(val) => {
+                        crate::tree_json::print_tree(&val, Some(input_str));
+                        0
+                    }
+                    Err(e) => {
+                        out(b"jtree: json parse error: ");
+                        out(e.as_bytes());
+                        out(b"\n");
+                        1
+                    }
+                }
+            }
+            Err(_) => {
+                out(b"jtree: cannot read '");
+                out(a);
+                out(b"': No such file or directory\n");
+                1
+            }
+        }
+    }
+}
+
+/// `tree [path]`：递归遍历并树状可视化打印 VFS 目录树骨架（经典文件系统 tree）。
+fn cmd_tree(arg: &[u8]) -> u8 {
+    let a = trim_bytes(arg);
+    let root_path = if a.is_empty() { "/" } else { core::str::from_utf8(a).unwrap_or("/") };
+    out(root_path.as_bytes());
+    out(b"\n");
+    print_vfs_tree(root_path, "");
+    0
+}
+
+fn print_vfs_tree(dir_path: &str, prefix: &str) {
+    let entries = match read_dir(dir_path) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let total = entries.len();
+    for (idx, entry) in entries.iter().enumerate() {
+        let is_last = idx + 1 == total;
+        let branch = if is_last { "└── " } else { "├── " };
+        let next_prefix = if is_last {
+            alloc::format!("{}    ", prefix)
+        } else {
+            alloc::format!("{}│   ", prefix)
+        };
+
+        let is_dir = entry.node_type == "Directory";
+        if is_dir {
+            out(alloc::format!("{}{}{}/\n", prefix, branch, entry.name).as_bytes());
+            let sub_path = if dir_path == "/" {
+                alloc::format!("/{}", entry.name)
+            } else {
+                alloc::format!("{}/{}", dir_path, entry.name)
+            };
+            print_vfs_tree(&sub_path, &next_prefix);
+        } else {
+            out(alloc::format!("{}{}{}\n", prefix, branch, entry.name).as_bytes());
+        }
+    }
+}
+
 /// 剥除注释。
 fn strip_comment(line: &[u8]) -> &[u8] {
     let mut in_single = false;
@@ -742,6 +848,8 @@ pub(crate) fn exec_line(line: &[u8]) {
         b"mkdir" => cmd_mkdir(arg),
         b"touch" => cmd_touch(arg),
         b"rm" => cmd_rm(arg),
+        b"tree" => cmd_tree(arg),
+        b"jtree" => cmd_jtree(arg),
         other => {
             out(b"boruix: unknown command: ");
             out(other);
