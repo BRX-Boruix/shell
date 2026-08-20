@@ -727,28 +727,46 @@ fn cmd_rm(arg: &[u8]) -> u8 {
     }
 }
 
-/// `jtree <path_or_json_string>`：自动树状可视化展示 JSON 结构（对象、数组、键值对）。
+/// `jtree [--utf8] <path_or_json_string>`：自动树状可视化展示 JSON 结构（默认 ASCII，加 `--utf8` 开启 UTF-8 盒子绘图）。
 fn cmd_jtree(arg: &[u8]) -> u8 {
     let a = trim_bytes(arg);
     if a.is_empty() {
-        out(b"jtree: usage: jtree <file_path|json_string>\n");
+        out(b"jtree: usage: jtree [--utf8] <file_path|json_string>\n");
         return 1;
     }
 
-    let input_str = match core::str::from_utf8(a) {
-        Ok(s) => s,
-        Err(_) => {
-            out(b"jtree: invalid utf-8 string\n");
-            return 1;
+    let mut use_utf8 = false;
+    let mut payload = "";
+
+    for tok in a.split(|&c| c.is_ascii_whitespace()).filter(|s| !s.is_empty()) {
+        if tok == b"--utf8" {
+            use_utf8 = true;
+        } else if payload.is_empty() {
+            if let Ok(s) = core::str::from_utf8(tok) {
+                payload = s;
+            }
         }
+    }
+
+    // 如果命令行包含空格且是 JSON 字符串，直接提取完整参数文本（去掉 `--utf8`）
+    let full_str = core::str::from_utf8(a).unwrap_or("");
+    let json_text = if full_str.contains('{') || full_str.contains('[') {
+        full_str.replace("--utf8", "").trim().to_string()
+    } else {
+        payload.to_string()
     };
 
+    if json_text.is_empty() {
+        out(b"jtree: usage: jtree [--utf8] <file_path|json_string>\n");
+        return 1;
+    }
+
     // 1. 如果是以 '{' 或 '[' 开始，直接作为 JSON 字符串解析
-    if input_str.starts_with('{') || input_str.starts_with('[') {
-        let mut parser = crate::tree_json::JsonParser::new(input_str);
+    if json_text.starts_with('{') || json_text.starts_with('[') {
+        let mut parser = crate::tree_json::JsonParser::new(&json_text);
         match parser.parse() {
             Ok(val) => {
-                crate::tree_json::print_tree(&val, Some("json"));
+                crate::tree_json::print_tree(&val, Some("json"), use_utf8);
                 0
             }
             Err(e) => {
@@ -760,7 +778,7 @@ fn cmd_jtree(arg: &[u8]) -> u8 {
         }
     } else {
         // 2. 作为 VFS 文件路径读取后解析
-        match read_to_end(input_str) {
+        match read_to_end(&json_text) {
             Ok(bytes) => {
                 let file_str = match core::str::from_utf8(&bytes) {
                     Ok(s) => s,
@@ -772,7 +790,7 @@ fn cmd_jtree(arg: &[u8]) -> u8 {
                 let mut parser = crate::tree_json::JsonParser::new(file_str);
                 match parser.parse() {
                     Ok(val) => {
-                        crate::tree_json::print_tree(&val, Some(input_str));
+                        crate::tree_json::print_tree(&val, Some(&json_text), use_utf8);
                         0
                     }
                     Err(e) => {
@@ -785,7 +803,7 @@ fn cmd_jtree(arg: &[u8]) -> u8 {
             }
             Err(_) => {
                 out(b"jtree: cannot read '");
-                out(a);
+                out(json_text.as_bytes());
                 out(b"': No such file or directory\n");
                 1
             }
@@ -793,17 +811,29 @@ fn cmd_jtree(arg: &[u8]) -> u8 {
     }
 }
 
-/// `tree [path]`：递归遍历并树状可视化打印 VFS 目录树骨架（经典文件系统 tree）。
+/// `tree [--utf8] [path]`：递归遍历并树状可视化打印 VFS 目录树骨架（默认 ASCII，加 `--utf8` 开启 UTF-8 盒子绘图）。
 fn cmd_tree(arg: &[u8]) -> u8 {
     let a = trim_bytes(arg);
-    let root_path = if a.is_empty() { "/" } else { core::str::from_utf8(a).unwrap_or("/") };
+    let mut use_utf8 = false;
+    let mut root_path = "/";
+
+    for tok in a.split(|&c| c.is_ascii_whitespace()).filter(|s| !s.is_empty()) {
+        if tok == b"--utf8" {
+            use_utf8 = true;
+        } else if !tok.starts_with(b"-") {
+            if let Ok(p) = core::str::from_utf8(tok) {
+                root_path = p;
+            }
+        }
+    }
+
     out(root_path.as_bytes());
     out(b"\n");
-    print_vfs_tree(root_path, "");
+    print_vfs_tree(root_path, "", use_utf8);
     0
 }
 
-fn print_vfs_tree(dir_path: &str, prefix: &str) {
+fn print_vfs_tree(dir_path: &str, prefix: &str, use_utf8: bool) {
     let entries = match read_dir(dir_path) {
         Ok(e) => e,
         Err(_) => return,
@@ -811,11 +841,23 @@ fn print_vfs_tree(dir_path: &str, prefix: &str) {
     let total = entries.len();
     for (idx, entry) in entries.iter().enumerate() {
         let is_last = idx + 1 == total;
-        let branch = if is_last { "`-- " } else { "|-- " };
-        let next_prefix = if is_last {
-            alloc::format!("{}    ", prefix)
+        let branch = if use_utf8 {
+            if is_last { "└── " } else { "├── " }
         } else {
-            alloc::format!("{}|   ", prefix)
+            if is_last { "`-- " } else { "|-- " }
+        };
+        let next_prefix = if use_utf8 {
+            if is_last {
+                alloc::format!("{}    ", prefix)
+            } else {
+                alloc::format!("{}│   ", prefix)
+            }
+        } else {
+            if is_last {
+                alloc::format!("{}    ", prefix)
+            } else {
+                alloc::format!("{}|   ", prefix)
+            }
         };
 
         let is_dir = entry.node_type == "dir" || entry.node_type == "Directory";
@@ -826,7 +868,7 @@ fn print_vfs_tree(dir_path: &str, prefix: &str) {
             } else {
                 alloc::format!("{}/{}", dir_path, entry.name)
             };
-            print_vfs_tree(&sub_path, &next_prefix);
+            print_vfs_tree(&sub_path, &next_prefix, use_utf8);
         } else {
             out(alloc::format!("{}{}{}\n", prefix, branch, entry.name).as_bytes());
         }

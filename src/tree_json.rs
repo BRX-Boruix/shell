@@ -215,35 +215,47 @@ impl<'a> JsonParser<'a> {
     }
 }
 
-/// 将解析好的 JSON 树状结构以 ASCII 连接符形式打印到终端。
-pub fn print_tree(val: &JsonValue, root_name: Option<&str>) {
+/// 将解析好的 JSON 树状结构打印到终端（默认 ASCII 连接符，use_utf8=true 时使用 UTF-8 盒子绘图字符）。
+pub fn print_tree(val: &JsonValue, root_name: Option<&str>, use_utf8: bool) {
     let name = root_name.unwrap_or(".");
     out(name.as_bytes());
     out(b"\n");
-    print_value(val, "");
+    print_value(val, "", use_utf8);
 }
 
-fn print_value(val: &JsonValue, prefix: &str) {
+fn print_value(val: &JsonValue, prefix: &str, use_utf8: bool) {
     match val {
         JsonValue::Object(fields) => {
             let total = fields.len();
             for (idx, (k, v)) in fields.iter().enumerate() {
                 let is_last = idx + 1 == total;
-                let branch = if is_last { "`-- " } else { "|-- " };
-                let next_prefix = if is_last {
-                    alloc::format!("{}    ", prefix)
+                let branch = if use_utf8 {
+                    if is_last { "└── " } else { "├── " }
                 } else {
-                    alloc::format!("{}|   ", prefix)
+                    if is_last { "`-- " } else { "|-- " }
+                };
+                let next_prefix = if use_utf8 {
+                    if is_last {
+                        alloc::format!("{}    ", prefix)
+                    } else {
+                        alloc::format!("{}│   ", prefix)
+                    }
+                } else {
+                    if is_last {
+                        alloc::format!("{}    ", prefix)
+                    } else {
+                        alloc::format!("{}|   ", prefix)
+                    }
                 };
 
                 match v {
                     JsonValue::Object(_) => {
                         out(alloc::format!("{}{}{}: (object)\n", prefix, branch, k).as_bytes());
-                        print_value(v, &next_prefix);
+                        print_value(v, &next_prefix, use_utf8);
                     }
                     JsonValue::Array(_) => {
                         out(alloc::format!("{}{}{}: (array)\n", prefix, branch, k).as_bytes());
-                        print_value(v, &next_prefix);
+                        print_value(v, &next_prefix, use_utf8);
                     }
                     _ => {
                         out(alloc::format!("{}{}{}: ", prefix, branch, k).as_bytes());
@@ -257,21 +269,33 @@ fn print_value(val: &JsonValue, prefix: &str) {
             let total = items.len();
             for (idx, v) in items.iter().enumerate() {
                 let is_last = idx + 1 == total;
-                let branch = if is_last { "`-- " } else { "|-- " };
-                let next_prefix = if is_last {
-                    alloc::format!("{}    ", prefix)
+                let branch = if use_utf8 {
+                    if is_last { "└── " } else { "├── " }
                 } else {
-                    alloc::format!("{}|   ", prefix)
+                    if is_last { "`-- " } else { "|-- " }
+                };
+                let next_prefix = if use_utf8 {
+                    if is_last {
+                        alloc::format!("{}    ", prefix)
+                    } else {
+                        alloc::format!("{}│   ", prefix)
+                    }
+                } else {
+                    if is_last {
+                        alloc::format!("{}    ", prefix)
+                    } else {
+                        alloc::format!("{}|   ", prefix)
+                    }
                 };
 
                 match v {
                     JsonValue::Object(_) => {
                         out(alloc::format!("{}{}[{}]: (object)\n", prefix, branch, idx).as_bytes());
-                        print_value(v, &next_prefix);
+                        print_value(v, &next_prefix, use_utf8);
                     }
                     JsonValue::Array(_) => {
                         out(alloc::format!("{}{}[{}]: (array)\n", prefix, branch, idx).as_bytes());
-                        print_value(v, &next_prefix);
+                        print_value(v, &next_prefix, use_utf8);
                     }
                     _ => {
                         out(alloc::format!("{}{}[{}]: ", prefix, branch, idx).as_bytes());
