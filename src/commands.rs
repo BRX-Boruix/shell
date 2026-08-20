@@ -183,8 +183,8 @@ fn cmd_jobs(arg: &[u8]) -> u8 {
 
 use libsys::nr::{INFO_BOOT_MS, INFO_CPU_COUNT, INFO_VERSION};
 use libsys::{
-    close, flock, info, kill, mkdir, now, open, ps, read_dir, read_to_end, sleep, unlink, write,
-    DirEntry, OpenFlags, Permissions, PsEntry,
+    close, info, kill, mkdir, now, open, ps, read_dir, read_to_end, sleep, unlink,
+    OpenFlags, Permissions, PsEntry,
 };
 use libsys::signal::LIST;
 
