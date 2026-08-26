@@ -4,11 +4,12 @@
 //! 入口，本文件导出 `user_main`（进程入口）。
 //!
 //! 模块划分（按职责解耦，依赖单向无环）：
-//! - `util`    : 输出辅助与通用字节/文本工具
-//! - `env`     : 纯字符串变量表 + `export`/`env` 命令
-//! - `tokenize`: 引号感知分词与 `$VAR` 展开
-//! - `commands`: 内建命令与命令分发
-//! - `main`    : 入口、REPL 循环、行读取（含历史与 Tab 补全）
+//! - `util`     : 输出辅助与通用字节/文本工具
+//! - `env`      : 纯字符串变量表 + `export`/`env` 命令
+//! - `tokenize` : 引号感知分词与 `$VAR` 展开
+//! - `commands` : 内建命令与命令分发
+//! - `json_tree`: JSON 树状可视化渲染（解析在 libsys，ADR-024）
+//! - `main`     : 入口、REPL 循环、行读取（含历史与 Tab 补全）
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
@@ -20,8 +21,8 @@ extern crate alloc;
 
 mod commands;
 mod env;
+mod json_tree;
 mod tokenize;
-pub mod tree_json;
 mod util;
 
 use alloc::vec::Vec;

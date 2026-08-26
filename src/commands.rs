@@ -763,10 +763,10 @@ fn cmd_jtree(arg: &[u8]) -> u8 {
 
     // 1. 如果是以 '{' 或 '[' 开始，直接作为 JSON 字符串解析
     if json_text.starts_with('{') || json_text.starts_with('[') {
-        let mut parser = crate::tree_json::JsonParser::new(&json_text);
+        let mut parser = libsys::json::JsonParser::new(&json_text);
         match parser.parse() {
             Ok(val) => {
-                crate::tree_json::print_tree(&val, Some("json"), use_utf8);
+                crate::json_tree::print_tree(&val, Some("json"), use_utf8);
                 0
             }
             Err(e) => {
@@ -787,10 +787,10 @@ fn cmd_jtree(arg: &[u8]) -> u8 {
                         return 1;
                     }
                 };
-                let mut parser = crate::tree_json::JsonParser::new(file_str);
+                let mut parser = libsys::json::JsonParser::new(file_str);
                 match parser.parse() {
                     Ok(val) => {
-                        crate::tree_json::print_tree(&val, Some(&json_text), use_utf8);
+                        crate::json_tree::print_tree(&val, Some(&json_text), use_utf8);
                         0
                     }
                     Err(e) => {
