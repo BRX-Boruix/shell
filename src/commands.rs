@@ -188,12 +188,51 @@ use libsys::{
 };
 use libsys::signal::LIST;
 
-/// 列出全部内建命令。
+/// `help`：列出全部内建命令（每条一行，英文说明）。
+///
+/// 对齐到固定列宽；多数状态命令支持 `--json` 结构化输出。
 fn cmd_help() -> u8 {
-    out(
-        b"builtins: echo help now time uptime version uname cpu \
-sleep clear env export unset ps kill signal alias unalias which jobs ls cat mkdir touch rm\n",
-    );
+    const COL: usize = 12; // 命令名左对齐列宽（含 2 空格缩进）
+    const ITEMS: &[(&[u8], &[u8])] = &[
+        (b"echo", b"print a line of text"),
+        (b"help", b"list all builtin commands"),
+        (b"now", b"monotonic clock in ns since boot"),
+        (b"time", b"wall clock (date/time from CMOS RTC)"),
+        (b"uptime", b"time since boot"),
+        (b"version", b"show kernel version"),
+        (b"uname", b"show kernel version"),
+        (b"cpu", b"show number of online CPUs"),
+        (b"sleep", b"sleep for N seconds"),
+        (b"clear", b"clear the terminal screen"),
+        (b"env", b"list environment variables"),
+        (b"export", b"set an environment variable"),
+        (b"unset", b"unset environment variable(s)"),
+        (b"ps", b"list running processes"),
+        (b"kill", b"send a signal to a process"),
+        (b"signal", b"list available signals"),
+        (b"alias", b"define or list aliases"),
+        (b"unalias", b"remove alias(es)"),
+        (b"which", b"locate a builtin/alias command"),
+        (b"jobs", b"list background jobs"),
+        (b"ls", b"list directory contents"),
+        (b"cat", b"print file contents"),
+        (b"mkdir", b"create a directory"),
+        (b"touch", b"create or update a file"),
+        (b"rm", b"remove a file"),
+        (b"tree", b"visualize VFS directory tree"),
+        (b"jtree", b"visualize a JSON value as a tree"),
+    ];
+    out(b"boruix shell builtins:\n");
+    for (c, d) in ITEMS {
+        out(b"  ");
+        out(c);
+        for _ in c.len()..COL {
+            out(b" ");
+        }
+        out(d);
+        out(b"\n");
+    }
+    out(b"\nnote: many commands accept --json for structured output\n");
     0
 }
 
