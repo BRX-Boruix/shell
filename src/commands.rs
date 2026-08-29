@@ -8,7 +8,8 @@
 pub(crate) const COMMANDS: &[&[u8]] = &[
     b"echo", b"help", b"now", b"time", b"uptime", b"version", b"uname", b"cpu", b"sleep",
     b"clear", b"env", b"export", b"unset", b"ps", b"kill", b"signal", b"alias", b"unalias",
-    b"which", b"jobs", b"ls", b"cat", b"mkdir", b"touch", b"rm", b"tree", b"jtree",
+    b"which", b"jobs", b"ls", b"cat", b"mkdir", b"touch", b"rm", b"tree", b"jtree", b"cd",
+    b"pwd",
 ];
 
 /// 返回内建命令名列表（供补全遍历）。
@@ -183,8 +184,8 @@ fn cmd_jobs(arg: &[u8]) -> u8 {
 
 use libsys::nr::{INFO_BOOT_MS, INFO_CPU_COUNT, INFO_VERSION};
 use libsys::{
-    close, info, kill, mkdir, now, open, ps, read_dir, read_to_end, read_wall_clock, sleep,
-    unlink, OpenFlags, Permissions, PsEntry,
+    chdir, close, getcwd, info, kill, mkdir, now, open, ps, read_dir, read_to_end,
+    read_wall_clock, sleep, unlink, OpenFlags, Permissions, PsEntry,
 };
 use libsys::signal::LIST;
 
@@ -221,6 +222,8 @@ fn cmd_help() -> u8 {
         (b"rm", b"remove a file"),
         (b"tree", b"visualize VFS directory tree"),
         (b"jtree", b"visualize a JSON value as a tree"),
+        (b"cd", b"change the working directory"),
+        (b"pwd", b"print the working directory"),
     ];
     out(b"boruix shell builtins:\n");
     for (c, d) in ITEMS {
@@ -617,7 +620,7 @@ fn cmd_ls(arg: &[u8]) -> u8 {
     let a = trim_bytes(arg);
     let mut long_mode = false;
     let mut json_mode = false;
-    let mut path = "/";
+    let mut path = getcwd().unwrap_or_else(|_| alloc::string::String::from("/"));
 
     for tok in a.split(|&c| c.is_ascii_whitespace()).filter(|s| !s.is_empty()) {
         if tok == b"-l" {
@@ -626,12 +629,12 @@ fn cmd_ls(arg: &[u8]) -> u8 {
             json_mode = true;
         } else if !tok.starts_with(b"-") {
             if let Ok(p) = core::str::from_utf8(tok) {
-                path = p;
+                path = alloc::string::String::from(p);
             }
         }
     }
 
-    match read_dir(path) {
+    match read_dir(&path) {
         Ok(entries) => {
             if json_mode {
                 use libsys::json::{JsonWriter, VecTarget};
@@ -897,25 +900,61 @@ fn cmd_jtree(arg: &[u8]) -> u8 {
     }
 }
 
+/// `cd [path]`：切换当前工作目录（无参回根目录 `/`）。相对路径相对当前
+/// cwd 解析（内核 syscall 层拼接）。
+fn cmd_cd(arg: &[u8]) -> u8 {
+    let a = trim_bytes(arg);
+    let mut target = alloc::string::String::from("/");
+    for tok in a.split(|&c| c.is_ascii_whitespace()).filter(|s| !s.is_empty()) {
+        if let Ok(p) = core::str::from_utf8(tok) {
+            target = alloc::string::String::from(p);
+        }
+    }
+    match chdir(&target) {
+        Ok(()) => 0,
+        Err(_) => {
+            out(b"cd: no such directory: ");
+            out(target.as_bytes());
+            out(b"\n");
+            1
+        }
+    }
+}
+
+/// `pwd`：打印当前工作目录（绝对路径）。
+fn cmd_pwd() -> u8 {
+    match getcwd() {
+        Ok(cwd) => {
+            out(cwd.as_bytes());
+            out(b"\n");
+            0
+        }
+        Err(_) => {
+            out(b"pwd: unable to read working directory\n");
+            1
+        }
+    }
+}
+
 /// `tree [--utf8] [path]`：递归遍历并树状可视化打印 VFS 目录树骨架（默认 ASCII，加 `--utf8` 开启 UTF-8 盒子绘图）。
 fn cmd_tree(arg: &[u8]) -> u8 {
     let a = trim_bytes(arg);
     let mut use_utf8 = false;
-    let mut root_path = "/";
+    let mut root_path = getcwd().unwrap_or_else(|_| alloc::string::String::from("/"));
 
     for tok in a.split(|&c| c.is_ascii_whitespace()).filter(|s| !s.is_empty()) {
         if tok == b"--utf8" {
             use_utf8 = true;
         } else if !tok.starts_with(b"-") {
             if let Ok(p) = core::str::from_utf8(tok) {
-                root_path = p;
+                root_path = alloc::string::String::from(p);
             }
         }
     }
 
     out(root_path.as_bytes());
     out(b"\n");
-    print_vfs_tree(root_path, "", use_utf8);
+    print_vfs_tree(&root_path, "", use_utf8);
     0
 }
 
@@ -1067,6 +1106,8 @@ pub(crate) fn exec_line(line: &[u8]) {
         b"rm" => cmd_rm(arg),
         b"tree" => cmd_tree(arg),
         b"jtree" => cmd_jtree(arg),
+        b"cd" => cmd_cd(arg),
+        b"pwd" => cmd_pwd(),
         other => {
             out(b"boruix: unknown command: ");
             out(other);
