@@ -80,7 +80,7 @@ pub(crate) fn for_each_alias<F: FnMut(&[u8], &[u8])>(mut f: F) {
 
 use crate::env::{cmd_env, cmd_export, env_unset, set_last_status};
 use crate::tokenize::tokenize_line;
-use crate::util::{out, outln, parse_u64, string_content, trim_bytes, u64_to_dec, unescape};
+use crate::util::{out, outln, pad2, parse_u64, string_content, trim_bytes, u64_to_dec, unescape};
 
 /// 后台作业条目。
 struct JobEntry {
@@ -183,8 +183,8 @@ fn cmd_jobs(arg: &[u8]) -> u8 {
 
 use libsys::nr::{INFO_BOOT_MS, INFO_CPU_COUNT, INFO_VERSION};
 use libsys::{
-    close, info, kill, mkdir, now, open, ps, read_dir, read_to_end, sleep, unlink,
-    OpenFlags, Permissions, PsEntry,
+    close, info, kill, mkdir, now, open, ps, read_dir, read_to_end, read_wall_clock, sleep,
+    unlink, OpenFlags, Permissions, PsEntry,
 };
 use libsys::signal::LIST;
 
@@ -197,7 +197,7 @@ sleep clear env export unset ps kill signal alias unalias which jobs ls cat mkdi
     0
 }
 
-/// `now`/`time`：单调时钟（纳秒）。
+/// `now`：单调时钟（纳秒，自开机以来的近似计数）。
 fn cmd_now() -> u8 {
     let ns = now();
     let mut b = [0u8; 24];
@@ -209,6 +209,53 @@ fn cmd_now() -> u8 {
     out(u64_to_dec((ns % 1_000_000_000) / 1_000_000, &mut b));
     out(b" s)\n");
     0
+}
+
+/// `time`：墙钟时间（真实年月日时分秒，来自 CMOS/BIOS 硬件时钟）。
+///
+/// 文本输出格式 `YYYY-MM-DD HH:MM:SS`；支持 `--json` 输出结构化字段。
+fn cmd_time(arg: &[u8]) -> u8 {
+    match read_wall_clock() {
+        Ok(wc) => {
+            if trim_bytes(arg) == b"--json" {
+                use libsys::json::{JsonWriter, VecTarget};
+                let mut target = VecTarget::new();
+                let mut writer = JsonWriter::new(&mut target);
+                if let Ok(mut o) = writer.start_object() {
+                    let _ = o.field_u64("year", wc.year);
+                    let _ = o.field_u64("month", wc.month);
+                    let _ = o.field_u64("day", wc.day);
+                    let _ = o.field_u64("hour", wc.hour);
+                    let _ = o.field_u64("minute", wc.minute);
+                    let _ = o.field_u64("second", wc.second);
+                    let _ = o.end();
+                }
+                let mut b = target.into_bytes();
+                b.push(b'\n');
+                out(&b);
+            } else {
+                // YYYY-MM-DD HH:MM:SS
+                let mut b = [0u8; 24];
+                out(u64_to_dec(wc.year, &mut b));
+                out(b"-");
+                out(pad2(wc.month, &mut b));
+                out(b"-");
+                out(pad2(wc.day, &mut b));
+                out(b" ");
+                out(pad2(wc.hour, &mut b));
+                out(b":");
+                out(pad2(wc.minute, &mut b));
+                out(b":");
+                out(pad2(wc.second, &mut b));
+                out(b"\n");
+            }
+            0
+        }
+        Err(_) => {
+            out(b"time: unable to read wall clock from /system/info/time\n");
+            1
+        }
+    }
 }
 
 /// `uptime`：开机至今。支持 `--json` 输出。
@@ -954,7 +1001,8 @@ pub(crate) fn exec_line(line: &[u8]) {
     let status = match name {
         b"echo" => exec_echo(arg),
         b"help" => cmd_help(),
-        b"now" | b"time" => cmd_now(),
+        b"now" => cmd_now(),
+        b"time" => cmd_time(arg),
         b"uptime" => cmd_uptime(arg),
         b"version" | b"uname" => cmd_version(),
         b"cpu" => cmd_cpu(),
