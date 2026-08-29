@@ -124,13 +124,3 @@ pub(crate) fn cmd_export(arg: &[u8]) -> u8 {
     0
 }
 
-/// `unset NAME`：删除环境变量。
-pub(crate) fn cmd_unset(arg: &[u8]) -> u8 {
-    let s = trim_bytes(arg);
-    if s.is_empty() {
-        out(b"unset: missing variable name\n");
-        return 1;
-    }
-    env_unset(s);
-    0
-}
