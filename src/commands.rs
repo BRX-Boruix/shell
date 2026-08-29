@@ -215,7 +215,7 @@ fn cmd_help() -> u8 {
         (b"unalias", b"remove alias(es)"),
         (b"which", b"locate a builtin/alias command"),
         (b"jobs", b"list background jobs"),
-        (b"ls", b"list directory contents"),
+        (b"ls", b"list directory contents (-a show hidden, -l long, --json)"),
         (b"cat", b"print file contents"),
         (b"mkdir", b"create a directory"),
         (b"touch", b"create or update a file"),
@@ -620,11 +620,14 @@ fn cmd_ls(arg: &[u8]) -> u8 {
     let a = trim_bytes(arg);
     let mut long_mode = false;
     let mut json_mode = false;
+    let mut show_all = false;
     let mut path = getcwd().unwrap_or_else(|_| alloc::string::String::from("/"));
 
     for tok in a.split(|&c| c.is_ascii_whitespace()).filter(|s| !s.is_empty()) {
         if tok == b"-l" {
             long_mode = true;
+        } else if tok == b"-a" || tok == b"--all" {
+            show_all = true;
         } else if tok == b"--json" {
             json_mode = true;
         } else if !tok.starts_with(b"-") {
@@ -634,6 +637,11 @@ fn cmd_ls(arg: &[u8]) -> u8 {
         }
     }
 
+    // POSIX 惯例：`ls` 默认隐藏 `.` 开头条目（如 `.`/`..`，以及真实文件系统
+    // 落盘的隐藏项）；`ls -a` 才如实全显。内核层如实回显盘上 dirent，过滤
+    // 是**显示层**职责——不隐藏会破坏与 RamFS（不返回 `.`/`..`）的一致性。
+    let show = |name: &str| show_all || !name.starts_with('.');
+
     match read_dir(&path) {
         Ok(entries) => {
             if json_mode {
@@ -642,6 +650,9 @@ fn cmd_ls(arg: &[u8]) -> u8 {
                 let mut writer = JsonWriter::new(&mut target);
                 if let Ok(mut arr) = writer.start_array() {
                     for entry in &entries {
+                        if !show(&entry.name) {
+                            continue;
+                        }
                         let _ = arr.push_object(|obj| {
                             let _ = obj.field_str("name", &entry.name);
                             let _ = obj.field_str("type", &entry.node_type);
@@ -661,6 +672,9 @@ fn cmd_ls(arg: &[u8]) -> u8 {
                 out(b"TYPE        SIZE   NAME\n");
                 let mut b = [0u8; 24];
                 for entry in &entries {
+                    if !show(&entry.name) {
+                        continue;
+                    }
                     let (type_badge, color, indicator): (&str, &[u8], &str) = match entry.node_type.as_str() {
                         "dir" | "Directory" => ("<DIR>   ", b"\x1b[1;34m", "/"),
                         "link" | "Symlink" => ("<LNK>   ", b"\x1b[1;36m", "@"),
@@ -689,6 +703,9 @@ fn cmd_ls(arg: &[u8]) -> u8 {
             } else {
                 // 简洁彩色网格模式
                 for entry in &entries {
+                    if !show(&entry.name) {
+                        continue;
+                    }
                     let (color, indicator): (&[u8], &str) = match entry.node_type.as_str() {
                         "dir" | "Directory" => (b"\x1b[1;34m", "/"),
                         "link" | "Symlink" => (b"\x1b[1;36m", "@"),
