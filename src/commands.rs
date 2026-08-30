@@ -185,7 +185,8 @@ fn cmd_jobs(arg: &[u8]) -> u8 {
 use libsys::nr::{INFO_BOOT_MS, INFO_CPU_COUNT, INFO_VERSION};
 use libsys::{
     chdir, close, dup2, getcwd, info, kill, mkdir, now, open, pipe_create, ps, read, read_dir,
-    read_to_end, read_wall_clock, sleep, unlink, write, OpenFlags, Permissions, PsEntry,
+    read_to_end, read_wall_clock, sleep, unlink, write, OpenFlags, Permissions, PsEntry, STDIN,
+    STDOUT,
 };
 use libsys::signal::LIST;
 
@@ -1097,6 +1098,209 @@ fn strip_comment(line: &[u8]) -> &[u8] {
     line
 }
 
+/// stdio 备份高位预留槽（shell 正常只开 0/1/2，这些槽空闲）。集中定义避免
+/// 魔法数字散落（规则 16：业务语义常量集中定义并附注释说明来源与含义）。
+/// 管道外层 stdout 备份槽（exec_pipeline 用）：把 shell 原始 fd 1 暂存，
+/// 左段经管道写端改指后据此还原。
+const SAVE_FD_OUT: u64 = 200;
+/// 管道外层 stdin 备份槽（exec_pipeline 用）：把 shell 原始 fd 0 暂存，
+/// 右段经管道读端改指后据此还原。
+const SAVE_FD_IN: u64 = 201;
+/// 段内重定向 stdout 备份槽（with_redirects 用）：把段执行时当前 fd 1
+/// （可能是管道写端）暂存，文件输出重定向改指后据此还原。与管道外层槽
+/// 200/201 分离，避免管道 + 段内重定向嵌套时互相覆盖备份。
+const REDIR_SAVE_FD_OUT: u64 = 202;
+/// 段内重定向 stdin 备份槽（with_redirects 用）：把段执行时当前 fd 0
+/// （可能是管道读端）暂存，文件输入重定向改指后据此还原。
+const REDIR_SAVE_FD_IN: u64 = 203;
+
+/// 一条重定向指令：命令执行期间把目标标准 fd 改指某个文件。
+///
+/// - `target`：0 = 标准输入，1 = 标准输出（用 libsys 常量 `STDIN`/`STDOUT`，规则 16）。
+///   内建命令错误统一写 stdout（`out()` 写 `STDOUT`），全 shell 已核验无任何命令写
+///   fd 2（src 无 `write(2`/`STDERR` 调用），故不实现 `2>`——否则是无人消费的死机制
+///   （规则 27：零死代码）。该取舍为显式设计决定（规则 29/规则 25：默认值带理由），
+///   若未来引入写 stderr 的命令须一并补 `2>`。
+/// - `input`：true = 输入重定向（读文件，`<`）；false = 输出重定向。
+/// - `append`：输出重定向追加（`>>`）而非截断（`>`）。输入重定向恒 false。
+struct Redirect {
+    target: u8,
+    input: bool,
+    append: bool,
+    path: Vec<u8>,
+}
+
+/// 从分词后的词表中剥离重定向词（`>`/`>>`/`<` + 紧随路径词），返回净化后的
+/// 命令词 + 重定向指令表。
+///
+/// 与管道同约定：重定向操作符是**空白分隔的独立词**（tokenizer 产出），
+/// `echo hi>f` 不会被当作重定向（需 `echo hi > f`）。
+///
+/// 操作符后缺路径 → `Err(())`，调用方报错短路、不执行命令（宁缺毋假）。
+fn split_redirects(words: &[Vec<u8>]) -> Result<(Vec<Vec<u8>>, Vec<Redirect>), ()> {
+    let mut clean: Vec<Vec<u8>> = Vec::new();
+    let mut redirs: Vec<Redirect> = Vec::new();
+    let mut i = 0usize;
+    while i < words.len() {
+        let w = words[i].as_slice();
+        // 识别重定向操作符（独立词）。元组 = (输入?, 追加?)。
+        let op: Option<(bool, bool)> = if w == b"<" {
+            Some((true, false)) // 输入重定向
+        } else if w == b">" {
+            Some((false, false)) // 输出截断
+        } else if w == b">>" {
+            Some((false, true)) // 输出追加
+        } else {
+            None
+        };
+        match op {
+            None => {
+                // 普通词：保留进净化命令词。
+                clean.push(words[i].clone());
+                i += 1;
+            }
+            Some((input, append)) => {
+                // 操作符后必须紧跟一个路径词。
+                let Some(path) = words.get(i + 1) else {
+                    return Err(());
+                };
+                if path.is_empty() {
+                    return Err(());
+                }
+                redirs.push(Redirect {
+                    target: if input { STDIN as u8 } else { STDOUT as u8 },
+                    input,
+                    append,
+                    path: path.clone(),
+                });
+                i += 2; // 跳过 操作符 + 路径
+            }
+        }
+    }
+    Ok((clean, redirs))
+}
+
+/// 在命令执行期间临时套用重定向，跑完还原。
+///
+/// - 对每条重定向：`open` 目标文件拿 fd，`dup2` 到目标标准 fd（`STDIN`/`STDOUT`）；
+/// - 执行 `run`（命令的 `out()` 写 `STDOUT` → 落文件 / `read(STDIN)` 读文件）；
+/// - 跑完还原：把目标 fd 恢复为备份的原 stdio，关闭备份槽与打开的文件 fd。
+/// - 任何 `open` 失败：**不执行命令**并如实报错（POSIX 语义，如
+///   `echo hi > /no/such/dir/f` 不执行 echo）。
+///
+/// 返回 `Ok(命令退出状态)`；打开失败返回 `Err(())`。
+fn with_redirects(redirs: &[Redirect], run: impl FnOnce() -> u8) -> Result<u8, ()> {
+    // 备份：先保存可能被改写的目标 fd（0 与/或 1）到高位预留槽。
+    let wants_in = redirs.iter().any(|r| r.target == STDIN as u8);
+    let wants_out = redirs.iter().any(|r| r.target == STDOUT as u8);
+    if (wants_in && dup2(STDIN, REDIR_SAVE_FD_IN).is_err())
+        || (wants_out && dup2(STDOUT, REDIR_SAVE_FD_OUT).is_err())
+    {
+        out(b"boruix: redirect: stdio backup failed\n");
+        return Err(());
+    }
+    // 打开并安装每条重定向。任一条失败：还原已安装的、关闭已打开的、短路。
+    let mut installed: Vec<(u8, u64)> = Vec::new(); // (目标fd, 打开的文件fd)
+    let mut fail = false;
+    for r in redirs {
+        let flags = if r.input {
+            OpenFlags::READ_ONLY
+        } else if r.append {
+            // 追加写：write + create（不存在则建），不截断。
+            OpenFlags {
+                read: false,
+                write: true,
+                create: true,
+                truncate: false,
+                append: true,
+                directory: false,
+                pipe: false,
+            }
+        } else {
+            // 截断写：write + create + truncate（不存在则建，存在则清空）。
+            OpenFlags {
+                read: false,
+                write: true,
+                create: true,
+                truncate: true,
+                append: false,
+                directory: false,
+                pipe: false,
+            }
+        };
+        let path = match core::str::from_utf8(&r.path) {
+            Ok(p) => p,
+            Err(_) => {
+                out(b"boruix: redirect: invalid path\n");
+                fail = true;
+                break;
+            }
+        };
+        // 权限仅在创建文件时生效：输入重定向只读、不创建，用 readonly；
+        // 输出重定向写/建/截断，用 read_write（规则 34：语义一致）。
+        let perm = if r.input {
+            Permissions::readonly()
+        } else {
+            Permissions::read_write()
+        };
+        let file_fd = match open(path, flags, perm) {
+            Ok(fd) => fd,
+            Err(_) => {
+                out(b"boruix: cannot open '");
+                out(&r.path);
+                out(b"' for redirect\n");
+                fail = true;
+                break;
+            }
+        };
+        // dup2 安装：把目标标准 fd 改指打开的文件。dup2 后原 file_fd 仍有效，
+        // 记录待关闭。
+        if dup2(file_fd, r.target as u64).is_err() {
+            let _ = close(file_fd);
+            out(b"boruix: redirect: dup2 failed\n");
+            fail = true;
+            break;
+        }
+        installed.push((r.target, file_fd));
+    }
+    if fail {
+        // 还原已安装的重定向（先 restore 再关备份槽/文件 fd，顺序重要）。
+        for (target, file_fd) in installed.iter().rev() {
+            let _ = if *target == STDIN as u8 {
+                dup2(REDIR_SAVE_FD_IN, STDIN)
+            } else {
+                dup2(REDIR_SAVE_FD_OUT, STDOUT)
+            };
+            let _ = close(*file_fd);
+        }
+        if wants_in {
+            let _ = close(REDIR_SAVE_FD_IN);
+        }
+        if wants_out {
+            let _ = close(REDIR_SAVE_FD_OUT);
+        }
+        return Err(());
+    }
+    // 执行命令。
+    let status = run();
+    // 还原重定向。
+    for (target, file_fd) in installed.iter().rev() {
+        let _ = if *target == STDIN as u8 {
+            dup2(REDIR_SAVE_FD_IN, STDIN)
+        } else {
+            dup2(REDIR_SAVE_FD_OUT, STDOUT)
+        };
+        let _ = close(*file_fd);
+    }
+    if wants_in {
+        let _ = close(REDIR_SAVE_FD_IN);
+    }
+    if wants_out {
+        let _ = close(REDIR_SAVE_FD_OUT);
+    }
+    Ok(status)
+}
+
 /// 执行一行输入。
 pub(crate) fn exec_line(line: &[u8]) {
     let line = trim_bytes(line);
@@ -1139,10 +1343,25 @@ pub(crate) fn exec_line(line: &[u8]) {
         set_last_status(status);
         return;
     }
-    let name = final_words[0].as_slice();
+    // 单命令路径：先剥离重定向（> / >> / <），剩下的才是指令词。
+    let (clean_words, redirs) = match split_redirects(&final_words) {
+        Ok(v) => v,
+        Err(()) => {
+            out(b"boruix: malformed redirect\n");
+            set_last_status(1);
+            return;
+        }
+    };
+    if clean_words.is_empty() {
+        // 只有重定向没有命令（如 > f）——无可执行指令，如实报错。
+        out(b"boruix: missing command before redirect\n");
+        set_last_status(1);
+        return;
+    }
+    let name = clean_words[0].as_slice();
 
     let mut argbuf = Vec::new();
-    for (k, w) in final_words.iter().enumerate().skip(1) {
+    for (k, w) in clean_words.iter().enumerate().skip(1) {
         if k > 1 {
             argbuf.push(b' ');
         }
@@ -1150,7 +1369,14 @@ pub(crate) fn exec_line(line: &[u8]) {
     }
     let arg = argbuf.as_slice();
 
-    let status = run_builtin(name, arg);
+    let status = if redirs.is_empty() {
+        run_builtin(name, arg)
+    } else {
+        match with_redirects(&redirs, || run_builtin(name, arg)) {
+            Ok(s) => s,
+            Err(()) => 1, // open/dup2 失败已报错
+        }
+    };
     set_last_status(status);
 }
 
@@ -1205,8 +1431,8 @@ fn run_builtin(name: &[u8], arg: &[u8]) -> u8 {
 /// 实现（Unix 管道本质）：
 /// 1. `pipe_create` 得 `(rfd, wfd)`；
 /// 2. 把 shell 自身 fd 0/1 备份到高位预留槽（`dup2`），执行中可恢复；
-/// 3. `dup2(wfd, 1)` 使左段 stdout → 管道写端，执行左段后 `dup2(备份,1)` 还原；
-/// 4. `dup2(rfd, 0)` 使右段 stdin ← 管道读端，执行右段后 `dup2(备份,0)` 还原。
+/// 3. `dup2(wfd, STDOUT)` 使左段 stdout → 管道写端，执行左段后 `dup2(备份, STDOUT)` 还原；
+/// 4. `dup2(rfd, STDIN)` 使右段 stdin ← 管道读端，执行右段后 `dup2(备份, STDIN)` 还原。
 ///
 /// 返回右段退出状态（管道语义以最右段为准）。
 fn exec_pipeline(words: &[Vec<u8>]) -> u8 {
@@ -1225,28 +1451,26 @@ fn exec_pipeline(words: &[Vec<u8>]) -> u8 {
             return 1;
         }
     };
-    // 备份 shell 自身 stdio 到高位预留槽（shell 正常只开 0/1/2，这些槽空闲）。
+    // 备份 shell 自身 stdio 到高位预留槽（模块级 SAVE_FD_* 常量，集中定义）。
     // 失败（槽被占/超上限）如实报错并回滚。
-    const SAVE_OUT: u64 = 200;
-    const SAVE_IN: u64 = 201;
-    if dup2(1, SAVE_OUT).is_err() || dup2(0, SAVE_IN).is_err() {
+    if dup2(STDOUT, SAVE_FD_OUT).is_err() || dup2(STDIN, SAVE_FD_IN).is_err() {
         out(b"boruix: dup2 backup failed\n");
         let _ = close(wfd);
         let _ = close(rfd);
         return 1;
     }
     // ---- 左段：stdout → 管道写端 ----
-    let _ = dup2(wfd, 1);
+    let _ = dup2(wfd, STDOUT);
     let lstatus = run_pipeline_stage(left);
     // 还原 stdout 再关备份/写端（顺序重要：先还原 fd1 才能让后续 out 输出正常）。
-    let _ = dup2(SAVE_OUT, 1);
-    let _ = close(SAVE_OUT);
+    let _ = dup2(SAVE_FD_OUT, STDOUT);
+    let _ = close(SAVE_FD_OUT);
     let _ = close(wfd);
     // ---- 右段：stdin ← 管道读端 ----
-    let _ = dup2(rfd, 0);
+    let _ = dup2(rfd, STDIN);
     let rstatus = run_pipeline_stage(right);
-    let _ = dup2(SAVE_IN, 0);
-    let _ = close(SAVE_IN);
+    let _ = dup2(SAVE_FD_IN, STDIN);
+    let _ = close(SAVE_FD_IN);
     let _ = close(rfd);
     // 左段失败传播（非零状态 = 左段问题）；否则以右段为准。
     if lstatus != 0 {
@@ -1257,16 +1481,39 @@ fn exec_pipeline(words: &[Vec<u8>]) -> u8 {
 }
 
 /// 运行管道的一段的命令分发（参数重建 + `run_builtin`）。
+///
+/// 段级作用域：先剥离本段的重定向（`>`/`>>`/`<`）并经 `with_redirects` 套用，
+/// 使 `echo hi > f | cat` 中左段的 stdout 落到文件 f（而非管道），右段仍从
+/// 管道读。
 fn run_pipeline_stage(stage: &[Vec<u8>]) -> u8 {
-    let name = stage[0].as_slice();
+    let (clean, redirs) = match split_redirects(stage) {
+        Ok(v) => v,
+        Err(()) => {
+            out(b"boruix: malformed redirect in pipeline\n");
+            return 1;
+        }
+    };
+    if clean.is_empty() {
+        out(b"boruix: missing command before redirect in pipeline\n");
+        return 1;
+    }
+    let name = clean[0].as_slice();
     let mut argbuf = Vec::new();
-    for (k, w) in stage.iter().enumerate().skip(1) {
+    for (k, w) in clean.iter().enumerate().skip(1) {
         if k > 1 {
             argbuf.push(b' ');
         }
         argbuf.extend_from_slice(w);
     }
-    run_builtin(name, argbuf.as_slice())
+    let arg = argbuf.as_slice();
+    if redirs.is_empty() {
+        run_builtin(name, arg)
+    } else {
+        match with_redirects(&redirs, || run_builtin(name, arg)) {
+            Ok(s) => s,
+            Err(()) => 1, // open/dup2 失败已报错
+        }
+    }
 }
 
 /// 从 fd 0（stdin）读到 EOF，把内容喂给 `feed`。供 `cat`（无路径读 stdin）
@@ -1279,7 +1526,7 @@ fn run_pipeline_stage(stage: &[Vec<u8>]) -> u8 {
 fn read_stdin_all(feed: &mut dyn FnMut(&[u8])) -> Result<(), ()> {
     let mut buf = [0u8; 128];
     loop {
-        let n = match read(0, &mut buf) {
+        let n = match read(STDIN, &mut buf) {
             Ok(n) => n,
             Err(libsys::error::Error::WouldBlock) => break, // 写端已关 = EOF
             Err(_) => return Err(()),
