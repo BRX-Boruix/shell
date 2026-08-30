@@ -184,9 +184,9 @@ fn cmd_jobs(arg: &[u8]) -> u8 {
 
 use libsys::nr::{INFO_BOOT_MS, INFO_CPU_COUNT, INFO_VERSION};
 use libsys::{
-    chdir, close, dup2, getcwd, info, kill, mkdir, now, open, pipe_create, ps, read, read_dir,
-    read_to_end, read_wall_clock, sleep, unlink, write, OpenFlags, Permissions, PsEntry, STDIN,
-    STDOUT,
+    chdir, close, dup2, exec_path, getcwd, info, kill, mkdir, now, open, pipe_create, ps,
+    read, read_dir, read_to_end, read_wall_clock, sleep, sync_create, sync_delete, sync_wake,
+    unlink, waitpid_any, write, yield_now, OpenFlags, Permissions, PsEntry, STDIN, STDOUT,
 };
 use libsys::signal::LIST;
 
@@ -815,6 +815,87 @@ fn cmd_pipe(_arg: &[u8]) -> u8 {
     out(b"\"\n");
     0
 }
+/// `synce2e`：SYNC 域（ADR-032）端到端**阻塞往返**测试（协调端）。
+///
+/// 流程：create 同步字(id,0) → `exec_path("/programs/synce2e.elf", "waiter:<id>")`
+/// 派生子进程（等待端）→ sleep 让子进程在 `sync_wait` 上真实阻塞 →
+/// `sync_wake(id,42,1)` 唤醒并预置值 42 → `waitpid_any()` 收子进程退出码断言为 0。
+/// 若 `sync_wake` 返回 1，则证明子进程确实被登记为等待者并阻塞过（真实切换往返）。
+///
+/// **liveCD 专属测试命令（ADR-029）**：`/programs/synce2e.elf` 依赖内核内嵌测试 payload
+/// （liveCD 模式经 ADR-028 单源填充 `/programs`）。安装模式下 `/programs` 是磁盘 root 的普通
+/// 目录、**不做 payload 兜底**，此 ELF 不保证存在——本命令定位为开发/验收期诊断，非生产特性。
+fn cmd_synce2e() -> u8 {
+    let mut b = [0u8; 24];
+    let mut id_buf = [0u8; 24];
+    // 1. create 同步字，初值 0。
+    let id = match sync_create(0) {
+        Ok(id) => id,
+        Err(_) => { out(b"synce2e: create failed\n"); return 1; }
+    };
+    out(b"synce2e: create id=");
+    out(u64_to_dec(id, &mut b));
+    out(b" init=0\n");
+    // 2. 派生等待端子进程，命令行 = "waiter:<id>"。
+    let id_s = u64_to_dec(id, &mut id_buf);
+    let mut cmd: alloc::vec::Vec<u8> = alloc::vec![b'w', b'a', b'i', b't', b'e', b'r', b':'];
+    cmd.extend_from_slice(id_s);
+    let child = match exec_path("/programs/synce2e.elf", &cmd) {
+        Ok(pid) => pid,
+        Err(e) => {
+            // ADR-029：安装模式 `/programs` 无 payload 兜底，synce2e.elf 可能不存在。
+            out(b"synce2e: spawn waiter failed errno=");
+            out(u64_to_dec(e.to_errno() as u64, &mut b));
+            out(b" (liveCD-only test payload /programs/synce2e.elf required, ADR-029)\n");
+            let _ = sync_delete(id);
+            return 1;
+        }
+    };
+    out(b"synce2e: spawned waiter pid=");
+    out(u64_to_dec(child, &mut b));
+    out(b"\n");
+    // 3. yield 循环：保持父进程就绪（而非阻塞），让子进程被调度去
+    //    sync_wait 上真正阻塞。若父进程 sleep 阻塞，子进程阻塞时无就绪同伴，
+    //    block_current_with 会 NotSwitched → WouldBlock（见内核注释）。
+    for _ in 0..2000 {
+        let _ = yield_now();
+    }
+    // 4. wake：设值 42 并唤醒（至多 1 个）等待者。返回 1 证明子进程已阻塞。
+    let woke = match sync_wake(id, 42, 1) {
+        Ok(n) => n,
+        Err(_) => { out(b"synce2e: wake failed\n"); let _ = sync_delete(id); return 1; }
+    };
+    if woke != 1 {
+        out(b"synce2e: wake returned ");
+        out(u64_to_dec(woke, &mut b));
+        out(b" (expected 1 = child was blocked)\n");
+        let _ = sync_delete(id);
+        return 1;
+    }
+    out(b"synce2e: woke 1 blocked waiter, value=42\n");
+    // 5. 收子进程退出码，断言 0（拿到唤醒值 42）。
+    match waitpid_any() {
+        Ok(code) => {
+            if code == 0 {
+                out(b"synce2e: child exit=0, round-trip OK\n");
+            } else {
+                out(b"synce2e: child exit=");
+                out(u64_to_dec(code, &mut b));
+                out(b" (expected 0)\n");
+                let _ = sync_delete(id);
+                return 1;
+            }
+        }
+        Err(_) => { out(b"synce2e: waitpid failed\n"); let _ = sync_delete(id); return 1; }
+    }
+    // 6. delete 同步字。
+    match sync_delete(id) {
+        Ok(()) => out(b"synce2e: delete ok\n"),
+        Err(_) => { out(b"synce2e: delete failed\n"); return 1; }
+    }
+    out(b"synce2e: ALL OK (blocking round-trip)\n");
+    0
+}
 
 /// `mkdir <dir>`：创建目录。
 fn cmd_mkdir(arg: &[u8]) -> u8 {    let a = trim_bytes(arg);
@@ -1416,6 +1497,7 @@ fn run_builtin(name: &[u8], arg: &[u8]) -> u8 {
         b"cd" => cmd_cd(arg),
         b"pwd" => cmd_pwd(),
         b"pipe" => cmd_pipe(arg),
+        b"synce2e" => cmd_synce2e(),
         other => {
             out(b"boruix: unknown command: ");
             out(other);
