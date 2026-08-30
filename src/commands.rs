@@ -184,7 +184,7 @@ fn cmd_jobs(arg: &[u8]) -> u8 {
 
 use libsys::nr::{INFO_BOOT_MS, INFO_CPU_COUNT, INFO_VERSION};
 use libsys::{
-    chdir, close, getcwd, info, kill, mkdir, now, open, pipe_create, ps, read, read_dir,
+    chdir, close, dup2, getcwd, info, kill, mkdir, now, open, pipe_create, ps, read, read_dir,
     read_to_end, read_wall_clock, sleep, unlink, write, OpenFlags, Permissions, PsEntry,
 };
 use libsys::signal::LIST;
@@ -737,12 +737,19 @@ fn cmd_ls(arg: &[u8]) -> u8 {
     }
 }
 
-/// `cat <file>`：打印文件内容。
+/// `cat [path]`：打印文件内容；无路径时读 stdin（支持管道右段 `A | cat`）。
 fn cmd_cat(arg: &[u8]) -> u8 {
     let a = trim_bytes(arg);
     if a.is_empty() {
-        out(b"cat: missing file operand\n");
-        return 1;
+        // 无路径：从 stdin（fd 0）读到 EOF，直接转发到 stdout。
+        // 管道右段 `echo hi | cat` 走此路径（pipe-features A3）。
+        return match read_stdin_all(&mut |chunk: &[u8]| out(chunk)) {
+            Ok(()) => 0,
+            Err(()) => {
+                out(b"cat: stdin read failed\n");
+                1
+            }
+        };
     }
     let path = match core::str::from_utf8(a) {
         Ok(p) => p,
@@ -1125,6 +1132,13 @@ pub(crate) fn exec_line(line: &[u8]) {
     if final_words.is_empty() {
         return;
     }
+    // 管道 `|`：若存在独立的 `|` 词，按管道执行（pipe-features A3）。
+    // 先于单命令分发——`|` 是保留分隔符，不作为普通命令/参数。
+    if final_words.iter().any(|w| w.as_slice() == b"|") {
+        let status = exec_pipeline(&final_words);
+        set_last_status(status);
+        return;
+    }
     let name = final_words[0].as_slice();
 
     let mut argbuf = Vec::new();
@@ -1136,7 +1150,14 @@ pub(crate) fn exec_line(line: &[u8]) {
     }
     let arg = argbuf.as_slice();
 
-    let status = match name {
+    let status = run_builtin(name, arg);
+    set_last_status(status);
+}
+
+/// 分发单条内建命令（`name` = 命令名，`arg` = 空格连接的剩余参数）。供
+/// `exec_line` 与管道 `|` 的各段（`run_pipeline_stage`）共用。返回退出状态。
+fn run_builtin(name: &[u8], arg: &[u8]) -> u8 {
+    match name {
         b"echo" => exec_echo(arg),
         b"help" => cmd_help(),
         b"now" => cmd_now(),
@@ -1175,6 +1196,98 @@ pub(crate) fn exec_line(line: &[u8]) {
             out(b"\n");
             127
         }
+    }
+}
+
+/// 执行管道 `A | B`（pipe-features A3）：把左段的 stdout 经真实匿名管道接到
+/// 右段的 stdin。用内核 `dup2` + `pipe_create`（方案 A 的 fd 重定向原语）。
+///
+/// 实现（Unix 管道本质）：
+/// 1. `pipe_create` 得 `(rfd, wfd)`；
+/// 2. 把 shell 自身 fd 0/1 备份到高位预留槽（`dup2`），执行中可恢复；
+/// 3. `dup2(wfd, 1)` 使左段 stdout → 管道写端，执行左段后 `dup2(备份,1)` 还原；
+/// 4. `dup2(rfd, 0)` 使右段 stdin ← 管道读端，执行右段后 `dup2(备份,0)` 还原。
+///
+/// 返回右段退出状态（管道语义以最右段为准）。
+fn exec_pipeline(words: &[Vec<u8>]) -> u8 {
+    // 拆成左右两段（当前支持单 `|`，两段）。`|` 词把 words 一分为二。
+    let split = words.iter().position(|w| w.as_slice() == b"|").unwrap_or(words.len());
+    let left = &words[..split];
+    let right = &words[split + 1..];
+    if left.is_empty() || right.is_empty() {
+        out(b"boruix: malformed pipeline\n");
+        return 1;
+    }
+    let (rfd, wfd) = match pipe_create() {
+        Ok(v) => v,
+        Err(_) => {
+            out(b"boruix: pipe_create failed\n");
+            return 1;
+        }
     };
-    set_last_status(status);
+    // 备份 shell 自身 stdio 到高位预留槽（shell 正常只开 0/1/2，这些槽空闲）。
+    // 失败（槽被占/超上限）如实报错并回滚。
+    const SAVE_OUT: u64 = 200;
+    const SAVE_IN: u64 = 201;
+    if dup2(1, SAVE_OUT).is_err() || dup2(0, SAVE_IN).is_err() {
+        out(b"boruix: dup2 backup failed\n");
+        let _ = close(wfd);
+        let _ = close(rfd);
+        return 1;
+    }
+    // ---- 左段：stdout → 管道写端 ----
+    let _ = dup2(wfd, 1);
+    let lstatus = run_pipeline_stage(left);
+    // 还原 stdout 再关备份/写端（顺序重要：先还原 fd1 才能让后续 out 输出正常）。
+    let _ = dup2(SAVE_OUT, 1);
+    let _ = close(SAVE_OUT);
+    let _ = close(wfd);
+    // ---- 右段：stdin ← 管道读端 ----
+    let _ = dup2(rfd, 0);
+    let rstatus = run_pipeline_stage(right);
+    let _ = dup2(SAVE_IN, 0);
+    let _ = close(SAVE_IN);
+    let _ = close(rfd);
+    // 左段失败传播（非零状态 = 左段问题）；否则以右段为准。
+    if lstatus != 0 {
+        lstatus
+    } else {
+        rstatus
+    }
+}
+
+/// 运行管道的一段的命令分发（参数重建 + `run_builtin`）。
+fn run_pipeline_stage(stage: &[Vec<u8>]) -> u8 {
+    let name = stage[0].as_slice();
+    let mut argbuf = Vec::new();
+    for (k, w) in stage.iter().enumerate().skip(1) {
+        if k > 1 {
+            argbuf.push(b' ');
+        }
+        argbuf.extend_from_slice(w);
+    }
+    run_builtin(name, argbuf.as_slice())
+}
+
+/// 从 fd 0（stdin）读到 EOF，把内容喂给 `feed`。供 `cat`（无路径读 stdin）
+/// 等管道右段消费。
+///
+/// EOF 语义：管道写端全部关闭且缓冲排空后，内核 `pipe_read` 返回 `WouldBlock`
+/// （当前内核不追踪"写端是否全部关闭"来给 EOF(0)）。对顺序管道右段（写端
+/// 已在本段运行前关闭），`WouldBlock` 即等价 EOF——此处如实把 `WouldBlock`
+/// 当 EOF 结束读取，而不是误报失败。其它错误才上抛。
+fn read_stdin_all(feed: &mut dyn FnMut(&[u8])) -> Result<(), ()> {
+    let mut buf = [0u8; 128];
+    loop {
+        let n = match read(0, &mut buf) {
+            Ok(n) => n,
+            Err(libsys::error::Error::WouldBlock) => break, // 写端已关 = EOF
+            Err(_) => return Err(()),
+        };
+        if n == 0 {
+            break; // EOF（写端已关）
+        }
+        feed(&buf[..n]);
+    }
+    Ok(())
 }
