@@ -9,7 +9,7 @@ pub(crate) const COMMANDS: &[&[u8]] = &[
     b"echo", b"help", b"now", b"time", b"uptime", b"version", b"uname", b"cpu", b"sleep",
     b"clear", b"env", b"export", b"unset", b"ps", b"kill", b"signal", b"alias", b"unalias",
     b"which", b"jobs", b"ls", b"cat", b"mkdir", b"touch", b"rm", b"tree", b"jtree", b"cd",
-    b"pwd",
+    b"pwd", b"pipe",
 ];
 
 /// 返回内建命令名列表（供补全遍历）。
@@ -184,8 +184,8 @@ fn cmd_jobs(arg: &[u8]) -> u8 {
 
 use libsys::nr::{INFO_BOOT_MS, INFO_CPU_COUNT, INFO_VERSION};
 use libsys::{
-    chdir, close, getcwd, info, kill, mkdir, now, open, ps, read_dir, read_to_end,
-    read_wall_clock, sleep, unlink, OpenFlags, Permissions, PsEntry,
+    chdir, close, getcwd, info, kill, mkdir, now, open, pipe_create, ps, read, read_dir,
+    read_to_end, read_wall_clock, sleep, unlink, write, OpenFlags, Permissions, PsEntry,
 };
 use libsys::signal::LIST;
 
@@ -224,6 +224,7 @@ fn cmd_help() -> u8 {
         (b"jtree", b"visualize a JSON value as a tree"),
         (b"cd", b"change the working directory"),
         (b"pwd", b"print the working directory"),
+        (b"pipe", b"self-test: create a pipe, write+read roundtrip"),
     ];
     out(b"boruix shell builtins:\n");
     for (c, d) in ITEMS {
@@ -764,9 +765,51 @@ fn cmd_cat(arg: &[u8]) -> u8 {
     }
 }
 
+/// `pipe`：管道自检（pipe-features.md 第 1 层验收）。创建一对匿名管道端，
+/// 写端写数据 → 读端读回 → 校验字节一致，打印结果。验证 libsys `pipe_create`
+/// 封装的解包 + 内核 FLAG_PIPE 路由（`SYS_STREAM_CREATE` → `ipc::pipe_*`）在
+/// 真实用户进程里可用。成功返回 0，任何一步失败返回 1。
+fn cmd_pipe(_arg: &[u8]) -> u8 {
+    let (rfd, wfd) = match pipe_create() {
+        Ok(v) => v,
+        Err(_) => {
+            out(b"pipe: pipe_create failed\n");
+            return 1;
+        }
+    };
+    const MSG: &[u8] = b"hello-pipe";
+    if write(wfd, MSG) != Ok(MSG.len()) {
+        out(b"pipe: write failed\n");
+        let _ = close(wfd);
+        let _ = close(rfd);
+        return 1;
+    }
+    let mut buf = [0u8; 64];
+    let n = match read(rfd, &mut buf) {
+        Ok(n) => n,
+        Err(_) => {
+            out(b"pipe: read failed\n");
+            let _ = close(wfd);
+            let _ = close(rfd);
+            return 1;
+        }
+    };
+    let _ = close(wfd);
+    let _ = close(rfd);
+    if n != MSG.len() || buf[..n] != *MSG {
+        out(b"pipe: mismatch read=");
+        out(u64_to_dec(n as u64, &mut [0u8; 24]));
+        out(b"\n");
+        return 1;
+    }
+    out(b"pipe: ok \"");
+    out(&buf[..n]);
+    out(b"\"\n");
+    0
+}
+
 /// `mkdir <dir>`：创建目录。
-fn cmd_mkdir(arg: &[u8]) -> u8 {
-    let a = trim_bytes(arg);
+fn cmd_mkdir(arg: &[u8]) -> u8 {    let a = trim_bytes(arg);
     if a.is_empty() {
         out(b"mkdir: missing operand\n");
         return 1;
@@ -1125,6 +1168,7 @@ pub(crate) fn exec_line(line: &[u8]) {
         b"jtree" => cmd_jtree(arg),
         b"cd" => cmd_cd(arg),
         b"pwd" => cmd_pwd(),
+        b"pipe" => cmd_pipe(arg),
         other => {
             out(b"boruix: unknown command: ");
             out(other);
