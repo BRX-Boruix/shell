@@ -1507,59 +1507,95 @@ fn run_builtin(name: &[u8], arg: &[u8]) -> u8 {
     }
 }
 
-/// 执行管道 `A | B`（pipe-features A3）：把左段的 stdout 经真实匿名管道接到
-/// 右段的 stdin。用内核 `dup2` + `pipe_create`（方案 A 的 fd 重定向原语）。
+/// 执行管道 `A | B | C ...`（pipe-features A3）：把前一段的 stdout 经真实匿名
+/// 管道接到后一段的 stdin，支持**多段**（评审 🟠 加入）。用内核 `dup2` +
+/// `pipe_create`（方案 A 的 fd 重定向原语）。
 ///
-/// 实现（Unix 管道本质）：
-/// 1. `pipe_create` 得 `(rfd, wfd)`；
-/// 2. 把 shell 自身 fd 0/1 备份到高位预留槽（`dup2`），执行中可恢复；
-/// 3. `dup2(wfd, STDOUT)` 使左段 stdout → 管道写端，执行左段后 `dup2(备份, STDOUT)` 还原；
-/// 4. `dup2(rfd, STDIN)` 使右段 stdin ← 管道读端，执行右段后 `dup2(备份, STDIN)` 还原。
+/// 实现（Unix 管道本质，顺序模型——与既有单管道一致的非并发语义）：
+/// 1. 按 `|` 把词表拆成 N 段，建 N-1 条匿名管道 `(rfd[i], wfd[i])`；
+/// 2. 把 shell 自身 fd 0/1 备份到高位预留槽（`dup2`），**整条管道期间保持
+///    打开**（每段结束时还原到原始 stdio，而不是关备份槽）；
+/// 3. 对每段 i：`dup2(rfd[i-1], STDIN)`（i>0）使 stdin ← 前段读端；
+///    `dup2(wfd[i], STDOUT)`（i<n-1）使 stdout → 后段写端；执行该段；
+///    再 `dup2(备份, STDOUT/STDIN)` 还原原始 stdio；
+/// 4. 段结束后关掉本段的管道端（产出写端 + 消费读端），使后段读到 EOF。
 ///
-/// 返回右段退出状态（管道语义以最右段为准）。
+/// 段间流通量受内核管道缓冲（PIPE_CAPACITY=4096B）上限约束——超量时顺序
+/// 模型下中间段写满会阻塞（既有单管道同限，pipe-features.md 已记录"顺序
+/// 非并发"）。内置命令多为小输出，当前语义正确。
+///
+/// 返回首个非零段退出状态；全零则返回 0（保留既有"首失败优先"约定）。
 fn exec_pipeline(words: &[Vec<u8>]) -> u8 {
-    // 拆成左右两段（当前支持单 `|`，两段）。`|` 词把 words 一分为二。
-    let split = words.iter().position(|w| w.as_slice() == b"|").unwrap_or(words.len());
-    let left = &words[..split];
-    let right = &words[split + 1..];
-    if left.is_empty() || right.is_empty() {
+    // 按 `|` 词把 words 拆成多段。`|` 是保留分隔符，不进入任何段。
+    let mut segments: Vec<&[Vec<u8>]> = Vec::new();
+    let mut start = 0usize;
+    for (i, w) in words.iter().enumerate() {
+        if w.as_slice() == b"|" {
+            segments.push(&words[start..i]);
+            start = i + 1;
+        }
+    }
+    segments.push(&words[start..]);
+    let n = segments.len();
+    // 至少两段；任一段为空（首/尾 `|` 或连续 `||`）即畸形。
+    if n < 2 || segments.iter().any(|s| s.is_empty()) {
         out(b"boruix: malformed pipeline\n");
         return 1;
     }
-    let (rfd, wfd) = match pipe_create() {
-        Ok(v) => v,
-        Err(_) => {
-            out(b"boruix: pipe_create failed\n");
-            return 1;
+    // 建 N-1 条管道。中途失败须回滚已建的（避免 fd 泄漏）。
+    let mut pipes: Vec<(u64, u64)> = Vec::new();
+    for _ in 0..n - 1 {
+        match pipe_create() {
+            Ok(v) => pipes.push(v),
+            Err(_) => {
+                out(b"boruix: pipe_create failed\n");
+                for &(r, w) in pipes.iter() {
+                    let _ = close(r);
+                    let _ = close(w);
+                }
+                return 1;
+            }
         }
-    };
+    }
     // 备份 shell 自身 stdio 到高位预留槽（模块级 SAVE_FD_* 常量，集中定义）。
-    // 失败（槽被占/超上限）如实报错并回滚。
+    // 失败（槽被占/超上限）如实报错并回滚全部管道端。
     if dup2(STDOUT, SAVE_FD_OUT).is_err() || dup2(STDIN, SAVE_FD_IN).is_err() {
         out(b"boruix: dup2 backup failed\n");
-        let _ = close(wfd);
-        let _ = close(rfd);
+        for &(r, w) in pipes.iter() {
+            let _ = close(r);
+            let _ = close(w);
+        }
         return 1;
     }
-    // ---- 左段：stdout → 管道写端 ----
-    let _ = dup2(wfd, STDOUT);
-    let lstatus = run_pipeline_stage(left);
-    // 还原 stdout 再关备份/写端（顺序重要：先还原 fd1 才能让后续 out 输出正常）。
-    let _ = dup2(SAVE_FD_OUT, STDOUT);
-    let _ = close(SAVE_FD_OUT);
-    let _ = close(wfd);
-    // ---- 右段：stdin ← 管道读端 ----
-    let _ = dup2(rfd, STDIN);
-    let rstatus = run_pipeline_stage(right);
-    let _ = dup2(SAVE_FD_IN, STDIN);
-    let _ = close(SAVE_FD_IN);
-    let _ = close(rfd);
-    // 左段失败传播（非零状态 = 左段问题）；否则以右段为准。
-    if lstatus != 0 {
-        lstatus
-    } else {
-        rstatus
+    // 顺序执行每段；备份槽保持打开到整条管道结束，便于每段还原原始 stdio。
+    let mut first_err: u8 = 0;
+    for i in 0..n {
+        // 段 i 的 stdin ← 前段读端（i>0）；段 i 的 stdout → 后段写端（i<n-1）。
+        if i > 0 {
+            let _ = dup2(pipes[i - 1].0, STDIN);
+        }
+        if i < n - 1 {
+            let _ = dup2(pipes[i].1, STDOUT);
+        }
+        let st = run_pipeline_stage(segments[i]);
+        // 还原原始 stdio（顺序重要：先还原 fd0/1 才能让后续 out 输出正常）。
+        let _ = dup2(SAVE_FD_OUT, STDOUT);
+        let _ = dup2(SAVE_FD_IN, STDIN);
+        if first_err == 0 && st != 0 {
+            first_err = st;
+        }
+        // 关掉本段消费的读端与产出的写端，使后段能读到 EOF。
+        if i > 0 {
+            let _ = close(pipes[i - 1].0);
+        }
+        if i < n - 1 {
+            let _ = close(pipes[i].1);
+        }
     }
+    // 关备份槽（整条管道结束）。
+    let _ = close(SAVE_FD_OUT);
+    let _ = close(SAVE_FD_IN);
+    first_err
 }
 
 /// 运行管道的一段的命令分发（参数重建 + `run_builtin`）。
