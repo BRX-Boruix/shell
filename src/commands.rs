@@ -9,7 +9,7 @@ pub(crate) const COMMANDS: &[&[u8]] = &[
     b"echo", b"help", b"now", b"time", b"uptime", b"version", b"uname", b"cpu", b"sleep",
     b"clear", b"env", b"export", b"unset", b"ps", b"kill", b"signal", b"alias", b"unalias",
     b"which", b"jobs", b"ls", b"cat", b"mkdir", b"touch", b"rm", b"tree", b"jtree", b"cd",
-    b"pwd", b"pipe",
+    b"pwd", b"pipe", b"libccheck",
 ];
 
 /// 返回内建命令名列表（供补全遍历）。
@@ -1498,6 +1498,7 @@ fn run_builtin(name: &[u8], arg: &[u8]) -> u8 {
         b"pwd" => cmd_pwd(),
         b"pipe" => cmd_pipe(arg),
         b"synce2e" => cmd_synce2e(),
+        b"libccheck" => crate::libc_check::cmd_libccheck(arg),
         other => {
             out(b"boruix: unknown command: ");
             out(other);

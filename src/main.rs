@@ -22,6 +22,7 @@ extern crate alloc;
 mod commands;
 mod env;
 mod json_tree;
+mod libc_check;
 mod tokenize;
 mod util;
 
