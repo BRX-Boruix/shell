@@ -873,18 +873,28 @@ fn cmd_synce2e() -> u8 {
         return 1;
     }
     out(b"synce2e: woke 1 blocked waiter, value=42\n");
-    // 5. 收子进程退出码，断言 0（拿到唤醒值 42）。
+    // 5. 收子进程退出码，断言 0 且 pid == 派生子进程（waitpid 真实返回被收尸 pid）。
     match waitpid_any() {
-        Ok(code) => {
-            if code == 0 {
-                out(b"synce2e: child exit=0, round-trip OK\n");
-            } else {
+        Ok(wr) => {
+            if wr.pid != child {
+                out(b"synce2e: waitpid pid=");
+                out(u64_to_dec(wr.pid, &mut b));
+                out(b" (expected ");
+                out(u64_to_dec(child, &mut b));
+                out(b")\n");
+                let _ = sync_delete(id);
+                return 1;
+            }
+            if wr.code != 0 {
                 out(b"synce2e: child exit=");
-                out(u64_to_dec(code, &mut b));
+                out(u64_to_dec(wr.code, &mut b));
                 out(b" (expected 0)\n");
                 let _ = sync_delete(id);
                 return 1;
             }
+            out(b"synce2e: waitpid pid=");
+            out(u64_to_dec(wr.pid, &mut b));
+            out(b" exit=0, round-trip OK\n");
         }
         Err(_) => { out(b"synce2e: waitpid failed\n"); let _ = sync_delete(id); return 1; }
     }
