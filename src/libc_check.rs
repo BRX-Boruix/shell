@@ -106,6 +106,48 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         }
     }
 
+
+
+    unsafe {
+        // item8 加固：canary / poison / double-free 检测。
+        let normal = libc::malloc::malloc(48);
+        if !normal.is_null() {
+            *normal.add(0) = 1;
+            *normal.add(47) = 2;
+            libc::malloc::free(normal);
+        }
+        rpt.check("malloc no-corrupt normal", libc::malloc::boruix_malloc_corrupt() == 0);
+        // 越界写：写入可写容量末尾（canary 区）→ free 应检测并置位。
+        let p_ov = libc::malloc::malloc(32);
+        if !p_ov.is_null() {
+            let usable = libc::malloc::malloc_usable_size(p_ov);
+            // canary 位于可写容量末 8 字节。
+            let mut i = usable;
+            while i > usable - 8 {
+                i -= 1;
+                *p_ov.add(i) = 0xCC;
+            }
+            libc::malloc::free(p_ov);
+            rpt.check("malloc canary detect overflow", libc::malloc::boruix_malloc_corrupt() == 1);
+        }
+        // poison：释放后旧内存读为 0xDD。
+        let p_poison = libc::malloc::malloc(16);
+        let mut poison_ok = false;
+        if !p_poison.is_null() {
+            *p_poison.add(0) = 0x11;
+            libc::malloc::free(p_poison);
+            poison_ok = p_poison.add(0).read() == 0xDD;
+        }
+        rpt.check("malloc poison 0xDD after free", poison_ok);
+        // double-free 检测：同一块释放两次 → 置损坏标志。
+        let p_df = libc::malloc::malloc(24);
+        if !p_df.is_null() {
+            libc::malloc::free(p_df);
+            libc::malloc::free(p_df);
+            rpt.check("malloc double-free detect", libc::malloc::boruix_malloc_corrupt() == 1);
+        }
+    }
+
     // 2) 字符串函数
     unsafe {
         let a = b"hello\0".as_ptr() as *const i8;
