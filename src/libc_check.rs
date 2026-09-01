@@ -41,6 +41,7 @@ impl Report {
 }
 
 /// 运行 libc 验收并输出结果。
+
 pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
     let mut rpt = Report::new();
 
@@ -117,6 +118,22 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             libc::malloc::free(normal);
         }
         rpt.check("malloc no-corrupt normal", libc::malloc::boruix_malloc_corrupt() == 0);
+
+        // poison：释放后经下次 malloc 复用同一块，其 payload 首字节应为 0xDD。
+        // 不读已释放内存（UB）；改为释放后同尺寸复用，检验毒化确实写入。
+        let p_poison = libc::malloc::malloc(512);
+        if !p_poison.is_null() {
+            // volatile 写/读：free 的毒化写是 volatile，复用后 volatile 读取真实内存，
+            // 使编译器无法把"释放→复用→读取"折叠成未初始化/常量（LTO 防御）。
+            core::ptr::write_volatile(p_poison, 0x11);
+            libc::malloc::free(p_poison);
+            let r = libc::malloc::malloc(512);
+            let poison_ok = !r.is_null() && core::ptr::read_volatile(r) == 0xDD;
+            if !r.is_null() {
+                libc::malloc::free(r);
+            }
+            rpt.check("malloc poison 0xDD after free", poison_ok);
+        }
         // 越界写：写入可写容量末尾（canary 区）→ free 应检测并置位。
         let p_ov = libc::malloc::malloc(32);
         if !p_ov.is_null() {
@@ -130,15 +147,6 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             libc::malloc::free(p_ov);
             rpt.check("malloc canary detect overflow", libc::malloc::boruix_malloc_corrupt() == 1);
         }
-        // poison：释放后旧内存读为 0xDD。
-        let p_poison = libc::malloc::malloc(16);
-        let mut poison_ok = false;
-        if !p_poison.is_null() {
-            *p_poison.add(0) = 0x11;
-            libc::malloc::free(p_poison);
-            poison_ok = p_poison.add(0).read() == 0xDD;
-        }
-        rpt.check("malloc poison 0xDD after free", poison_ok);
         // double-free 检测：同一块释放两次 → 置损坏标志。
         let p_df = libc::malloc::malloc(24);
         if !p_df.is_null() {
@@ -358,7 +366,7 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         let na = libc::stdio::snprintf(ab.as_mut_ptr() as *mut i8, ab.len(),
             b"%a\0".as_ptr() as *const i8, 255.5f64);
         let gota = cstr_to_owned(ab.as_ptr());
-        rpt.check("snprintf %a len", na == 7);
+        rpt.check("snprintf %a len", na == 9);
         rpt.check("snprintf %a 0x1.ffp+7", gota == b"0x1.ffp+7");
 
         // %n 写已输出字符数。

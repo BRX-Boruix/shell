@@ -26,6 +26,16 @@
 - 备份槽被占/超上限：`boruix: redirect: stdio backup failed` / `boruix: dup2 backup failed`。
 - **已知限制**：重定向符须为空白分隔的独立词，`echo hi>f` 不会被当作重定向（与管道 `|` 同约定）。
 
+### 已知限制（S09 诚实降级）
+- **变长浮点实参（`%.2f` / `%a` / `%e` / `%g`）在真实内核上受限**：`c_variadic`
+  （Rust nightly 特性）在 `x86_64-unknown-none` 目标的 `va_arg` 读取 `f64` 变长实参时
+  得到错误值（整型/指针变长实参正常）。这是**工具链/ABI 级限制**（`libccheck` 的 `snprintf2
+  pad+float`、`snprintf %a` 两项失败；init 自检的 `snprintf FAIL` 同源），**非 libc 格式化
+  引擎缺陷**——格式化引擎（`emit_fixed`/`render_hexfloat`）已由宿主测试覆盖通过
+  （`test_float_fixed_basic`/`test_hexfloat_known_values` 等 17 项）。
+- 浮点格式化引擎本身正确；仅变长浮点**实参传入**被工具链限制。修复方向：跟进 Rust `c_variadic`
+  对 `x86_64-unknown-none` 的浮点 `va_arg` 支持，或改用非变长浮点接口。
+
 ### 回滚/降级
 - 该功能位于内建命令分发路径（`exec_line` / `run_pipeline_stage` 剥离重定向后分发）。
   若需回滚，恢复 `src/commands.rs` 中 `split_redirects`/`with_redirects` 的调用即可，
