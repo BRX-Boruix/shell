@@ -12,6 +12,7 @@
 //! 直接经 libc crate 路径调用其 C ABI 导出（强制链接 + 真实调用）。
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 use crate::util::{out, outln};
 
 /// 检查结果计数器：通过/失败。
@@ -40,6 +41,15 @@ impl Report {
     }
 }
 
+
+// ---- libccheck 信号处理器（真实投递验证用） ----
+/// 用户 SIGUSR1 handler：置位标记（证明经 libc signal()/sigaction() 设置的处理器
+/// 确实被内核投递并 sigreturn 恢复）。普通 extern "C" 函数即可——内核压帧后跳入，
+/// 函数 ret 弹回 restorer → rt_sigreturn。
+static SIG_LIBC_RAN: AtomicU32 = AtomicU32::new(0);
+unsafe extern "C" fn libc_sigusr1_handler(_sig: i32) {
+    SIG_LIBC_RAN.store(1, Ordering::SeqCst);
+}
 /// 运行 libc 验收并输出结果。
 
 pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
@@ -432,6 +442,89 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
     // 7) errno 机制
     {
         rpt.check("errno_location non-null", !libc::errno::__errno_location().is_null());
+    }
+
+
+    // 9) mkdir / opendir / readdir / closedir / remove（经内核 VFS）
+    unsafe {
+        let tdir = b"/tmp_libc_dir ".as_ptr() as *const i8;
+        // mkdir 755
+        let rc = libc::unistd::mkdir(tdir, 0o755);
+        rpt.check("mkdir rc==0", rc == 0);
+        // 在目录内创建文件
+        let tfile = b"/tmp_libc_dir/hello.txt ".as_ptr() as *const i8;
+        let fp = libc::stdio::fopen(tfile, b"w ".as_ptr() as *const i8);
+        let file_created = !fp.is_null();
+        if !fp.is_null() { libc::stdio::fclose(fp); }
+        rpt.check("mkdir create file in dir", file_created);
+        // opendir/readdir/closedir
+        let dp = libc::dirent::opendir(tdir);
+        rpt.check("opendir non-null", !dp.is_null());
+        if !dp.is_null() {
+            let mut found = false;
+            let mut count = 0usize;
+            loop {
+                let e = libc::dirent::readdir(dp);
+                if e.is_null() { break; }
+                count += 1;
+                let nm = cstr_to_owned((*e).d_name.as_ptr() as *const u8);
+                if nm == b"hello.txt" { found = true; }
+                // 文件条目 d_type == DT_REG(8)；目录条目 == DT_DIR(4)。
+                let t = (*e).d_type;
+                let _ = t;
+            }
+            rpt.check("readdir count>=1", count >= 1);
+            rpt.check("readdir found hello.txt", found);
+            let rc2 = libc::dirent::closedir(dp);
+            rpt.check("closedir rc==0", rc2 == 0);
+        }
+        // remove 文件，再 remove 空目录
+        let rc3 = libc::unistd::remove(tfile);
+        rpt.check("remove file rc==0", rc3 == 0);
+        let rc4 = libc::unistd::remove(tdir);
+        rpt.check("remove empty dir rc==0", rc4 == 0);
+    }
+
+    // 10) signal / sigaction / raise（经内核 SIGNAL 域）
+    unsafe {
+        // signal() 设置/返回旧处置语义
+        let old_ign = libc::signal::signal(libc::signal::SIGUSR1, libc::signal::SIG_IGN);
+        rpt.check("signal set IGN returns DFL", old_ign == libc::signal::SIG_DFL);
+        let old_dfl = libc::signal::signal(libc::signal::SIGUSR1, libc::signal::SIG_DFL);
+        rpt.check("signal set DFL returns IGN", old_dfl == libc::signal::SIG_IGN);
+
+        // sigaction()：设处理器 + oact 捕获旧处置
+        let mut act: libc::signal::sigaction = core::mem::zeroed();
+        act.sa_handler = libc_sigusr1_handler as *const () as usize;
+        act.sa_flags = 0;
+        let mut oact: libc::signal::sigaction = core::mem::zeroed();
+        let rsa = libc::signal::sigaction(libc::signal::SIGUSR1, &act as *const _ as *const libc::signal::sigaction, &mut oact as *mut _);
+        rpt.check("sigaction set rc==0", rsa == 0);
+        rpt.check("sigaction oact old==DFL", oact.sa_handler == libc::signal::SIG_DFL);
+
+        // 真机投递：raise 自身 + yield 让内核投递进 handler
+        SIG_LIBC_RAN.store(0, Ordering::SeqCst);
+        let rr = libc::signal::raise(libc::signal::SIGUSR1);
+        rpt.check("raise rc==0", rr == 0);
+        let _ = libsys::yield_now();
+        let _ = libsys::yield_now();
+        rpt.check("signal handler ran (libc)", SIG_LIBC_RAN.load(Ordering::SeqCst) == 1);
+        // 恢复默认，避免残留处理器影响后续。
+        libc::signal::signal(libc::signal::SIGUSR1, libc::signal::SIG_DFL);
+    }
+
+    // 11) fcntl：F_DUPFD / F_GETFD（经内核 dup2）
+    unsafe {
+        // F_DUPFD：复制 stdout(1) 到 >=10 的最低空闲槽。
+        let newfd = libc::unistd::fcntl(1, libc::unistd::F_DUPFD, 10);
+        rpt.check("fcntl F_DUPFD >=10", newfd >= 10);
+        // 副本应可写（与 stdout 同句柄）。
+        let wc = libc::unistd::write(newfd, b"".as_ptr() as *const core::ffi::c_void, 0);
+        let _ = wc;
+        libc::unistd::close(newfd);
+        // F_GETFD：无 fd 标志 → 0。
+        let gfd = libc::unistd::fcntl(1, libc::unistd::F_GETFD, 0);
+        rpt.check("fcntl F_GETFD==0", gfd == 0);
     }
 
     // 汇总

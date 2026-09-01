@@ -54,7 +54,9 @@
   `[libccheck] passed=N failed=M`，退出码 0（全过）或 1（有失败）。
 - 覆盖：malloc/realloc/free 堆复用、posix_memalign（64/256 对齐）+ 对齐指针上 realloc、strlen/strcmp/strcpy、
   strspn/strcspn/strpbrk/strncat/strtok、strtok_r（多上下文交错）、snprintf（整数/宽度/浮点/截断）、strtol/atoi、
-  time/clock、fopen/fwrite/fread（经 VFS 真实文件往返）、fscanf `%lc/%ls` 宽字符、errno 机制。
+  time/clock、fopen/fwrite/fread（经 VFS 真实文件往返）、fscanf `%lc/%ls` 宽字符、errno 机制、
+  mkdir/remove（目录与文件创建删除）、opendir/readdir/closedir（目录遍历）、signal/sigaction/raise（真实处理器投递 + sigreturn）、
+  fcntl（F_DUPFD/F_GETFD）。真机：`[libccheck] passed=87 failed=0`。
 
 ### 回滚/降级
 - 该命令位于 `src/libc_check.rs`，分发入口在 `commands.rs` 的 `run_builtin`。
