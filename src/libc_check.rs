@@ -261,7 +261,7 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         let n2 = libc::stdio::snprintf(buf.as_mut_ptr() as *mut i8, buf.len(),
             b"%05d %.2f\0".as_ptr() as *const i8,
             7, 3.14159);
-        rpt.check("snprintf2 returns len", n2 == 9);
+        rpt.check("snprintf2 returns len", n2 == 10);
         let got2 = cstr_to_owned(buf.as_ptr());
         rpt.check("snprintf2 pad+float", got2 == b"00007 3.14");
         let n3 = libc::stdio::snprintf(buf.as_mut_ptr() as *mut i8, 5,

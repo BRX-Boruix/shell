@@ -26,15 +26,17 @@
 - 备份槽被占/超上限：`boruix: redirect: stdio backup failed` / `boruix: dup2 backup failed`。
 - **已知限制**：重定向符须为空白分隔的独立词，`echo hi>f` 不会被当作重定向（与管道 `|` 同约定）。
 
-### 已知限制（S09 诚实降级）
-- **变长浮点实参（`%.2f` / `%a` / `%e` / `%g`）在真实内核上受限**：`c_variadic`
-  （Rust nightly 特性）在 `x86_64-unknown-none` 目标的 `va_arg` 读取 `f64` 变长实参时
-  得到错误值（整型/指针变长实参正常）。这是**工具链/ABI 级限制**（`libccheck` 的 `snprintf2
-  pad+float`、`snprintf %a` 两项失败；init 自检的 `snprintf FAIL` 同源），**非 libc 格式化
-  引擎缺陷**——格式化引擎（`emit_fixed`/`render_hexfloat`）已由宿主测试覆盖通过
-  （`test_float_fixed_basic`/`test_hexfloat_known_values` 等 17 项）。
-- 浮点格式化引擎本身正确；仅变长浮点**实参传入**被工具链限制。修复方向：跟进 Rust `c_variadic`
-  对 `x86_64-unknown-none` 的浮点 `va_arg` 支持，或改用非变长浮点接口。
+### 已知限制 / 规避（S09 诚实降级）
+- **变长浮点实参（`%.2f` / `%a` / `%e` / `%g`）**：本目标 `x86_64-unknown-none` 的
+  `c_variadic`（nightly 特性）在**调用侧**代码生成存在 ABI 缺陷——变长 `double` 实参被放进
+  通用寄存器（GPR）而非 XMM，且 `%al=0`，导致标准的 `va_arg`（走 `fp_offset`/XMM 槽）读到垃圾值。
+  **已在 libc 规避**（`stdio.rs` 的 `next_float_arg_gp`）：实测确认调用方把全部变长实参（整型/
+  指针/浮点）按序放入 GPR，故统一经 `gp_offset`/`reg_save_area` 读取可正确还原。真机验证：
+  `libccheck` `snprintf2 pad+float`/`snprintf %a`/`snprintf %n` 全过、init 自检 `snprintf OK`，
+  `[libccheck] passed=71 failed=0`。
+- 该规避依赖当前编译器把变长实参放入 GPR 的（缺陷）行为；若上游修复 `c_variadic`，应改回标准
+  `ap.next_arg::<f64>()` 并移除 `next_float_arg_gp`（其注释已标注）。浮点格式化引擎本身由宿主测试
+  覆盖（`test_float_fixed_basic`/`test_hexfloat_known_values` 等 17 项）。
 
 ### 回滚/降级
 - 该功能位于内建命令分发路径（`exec_line` / `run_pipeline_stage` 剥离重定向后分发）。
