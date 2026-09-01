@@ -339,6 +339,88 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         }
     }
 
+
+    // 8) item9 真机覆盖增强：strtof 正确舍入 / %a / %n / 宽字符 / ungetc / getline
+    unsafe {
+        // strtof 严格正确舍入（位级对拍 Rust f32 参考）。
+        let f1 = libc::stdlib::strtof(b"1.17549435e-38\0".as_ptr() as *const i8, core::ptr::null_mut());
+        let ref1: f32 = "1.17549435e-38".parse().unwrap();
+        rpt.check("strtof min-normal bits", f1.to_bits() == ref1.to_bits());
+        let f2 = libc::stdlib::strtof(b"3.4028234663852886e38\0".as_ptr() as *const i8, core::ptr::null_mut());
+        let ref2: f32 = "3.4028234663852886e38".parse().unwrap();
+        rpt.check("strtof max bits", f2.to_bits() == ref2.to_bits());
+        let f3 = libc::stdlib::strtof(b"0.1\0".as_ptr() as *const i8, core::ptr::null_mut());
+        let ref3: f32 = "0.1".parse().unwrap();
+        rpt.check("strtof 0.1 bits", f3.to_bits() == ref3.to_bits());
+
+        // %a 十六进制浮点。
+        let mut ab = [0u8; 32];
+        let na = libc::stdio::snprintf(ab.as_mut_ptr() as *mut i8, ab.len(),
+            b"%a\0".as_ptr() as *const i8, 255.5f64);
+        let gota = cstr_to_owned(ab.as_ptr());
+        rpt.check("snprintf %a len", na == 7);
+        rpt.check("snprintf %a 0x1.ffp+7", gota == b"0x1.ffp+7");
+
+        // %n 写已输出字符数。
+        let mut nb = [0u8; 16];
+        let mut written: i32 = -1;
+        let nn = libc::stdio::snprintf(nb.as_mut_ptr() as *mut i8, nb.len(),
+            b"abc%n\0".as_ptr() as *const i8, &mut written as *mut i32);
+        rpt.check("snprintf %n len", nn == 3);
+        rpt.check("snprintf %n wrote 3", written == 3);
+
+        // 宽字符往返。
+        let mut wbuf = [0i32; 16];
+        let ws = libc::wchar::mbstowcs(wbuf.as_mut_ptr(), b"hi\0".as_ptr() as *const i8, 16);
+        rpt.check("mbstowcs count", ws == 2 && wbuf[0] == b'h' as i32 && wbuf[1] == b'i' as i32);
+        let mut mbb = [0i8; 16];
+        let ms = libc::wchar::wcstombs(mbb.as_mut_ptr(), wbuf.as_ptr(), 16);
+        rpt.check("wcstombs roundtrip", ms == 2 && mbb[0] == b'h' as i8);
+
+        // ungetc + fgetc 往返（经 VFS 文件）。
+        let upath = b"/tmp/libc_ungetc.txt\0".as_ptr() as *const i8;
+        let ufp = libc::stdio::fopen(upath, b"w+\0".as_ptr() as *const i8);
+        if !ufp.is_null() {
+            libc::stdio::fwrite(b"XYZ\0".as_ptr() as *const core::ffi::c_void, 1, 3, ufp);
+            libc::stdio::fclose(ufp);
+            let ufr = libc::stdio::fopen(upath, b"r\0".as_ptr() as *const i8);
+            if !ufr.is_null() {
+                let _c1 = libc::stdio::fgetc(ufr);
+                let uc = libc::stdio::ungetc(b'Q' as i32, ufr);
+                let c2 = libc::stdio::fgetc(ufr);
+                let c3 = libc::stdio::fgetc(ufr);
+                rpt.check("ungetc returns Q", uc == b'Q' as i32);
+                rpt.check("fgetc after ungetc == Q", c2 == b'Q' as i32);
+                rpt.check("fgetc next still Y", c3 == b'Y' as i32);
+                libc::stdio::fclose(ufr);
+            }
+            libc::unistd::unlink(upath);
+        }
+
+        // getline（自动扩容读一行）。
+        let gpath = b"/tmp/libc_getline.txt\0".as_ptr() as *const i8;
+        let gfp = libc::stdio::fopen(gpath, b"w+\0".as_ptr() as *const i8);
+        if !gfp.is_null() {
+            libc::stdio::fwrite(b"hello world\nsecond\0".as_ptr() as *const core::ffi::c_void, 1, 18, gfp);
+            libc::stdio::fclose(gfp);
+            let gfr = libc::stdio::fopen(gpath, b"r\0".as_ptr() as *const i8);
+            if !gfr.is_null() {
+                let mut line: *mut i8 = core::ptr::null_mut();
+                let mut cap: usize = 0;
+                let glen = libc::stdio::getline(&mut line, &mut cap, gfr);
+                let mut line_ok = false;
+                if glen > 0 && !line.is_null() {
+                    // 内容应为 "hello world\n" 共 12 字符。
+                    let s = core::slice::from_raw_parts(line as *const u8, glen as usize);
+                    line_ok = s == b"hello world\n";
+                }
+                rpt.check("getline first line", line_ok && glen == 12);
+                libc::stdio::fclose(gfr);
+            }
+            libc::unistd::unlink(gpath);
+        }
+    }
+
     // 7) errno 机制
     {
         rpt.check("errno_location non-null", !libc::errno::__errno_location().is_null());
