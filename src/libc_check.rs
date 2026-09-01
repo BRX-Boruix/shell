@@ -527,6 +527,74 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         rpt.check("fcntl F_GETFD==0", gfd == 0);
     }
 
+    // 12) stat / fstat / chmod / rename（经内核 VFS + INode::metadata/set_permissions）
+    unsafe {
+        // 在根目录下创建独立测试目录与文件。
+        let sdir = b"/tmp_libc_sd ".as_ptr() as *const i8;
+        let _ = libc::unistd::mkdir(sdir, 0o755);
+        let fa = b"/tmp_libc_sd/a.txt ".as_ptr() as *const i8;
+        let fp = libc::stdio::fopen(fa, b"w ".as_ptr() as *const i8);
+        if !fp.is_null() {
+            libc::stdio::fwrite(b"abc ".as_ptr() as *const core::ffi::c_void, 1, 3, fp);
+            libc::stdio::fclose(fp);
+        }
+
+        // rename：a.txt -> b.txt（同目录内重命名）。
+        let fb = b"/tmp_libc_sd/b.txt ".as_ptr() as *const i8;
+        let rr = libc::unistd::rename(fa, fb);
+        rpt.check("rename rc==0", rr == 0);
+        // 重命名后旧名不应再存在。
+        let mut oldst: libc::unistd::stat = core::mem::zeroed();
+        let so = libc::unistd::stat(fa, &mut oldst);
+        rpt.check("rename old gone (ENOENT)", so != 0);
+
+        // stat：解析路径读元数据。
+        let mut st: libc::unistd::stat = core::mem::zeroed();
+        let sr = libc::unistd::stat(fb, &mut st);
+        rpt.check("stat rc==0", sr == 0);
+        rpt.check("stat type==REG", st.st_mode & libc::unistd::S_IFMT == libc::unistd::S_IFREG);
+        rpt.check("stat size==3", st.st_size == 3);
+
+        // stat 目录：类型位应为 DIR。
+        let mut dst: libc::unistd::stat = core::mem::zeroed();
+        let sd = libc::unistd::stat(sdir, &mut dst);
+        rpt.check("stat dir rc==0", sd == 0);
+        rpt.check("stat dir type==DIR", dst.st_mode & libc::unistd::S_IFMT == libc::unistd::S_IFDIR);
+
+        // fstat：按 fd 读元数据。
+        // fstat：按 fd 读元数据。
+        let fdf = libc::unistd::open(fb, libc::unistd::O_RDONLY, 0);
+        rpt.check("fstat open fd>=0", fdf >= 0);
+        if fdf >= 0 {
+            let mut fst: libc::unistd::stat = core::mem::zeroed();
+            let fr = libc::unistd::fstat(fdf, &mut fst);
+            rpt.check("fstat rc==0", fr == 0);
+            rpt.check("fstat type==REG", fst.st_mode & libc::unistd::S_IFMT == libc::unistd::S_IFREG);
+            rpt.check("fstat size==3", fst.st_size == 3);
+            libc::unistd::close(fdf);
+        } else {
+            rpt.check("fstat open", false);
+        }
+
+        // chmod + stat 往返：0o700 设可执行，0o600 清除可执行。
+        let c1 = libc::unistd::chmod(fb, 0o700);
+        rpt.check("chmod 0o700 rc==0", c1 == 0);
+        let mut s1: libc::unistd::stat = core::mem::zeroed();
+        let _ = libc::unistd::stat(fb, &mut s1);
+        rpt.check("chmod 0o700 sets exec", s1.st_mode & 0o111 != 0);
+        let c2 = libc::unistd::chmod(fb, 0o600);
+        rpt.check("chmod 0o600 rc==0", c2 == 0);
+        let mut s2: libc::unistd::stat = core::mem::zeroed();
+        let _ = libc::unistd::stat(fb, &mut s2);
+        rpt.check("chmod 0o600 clears exec", s2.st_mode & 0o111 == 0);
+        rpt.check("chmod 0o600 keeps rw", s2.st_mode & 0o600 != 0);
+
+        // 清理：删文件与目录。
+        let _ = libc::unistd::remove(fb);
+        let _ = libc::unistd::remove(sdir);
+    }
+
+    // 汇总
     // 汇总
     let mut sum = Vec::new();
     sum.extend_from_slice(b"[libccheck] passed=");
