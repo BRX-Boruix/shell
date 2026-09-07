@@ -9,7 +9,7 @@ pub(crate) const COMMANDS: &[&[u8]] = &[
     b"echo", b"help", b"now", b"time", b"uptime", b"version", b"uname", b"cpu", b"sleep",
     b"clear", b"env", b"export", b"unset", b"ps", b"kill", b"signal", b"alias", b"unalias",
     b"which", b"jobs", b"ls", b"cat", b"mkdir", b"touch", b"rm", b"tree", b"jtree", b"cd",
-    b"pwd", b"pipe", b"libccheck", b"poweroff", b"reboot", b"uiodemo",
+    b"pwd", b"pipe", b"libccheck", b"poweroff", b"reboot", b"uiodemo", b"driver",
 ];
 
 /// 返回内建命令名列表（供补全遍历）。
@@ -184,7 +184,7 @@ fn cmd_jobs(arg: &[u8]) -> u8 {
 
 use libsys::nr::{INFO_BOOT_MS, INFO_CPU_COUNT, INFO_VERSION};
 use libsys::{
-    chdir, close, dup2, exec_path, getcwd, info, kill, mkdir, now, open, pipe_create, ps,
+    chdir, close, chmod, dup2, exec_path, getcwd, info, kill, mkdir, now, open, pipe_create, ps,
     read, read_dir, read_to_end, read_wall_clock, sleep, sync_create, sync_delete, sync_wake,
     unlink, waitpid_any, write, yield_now, OpenFlags, Permissions, PsEntry, STDIN, STDOUT,
     power_off, reboot,
@@ -1636,6 +1636,7 @@ fn run_builtin(name: &[u8], arg: &[u8]) -> u8 {
         b"poweroff" => cmd_poweroff(arg),
         b"reboot" => cmd_reboot(arg),
         b"uiodemo" => cmd_uiodemo(arg),
+        b"driver" => cmd_driver(arg),
         other => {
             out(b"boruix: unknown command: ");
             out(other);
@@ -1794,3 +1795,330 @@ fn read_stdin_all(feed: &mut dyn FnMut(&[u8])) -> Result<(), ()> {
     }
     Ok(())
 }
+// ============================================================================
+// driver 命令：运行时驱动安装 / 装载 / 枚举（ADR-037 决策 2/3/4/5，runtime-driver.md
+// PRE-3 + P1-2/P1-3/P1-4/P1-5）。
+//
+// 驱动 = 普通 no_std 用户 ELF + UIO 认领。装载走既有 exec_path（spawn 子进程，父进程
+// 不退出）+ driver_register/claim（System-only，PRE-1 门禁）。设备名经 exec 的 cmd
+// 字符串（= 子进程 argv[0]）传入驱动 ELF，由驱动内部解析。
+//
+// 子命令：
+//   driver install <srcpath> <name> [dev]  把 srcpath 的驱动 ELF 装进 /modules/<name>/
+//                                          （写 driver.elf + manifest.json），dev 缺省
+//                                          pci-ethernet-00-03-0。
+//   driver list                           枚举 /modules/*/，真实读各 manifest.json 列出。
+//   driver load <name>                    读 manifest、把 binds[0] 解析为设备名、
+//                                          spawn /modules/<name>/driver.elf（设备名作 cmd）
+//                                          并 waitpid 收其退出码。
+//   driver status [dev]                   driver_query(dev) 打印绑定态 JSON（看 uio_claimed）。
+//
+// 诚实契约：每步以底层真实成败为准（read_to_end / write / spawn / waitpid 真值），
+// 不伪造"已安装/已认领"。
+// ============================================================================
+
+/// 驱动名合法字符白名单（[A-Za-z0-9_-]），禁止 '/' 与 '.' 防路径穿越。
+fn valid_driver_name(name: &[u8]) -> bool {
+    if name.is_empty() || name.len() > 48 {
+        return false;
+    }
+    name.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+}
+
+/// 把空格分隔的 arg 切成词（返回 owned，首词为子命令，其后为参数）。
+fn split_words(arg: &[u8]) -> Vec<Vec<u8>> {
+    let mut words: Vec<Vec<u8>> = Vec::new();
+    let mut cur: Vec<u8> = Vec::new();
+    let mut in_word = false;
+    for &c in arg {
+        if c == b' ' || c == b'\t' {
+            if in_word {
+                words.push(core::mem::take(&mut cur));
+                in_word = false;
+            }
+        } else {
+            cur.push(c);
+            in_word = true;
+        }
+    }
+    if in_word {
+        words.push(cur);
+    }
+    words
+}
+
+/// 写整个字节序列到文件（create/truncate + write + close）。
+fn write_file(path: &str, data: &[u8]) -> Result<(), libsys::Error> {
+    let fd = open(path, OpenFlags::CREATE_OR_TRUNCATE, Permissions::read_write())?;
+    let mut off = 0usize;
+    while off < data.len() {
+        let n = write(fd, &data[off..])?;
+        if n == 0 {
+            break;
+        }
+        off += n;
+    }
+    let _ = close(fd);
+    Ok(())
+}
+
+/// 把一个文件的权限收紧为 system_only（仅 System 可读/可 exec）。shell 是 System。
+fn make_system_only(path: &str) -> Result<(), libsys::Error> {
+    chmod(
+        path,
+        Permissions {
+            readable: true,
+            writable: true,
+            executable: true,
+            system_only: true,
+        },
+    )
+}
+
+/// 构造并写 manifest.json：{"name":<name>,"binary":"driver.elf","binds":[<dev>]}。
+///
+/// name/dev 均经 valid_driver_name 白名单校验（[A-Za-z0-9_-]，设备名另含 ':' '.'），
+/// 不含 '"'、'\\'、控制符，故手写 JSON 无需转义、无注入面。读取方（driver load / list）
+/// 用 libsys::json::JsonParser 解析同一 schema。
+fn write_manifest(dir: &str, name: &str, dev: &str) -> Result<(), libsys::Error> {
+    let mut s = alloc::string::String::from("{\"name\":\"");
+    s.push_str(name);
+    s.push_str("\",\"binary\":\"driver.elf\",\"binds\":[\"");
+    s.push_str(dev);
+    s.push_str("\"]}");
+    write_file(&alloc::format!("{dir}/manifest.json"), s.as_bytes())
+}
+
+/// driver install <srcpath> <name> [dev]
+fn driver_install(words: &[Vec<u8>]) -> u8 {
+    if words.len() < 2 {
+        out(b"driver install: usage: driver install <srcpath> <name> [dev]\n");
+        return 1;
+    }
+    let src = words[0].as_slice();
+    let name = words[1].as_slice();
+    let dev: &[u8] = if words.len() >= 3 {
+        words[2].as_slice()
+    } else {
+        b"pci-ethernet-00-03-0"
+    };
+    if !valid_driver_name(name) {
+        out(b"driver install: invalid driver name (allow [A-Za-z0-9_-], no '/' or '.')\n");
+        return 1;
+    }
+    if !valid_driver_name(dev) && !dev.iter().all(|&c| c == b'-' || c == b'_' || c == b':' || c.is_ascii_alphanumeric() || c == b'.') {
+        out(b"driver install: invalid device name\n");
+        return 1;
+    }
+    let src_str = match core::str::from_utf8(src) {
+        Ok(p) => p,
+        Err(_) => { out(b"driver install: bad src path\n"); return 1; }
+    };
+    let name_str = core::str::from_utf8(name).unwrap_or("?");
+    let dev_str = core::str::from_utf8(dev).unwrap_or("?");
+    let dir = alloc::format!("/modules/{name_str}");
+    // 1. 校验源 ELF 可读（read_to_end 真值）。
+    let elf = match read_to_end(src_str) {
+        Ok(b) => b,
+        Err(_) => {
+            out(b"driver install: cannot read source ELF: ");
+            out(src);
+            out(b"\n");
+            return 1;
+        }
+    };
+    // 2. 建目录（已存在则容忍，幂等）。
+    let _ = mkdir(&dir, Permissions::all());
+    // 3. 写 driver.elf + manifest.json。
+    let elf_path = alloc::format!("{dir}/driver.elf");
+    if write_file(&elf_path, &elf).is_err() {
+        out(b"driver install: write driver.elf failed\n");
+        return 1;
+    }
+    if write_manifest(&dir, name_str, dev_str).is_err() {
+        out(b"driver install: write manifest.json failed\n");
+        return 1;
+    }
+    // 4. 收紧为 system_only（System-only 写 / system_only 可执行，ADR-037 决策 5）。
+    if make_system_only(&elf_path).is_err() {
+        out(b"driver install: mark driver.elf system_only failed\n");
+        return 1;
+    }
+    let mpath = alloc::format!("{dir}/manifest.json");
+    let _ = make_system_only(&mpath);
+    let _ = make_system_only(&dir);
+    out(b"driver install: installed -> /modules/");
+    out(name);
+    out(b" (binary driver.elf, binds=[");
+    out(dev);
+    out(b"])\n");
+    0
+}
+
+/// 从 manifest.json 解析出 binds[0]（设备名/通配）。失败返回 None。
+fn manifest_first_bind(name: &str) -> Option<alloc::vec::Vec<u8>> {
+    let path = alloc::format!("/modules/{name}/manifest.json");
+    let bytes = read_to_end(&path).ok()?;
+    let text = core::str::from_utf8(&bytes).ok()?;
+    let mut parser = libsys::json::JsonParser::new(text);
+    let val = parser.parse().ok()?;
+    // 顶层 object，找 binds 数组，取 [0]。
+    if let libsys::json::JsonValue::Object(fields) = val {
+        for (k, v) in fields {
+            if k == "binds" {
+                if let libsys::json::JsonValue::Array(arr) = v {
+                    if let Some(libsys::json::JsonValue::String(s)) = arr.into_iter().next() {
+                        return Some(s.into_bytes());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// driver load <name>：spawn 驱动 ELF（设备名作 cmd）并 waitpid 收回。
+fn driver_load(words: &[Vec<u8>]) -> u8 {
+    if words.is_empty() {
+        out(b"driver load: usage: driver load <name>\n");
+        return 1;
+    }
+    let name = words[0].as_slice();
+    if !valid_driver_name(name) {
+        out(b"driver load: invalid driver name\n");
+        return 1;
+    }
+    let name_str = core::str::from_utf8(name).unwrap_or("?");
+    // 1. 读 manifest 取 binds[0] → 目标设备名。
+    let Some(dev) = manifest_first_bind(name_str) else {
+        out(b"driver load: no manifest or no binds for ");
+        out(name);
+        out(b"\n");
+        return 1;
+    };
+    // 2. spawn /modules/<name>/driver.elf，把设备名作 cmd（= 子进程 argv[0]）。
+    let elf_path = alloc::format!("/modules/{name_str}/driver.elf");
+    let mut b = [0u8; 24];
+    let child = match exec_path(&elf_path, &dev) {
+        Ok(pid) => pid,
+        Err(e) => {
+            out(b"driver load: spawn driver failed errno=");
+            out(u64_to_dec(e.to_errno() as u64, &mut b));
+            out(b"\n");
+            return 1;
+        }
+    };
+    out(b"driver load: spawned driver pid=");
+    out(u64_to_dec(child, &mut b));
+    out(b" device=");
+    out(&dev);
+    out(b"\n");
+    // 3. 收退出码（单核上 waitpid 可能瞬时 WouldBlock/NotFound，轮询）。
+    let mut code: u64 = 0;
+    let mut reap = false;
+    for _ in 0..10_000_000u32 {
+        match waitpid_any() {
+            Ok(wr) if wr.pid == child => { code = wr.code; reap = true; break; }
+            Ok(_) => { /* 其它已收子进程，忽略继续 */ }
+            Err(libsys::error::Error::WouldBlock) | Err(libsys::error::Error::NotFound) => {
+                let _ = yield_now();
+            }
+            Err(_) => { let _ = yield_now(); }
+        }
+    }
+    if !reap {
+        out(b"driver load: TIMEOUT waiting for driver pid\n");
+        return 1;
+    }
+    out(b"driver load: driver pid=");
+    out(u64_to_dec(child, &mut b));
+    out(b" exit=");
+    out(u64_to_dec(code, &mut b));
+    out(b"\n");
+    code as u8
+}
+
+/// driver list：枚举 /modules/*/ 真实读 manifest。
+fn driver_list() -> u8 {
+    let entries = match read_dir("/modules") {
+        Ok(e) => e,
+        Err(_) => { out(b"driver list: cannot read /modules\n"); return 1; }
+    };
+    let mut found = false;
+    for e in entries {
+        if e.node_type != "dir" {
+            continue;
+        }
+        let mpath = alloc::format!("/modules/{}/manifest.json", e.name);
+        match read_to_end(&mpath) {
+            Ok(bytes) => {
+                found = true;
+                out(b"  ");
+                out(e.name.as_bytes());
+                out(b": ");
+                out(&bytes);
+                out(b"\n");
+            }
+            Err(_) => {
+                // 有目录无 manifest：如实列出目录名但标注无声明。
+                found = true;
+                out(b"  ");
+                out(e.name.as_bytes());
+                out(b": (no manifest.json)\n");
+            }
+        }
+    }
+    if !found {
+        out(b"driver list: no drivers installed in /modules\n");
+        return 0;
+    }
+    0
+}
+
+/// driver status [dev]：driver_query 打印绑定态 JSON。
+fn driver_status(words: &[Vec<u8>]) -> u8 {
+    let dev: &[u8] = if words.is_empty() { b"pci-ethernet-00-03-0" } else { words[0].as_slice() };
+    let dev_str = core::str::from_utf8(dev).unwrap_or("?");
+    match driver_query(dev_str) {
+        Ok(json) => {
+            out(b"driver status ");
+            out(dev);
+            out(b": ");
+            out(json.as_bytes());
+            out(b"\n");
+            0
+        }
+        Err(_) => {
+            out(b"driver status: query failed for ");
+            out(dev);
+            out(b"\n");
+            1
+        }
+    }
+}
+
+/// driver 主分发：<install|load|list|status> [args...]
+fn cmd_driver(arg: &[u8]) -> u8 {
+    let a = trim_bytes(arg);
+    if a.is_empty() {
+        out(b"driver: subcommands: install <src> <name> [dev] | load <name> | list | status [dev]\n");
+        return 1;
+    }
+    let words = split_words(a);
+    if words.is_empty() {
+        return 1;
+    }
+    match words[0].as_slice() {
+        b"install" => driver_install(&words[1..]),
+        b"load" => driver_load(&words[1..]),
+        b"list" => driver_list(),
+        b"status" => driver_status(&words[1..]),
+        other => {
+            out(b"driver: unknown subcommand: ");
+            out(other);
+            out(b"\n");
+            1
+        }
+    }
+}
+
