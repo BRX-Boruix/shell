@@ -9,7 +9,7 @@ pub(crate) const COMMANDS: &[&[u8]] = &[
     b"echo", b"help", b"now", b"time", b"uptime", b"version", b"uname", b"cpu", b"sleep",
     b"clear", b"env", b"export", b"unset", b"ps", b"kill", b"signal", b"alias", b"unalias",
     b"which", b"jobs", b"ls", b"cat", b"mkdir", b"touch", b"rm", b"tree", b"jtree", b"cd",
-    b"pwd", b"pipe", b"libccheck", b"poweroff", b"reboot",
+    b"pwd", b"pipe", b"libccheck", b"poweroff", b"reboot", b"uiodemo",
 ];
 
 /// 返回内建命令名列表（供补全遍历）。
@@ -188,6 +188,7 @@ use libsys::{
     read, read_dir, read_to_end, read_wall_clock, sleep, sync_create, sync_delete, sync_wake,
     unlink, waitpid_any, write, yield_now, OpenFlags, Permissions, PsEntry, STDIN, STDOUT,
     power_off, reboot,
+    driver_claim, driver_query, driver_register, driver_unregister,
 };
 use libsys::signal::LIST;
 
@@ -403,6 +404,92 @@ fn cmd_reboot(arg: &[u8]) -> u8 {
             1
         }
     }
+}
+
+/// `uiodemo [dev_name]`：演示**用户态驱动（UIO）**全流程——向内核注册认领一个真实
+/// 设备、claim 授权后把该设备 MMIO 窗口真实映射进本进程、从映射地址读一个硬件寄存器
+/// （volatile 读，证明用户态真的触达了硬件），最后注销。默认认领 QEMU 的 e1000 网卡
+/// `pci-ethernet-00-03-0`（PCI BAR 有 MMIO 窗口，可被 UIO 认领）。
+fn cmd_uiodemo(arg: &[u8]) -> u8 {
+    const DEFAULT_DEV: &[u8] = b"pci-ethernet-00-03-0";
+    let name = trim_bytes(arg);
+    let name: &[u8] = if name.is_empty() { DEFAULT_DEV } else { name };
+    let name_str = core::str::from_utf8(name).unwrap_or("?");
+    out(b"uiodemo: target device = ");
+    out(name);
+    out(b"\n");
+
+    // 1. query：查设备绑定状态（JSON）。
+    match driver_query(name_str) {
+        Ok(json) => {
+            out(b"uiodemo: query -> ");
+            out(json.as_bytes());
+            out(b"\n");
+        }
+        Err(e) => {
+            out(b"uiodemo: driver_query failed: ");
+            out(e.to_string().as_bytes());
+            out(b"\n");
+            return 1;
+        }
+    }
+
+    // 2. register：本进程认领该设备，拿 uio_id。
+    let uio_id = match driver_register(name_str) {
+        Ok(id) => id,
+        Err(e) => {
+            out(b"uiodemo: driver_register failed: ");
+            out(e.to_string().as_bytes());
+            out(b"\n");
+            return 1;
+        }
+    };
+    out(b"uiodemo: registered (uio_id=");
+    {
+        let mut b = [0u8; 24];
+        out(u64_to_dec(uio_id, &mut b));
+    }
+    out(b")\n");
+
+    // 3. claim：授权映射 MMIO 窗口，返回用户虚拟地址。
+    let va = match driver_claim(uio_id) {
+        Ok(v) => v,
+        Err(e) => {
+            out(b"uiodemo: driver_claim failed: ");
+            out(e.to_string().as_bytes());
+            out(b"\n");
+            let _ = driver_unregister(uio_id);
+            return 1;
+        }
+    };
+    out(b"uiodemo: claimed, device MMIO mapped at user 0x");
+    {
+        let mut b = [0u8; 24];
+        out(u64_to_dec(va, &mut b));
+    }
+    out(b" (dec)\n");
+
+    // 4. 从映射地址 volatile 读一个 32 位硬件寄存器（offset 0），证明用户态触达硬件。
+    let reg: u32 = unsafe { core::ptr::read_volatile(va as *const u32) };
+    out(b"uiodemo: read dev reg[0] = ");
+    {
+        let mut b = [0u8; 24];
+        out(u64_to_dec(reg as u64, &mut b));
+    }
+    out(b" (dec)\n");
+
+    // 5. unregister：释放认领。
+    match driver_unregister(uio_id) {
+        Ok(()) => out(b"uiodemo: unregistered ok\n"),
+        Err(e) => {
+            out(b"uiodemo: driver_unregister failed: ");
+            out(e.to_string().as_bytes());
+            out(b"\n");
+            return 1;
+        }
+    }
+    out(b"uiodemo: PASS - userspace driver registered/claimed/mapped/read a real device\n");
+    0
 }
 
 /// `ps`：列出存活进程。支持 `--json` 输出。
@@ -1548,6 +1635,7 @@ fn run_builtin(name: &[u8], arg: &[u8]) -> u8 {
         b"libccheck" => crate::libc_check::cmd_libccheck(arg),
         b"poweroff" => cmd_poweroff(arg),
         b"reboot" => cmd_reboot(arg),
+        b"uiodemo" => cmd_uiodemo(arg),
         other => {
             out(b"boruix: unknown command: ");
             out(other);
