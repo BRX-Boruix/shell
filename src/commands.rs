@@ -1825,6 +1825,20 @@ fn valid_driver_name(name: &[u8]) -> bool {
     name.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
 }
 
+/// binds 条目合法白名单：具体设备名（含 '.' ':' '-' '_' 字母数字）或以 '\*'
+/// 结尾的通配类别前缀（如 "pci-vga-*"）。不允许 '/' 防路径穿越、不允许 '\*' 出现在
+/// 非结尾（单一尾部通配）。
+fn valid_bind(b: &[u8]) -> bool {
+    if b.is_empty() || b.len() > 64 {
+        return false;
+    }
+    let body = if b[b.len() - 1] == b'*' { &b[..b.len() - 1] } else { b };
+    if body.is_empty() {
+        return false;
+    }
+    body.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c == b'.' || c == b':')
+}
+
 /// 把空格分隔的 arg 切成词（返回 owned，首词为子命令，其后为参数）。
 fn split_words(arg: &[u8]) -> Vec<Vec<u8>> {
     let mut words: Vec<Vec<u8>> = Vec::new();
@@ -1906,8 +1920,8 @@ fn driver_install(words: &[Vec<u8>]) -> u8 {
         out(b"driver install: invalid driver name (allow [A-Za-z0-9_-], no '/' or '.')\n");
         return 1;
     }
-    if !valid_driver_name(dev) && !dev.iter().all(|&c| c == b'-' || c == b'_' || c == b':' || c.is_ascii_alphanumeric() || c == b'.') {
-        out(b"driver install: invalid device name\n");
+    if !valid_bind(dev) {
+        out(b"driver install: invalid bind (device name or trailing-* class, e.g. pci-vga-*)\n");
         return 1;
     }
     let src_str = match core::str::from_utf8(src) {
@@ -1977,6 +1991,39 @@ fn manifest_first_bind(name: &str) -> Option<alloc::vec::Vec<u8>> {
     None
 }
 
+/// 从 /devices/list 解析一个 binds 条目（具体设备名或 "prefix*" 通配类别）→ 返回
+/// 第一个匹配的真实 DriverHub 设备名。读 /devices/list 真值，不伪造；无匹配返回 None。
+///
+/// 通配只做**尾部单个 '*'**（valid_bind 已保证）：把前缀与每个设备名比对。
+fn resolve_bind(bind: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    let Ok(list) = read_to_end("/devices/list") else {
+        return None;
+    };
+    let Ok(text) = core::str::from_utf8(&list) else { return None; };
+    let mut parser = libsys::json::JsonParser::new(text);
+    let Ok(val) = parser.parse() else { return None; };
+    let wild = bind.last() == Some(&b'*');
+    let prefix = if wild { &bind[..bind.len() - 1] } else { bind };
+    if let libsys::json::JsonValue::Array(items) = val {
+        for it in items {
+            if let libsys::json::JsonValue::Object(fields) = it {
+                for (k, v) in fields {
+                    if k == "name" {
+                        if let libsys::json::JsonValue::String(s) = v {
+                            let nb = s.as_bytes();
+                            let hit = if wild { nb.starts_with(prefix) } else { nb == bind };
+                            if hit {
+                                return Some(s.into_bytes());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// driver load <name>：spawn 驱动 ELF（设备名作 cmd）并 waitpid 收回。
 fn driver_load(words: &[Vec<u8>]) -> u8 {
     if words.is_empty() {
@@ -1989,10 +2036,17 @@ fn driver_load(words: &[Vec<u8>]) -> u8 {
         return 1;
     }
     let name_str = core::str::from_utf8(name).unwrap_or("?");
-    // 1. 读 manifest 取 binds[0] → 目标设备名。
-    let Some(dev) = manifest_first_bind(name_str) else {
+    // 1. 读 manifest 取 binds[0]（具体设备名或通配类别）。
+    let Some(bind) = manifest_first_bind(name_str) else {
         out(b"driver load: no manifest or no binds for ");
         out(name);
+        out(b"\n");
+        return 1;
+    };
+    // 1b. 通配 binds 解析为 /devices/list 中真实匹配的设备（具体名原样直通）。
+    let Some(dev) = resolve_bind(&bind) else {
+        out(b"driver load: bind matches no real unclaimed device: ");
+        out(&bind);
         out(b"\n");
         return 1;
     };
