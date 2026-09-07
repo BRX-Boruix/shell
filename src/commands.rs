@@ -9,7 +9,7 @@ pub(crate) const COMMANDS: &[&[u8]] = &[
     b"echo", b"help", b"now", b"time", b"uptime", b"version", b"uname", b"cpu", b"sleep",
     b"clear", b"env", b"export", b"unset", b"ps", b"kill", b"signal", b"alias", b"unalias",
     b"which", b"jobs", b"ls", b"cat", b"mkdir", b"touch", b"rm", b"tree", b"jtree", b"cd",
-    b"pwd", b"pipe", b"libccheck",
+    b"pwd", b"pipe", b"libccheck", b"poweroff", b"reboot",
 ];
 
 /// 返回内建命令名列表（供补全遍历）。
@@ -187,6 +187,7 @@ use libsys::{
     chdir, close, dup2, exec_path, getcwd, info, kill, mkdir, now, open, pipe_create, ps,
     read, read_dir, read_to_end, read_wall_clock, sleep, sync_create, sync_delete, sync_wake,
     unlink, waitpid_any, write, yield_now, OpenFlags, Permissions, PsEntry, STDIN, STDOUT,
+    power_off, reboot,
 };
 use libsys::signal::LIST;
 
@@ -363,6 +364,42 @@ fn cmd_sleep(arg: &[u8]) -> u8 {
         }
         None => {
             out(b"sleep: usage: sleep <seconds>\n");
+            1
+        }
+    }
+}
+/// `poweroff`：请求 ACPI 软关机（S5）。成功后机器断电，永不返回；
+/// 电源管理不可用时打印错误并返回 1。
+fn cmd_poweroff(arg: &[u8]) -> u8 {
+    if !trim_bytes(arg).is_empty() {
+        out(b"poweroff: usage: poweroff (no args)\n");
+        return 1;
+    }
+    out(b"poweroff: powering down ...\n");
+    match power_off() {
+        Ok(()) => 0, // 永不达（成功即断电）
+        Err(e) => {
+            out(b"poweroff: failed: ");
+            out(e.to_string().as_bytes());
+            out(b"\n");
+            1
+        }
+    }
+}
+
+/// `reboot`：请求系统重启。成功后机器复位，永不返回；不可用时打印错误并返回 1。
+fn cmd_reboot(arg: &[u8]) -> u8 {
+    if !trim_bytes(arg).is_empty() {
+        out(b"reboot: usage: reboot (no args)\n");
+        return 1;
+    }
+    out(b"reboot: restarting ...\n");
+    match reboot() {
+        Ok(()) => 0, // 永不达（成功即复位）
+        Err(e) => {
+            out(b"reboot: failed: ");
+            out(e.to_string().as_bytes());
+            out(b"\n");
             1
         }
     }
@@ -1509,6 +1546,8 @@ fn run_builtin(name: &[u8], arg: &[u8]) -> u8 {
         b"pipe" => cmd_pipe(arg),
         b"synce2e" => cmd_synce2e(),
         b"libccheck" => crate::libc_check::cmd_libccheck(arg),
+        b"poweroff" => cmd_poweroff(arg),
+        b"reboot" => cmd_reboot(arg),
         other => {
             out(b"boruix: unknown command: ");
             out(other);
