@@ -1031,6 +1031,103 @@ fn cmd_synce2e() -> u8 {
     0
 }
 
+/// 
+/// `audioe2e`：AUDIO 域（plan_audio_vfs.md 批次二）端到端**阻塞往返**测试（协调端）。
+///
+/// **为何需要它**：内核启动期测试（`test_audio_pipe_a2`）直接调节点与 ring，
+/// 无法触达两条关键路径——AUDIO 域四个 syscall 包装本身、以及真正的
+/// 阻塞-唤醒往返（`block_for_audio`/`wake_audio` 需要真实进程上下文切换）。
+/// 本命令经**真实 syscall** 跑完整往返。
+///
+/// **顺序是本测试的核心**：
+///   1. 先派生 consumer —— 它 attach 后在**空** ring 上调 fetch，真正入睡；
+///   2. 父进程再经 VFS 写入一帧 PCM —— 写路径的 notify 唤醒 consumer；
+///   3. consumer 醒来逐字节校验、commit、detach，退出 0。
+///
+/// 若先写数据再派生 consumer，fetch 会立刻拿到数据，**阻塞路径根本没被走到**
+/// ——测试会"通过"却什么也没验证（这正是本命令顺序不可调换的原因）。
+///
+/// **liveCD 专属测试命令（ADR-029）**：`/programs/audioe2e.elf` 依赖内核内嵌
+/// 测试 payload；安装模式下 `/programs` 是磁盘 root 的普通目录、不做兜底。
+fn cmd_audioe2e() -> u8 {
+    let mut b = [0u8; 24];
+
+    // ---- 1. 先派生 consumer，让它 attach 并在空 ring 上阻塞 ----
+    let consumer = match exec_path("/programs/audioe2e.elf", b"consumer") {
+        Ok(pid) => pid,
+        Err(e) => {
+            out(b"audioe2e: spawn consumer failed errno=");
+            out(u64_to_dec(e.to_errno() as u64, &mut b));
+            out(b" (liveCD-only test payload required, ADR-029)\n");
+            return 1;
+        }
+    };
+    out(b"audioe2e: spawned consumer pid=");
+    out(u64_to_dec(consumer, &mut b));
+    out(b"\n");
+    // 保持父就绪（yield 而非 sleep）：子进程阻塞时若无就绪同伴可切，
+    // block_current_with 会 NotSwitched，阻塞路径就走不到。
+    for _ in 0..3000 {
+        let _ = yield_now();
+    }
+
+    // ---- 2. 父进程经 VFS 写入一帧 PCM，唤醒阻塞中的 consumer ----
+    // 与 consumer 端**逐字节一致**的确定性填充（写错则校验失败如实报错）。
+    const FRAME: usize = 256;
+    let mut frame = [0u8; FRAME];
+    for (i, v) in frame.iter_mut().enumerate() {
+        *v = ((i * 37) ^ (i >> 3)) as u8;
+    }
+    // 经**真实 VFS syscall** 打开并写入（shell 是用户态程序，不经内核内部 API）。
+    let fd = match open(
+        "/devices/audio/dsp",
+        OpenFlags::READ_WRITE,
+        Permissions::read_write(),
+    ) {
+        Ok(f) => f,
+        Err(_) => { out(b"audioe2e: open dsp failed\n"); return 1; }
+    };
+    match write(fd, &frame) {
+        Ok(n) if n == FRAME => {
+            out(b"audioe2e: wrote 256-byte frame (should wake blocked consumer)\n");
+        }
+        Ok(n) => {
+            out(b"audioe2e: short write ");
+            out(u64_to_dec(n as u64, &mut b));
+            out(b" (expected 256)\n");
+            return 1;
+        }
+        Err(_) => {
+            out(b"audioe2e: write failed (consumer attached?)\n");
+            return 1;
+        }
+    }
+    // 让被唤醒的 consumer 跑完校验/commit/detach。
+    for _ in 0..3000 {
+        let _ = yield_now();
+    }
+
+    // ---- 3. 收 consumer 退出码断言 0 ----
+    match waitpid_any() {
+        Ok(wr) if wr.pid == consumer && wr.code == 0 => {
+            out(b"audioe2e: consumer exit=0 (blocked, woke, verified, committed)\n");
+        }
+        Ok(wr) => {
+            out(b"audioe2e: consumer pid=");
+            out(u64_to_dec(wr.pid, &mut b));
+            out(b" exit=");
+            out(u64_to_dec(wr.code, &mut b));
+            out(b" (expected pid=");
+            out(u64_to_dec(consumer, &mut b));
+            out(b" exit=0)\n");
+            return 1;
+        }
+        Err(_) => { out(b"audioe2e: waitpid(consumer) failed\n"); return 1; }
+    }
+    out(b"audioe2e: ALL OK (audio pipe blocking round-trip)\n");
+    0
+}
+
 /// `mkdir <dir>`：创建目录。
 fn cmd_mkdir(arg: &[u8]) -> u8 {    let a = trim_bytes(arg);
     if a.is_empty() {
@@ -1632,6 +1729,7 @@ fn run_builtin(name: &[u8], arg: &[u8]) -> u8 {
         b"pwd" => cmd_pwd(),
         b"pipe" => cmd_pipe(arg),
         b"synce2e" => cmd_synce2e(),
+        b"audioe2e" => cmd_audioe2e(),
         b"libccheck" => crate::libc_check::cmd_libccheck(arg),
         b"poweroff" => cmd_poweroff(arg),
         b"reboot" => cmd_reboot(arg),
