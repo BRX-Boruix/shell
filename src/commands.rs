@@ -946,9 +946,20 @@ fn cmd_pipe(_arg: &[u8]) -> u8 {
 /// `sync_wake(id,42,1)` 唤醒并预置值 42 → `waitpid_any()` 收子进程退出码断言为 0。
 /// 若 `sync_wake` 返回 1，则证明子进程确实被登记为等待者并阻塞过（真实切换往返）。
 ///
-/// **liveCD 专属测试命令（ADR-029）**：`/programs/synce2e.elf` 依赖内核内嵌测试 payload
-/// （liveCD 模式经 ADR-028 单源填充 `/programs`）。安装模式下 `/programs` 是磁盘 root 的普通
-/// 目录、**不做 payload 兜底**，此 ELF 不保证存在——本命令定位为开发/验收期诊断，非生产特性。
+/// **依赖 `/programs/synce2e.elf` 存在**，来源随启动模式而异：
+/// liveCD 模式由内核内嵌 payload 提供（ADR-028 单源）；
+/// 安装模式由 `systemdisk.img` 的 EXT2 `/programs` 提供
+/// （SDK `build --systemdisk` 会写入 `synce2e.elf`，实测确认存在）。
+///
+/// 因此**两种模式下该命令都可用**。
+///
+/// > 原注释称"安装模式下不保证存在"，源于把 ADR-029 的"不做 payload 兜底"
+/// > 误读为"盘上没有这个文件"（2026-09-12 实测纠正）。
+/// > 「不兜底」= 不用内嵌副本遮蔽盘上的内容，不等于盘上没有内容。
+/// >
+/// > 真正的不确定性来自另一处：**自定义（非 SDK 产）系统盘**上装了什么
+/// > 就有什么。故失败仍须如实报错，不能假定必然成功。
+/// 定位为开发/验收期诊断，非生产特性。
 fn cmd_synce2e() -> u8 {
     let mut b = [0u8; 24];
     let mut id_buf = [0u8; 24];
@@ -967,10 +978,11 @@ fn cmd_synce2e() -> u8 {
     let child = match exec_path("/programs/synce2e.elf", &cmd) {
         Ok(pid) => pid,
         Err(e) => {
-            // ADR-029：安装模式 `/programs` 无 payload 兜底，synce2e.elf 可能不存在。
+            // 路径不存在时如实报错并给出两条可能的来源（不假定是哪一种）。
             out(b"synce2e: spawn waiter failed errno=");
             out(u64_to_dec(e.to_errno() as u64, &mut b));
-            out(b" (liveCD-only test payload /programs/synce2e.elf required, ADR-029)\n");
+            out(b" (/programs/synce2e.elf missing; liveCD supplies it from the built-in\n");
+            out(b"         payload, installed mode from the systemdisk.img EXT2 /programs)\n");
             let _ = sync_delete(id);
             return 1;
         }
@@ -2401,9 +2413,17 @@ fn report_exec_error(path: &[u8], e: libsys::Error) {
     match e {
         Error::NotFound => {
             out(b"no such file (ENOENT)\n");
-            // ADR-029：这是最容易被误解成「路径写错」的一类。
-            out(b"boruix: note: /programs is filled from the built-in liveCD payload only;\n");
-            out(b"boruix:       in installed mode it is a plain disk directory with no fallback (ADR-029)\n");
+            // 提示 /programs 的**两种**来源，不假定当前是哪一种。
+            //
+            // 原措辞只说 liveCD 一种来源，并称安装模式下"没有兜底"，
+            // 会被读成"安装模式下 /programs 是空的"——这是错的：
+            // 安装模式下 /programs 是 systemdisk.img 的 EXT2 目录，
+            // SDK `build --systemdisk` 会把全部用户程序写进去（实测确认）。
+            // shell 无法可靠区分当前模式，故只陈述事实，由用户自行判断。
+            out(b"boruix: note: /programs contents depend on how you booted:\n");
+            out(b"boruix:       - liveCD (ISO): the built-in payload embedded in the kernel\n");
+            out(b"boruix:       - installed (hard disk): the EXT2 /programs on that disk,\n");
+            out(b"boruix:         written by `python main.py build --systemdisk`\n");
         }
         Error::ExecFormat => {
             out(b"not a loadable ELF image (ENOEXEC)\n");
