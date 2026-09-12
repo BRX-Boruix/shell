@@ -1681,15 +1681,35 @@ pub(crate) fn exec_line(line: &[u8]) {
     }
     let arg = argbuf.as_slice();
 
+    // 路径执行：首词含 `/` 即按 VFS 路径装载，否则按内建命令名分发。
+    //
+    // **内建名优先**：即使某个内建名里含斜杠（当前没有），也仍走内建，
+    // 使规则不依赖「内建名恰好都不含斜杠」这一巧合。
     let status = if redirs.is_empty() {
-        run_builtin(name, arg)
+        run_command(name, arg)
     } else {
-        match with_redirects(&redirs, || run_builtin(name, arg)) {
+        match with_redirects(&redirs, || run_command(name, arg)) {
             Ok(s) => s,
             Err(()) => 1, // open/dup2 失败已报错
         }
     };
     set_last_status(status);
+}
+
+/// 分发单条命令：内建名走内建，含 `/` 的走 VFS 路径装载。
+///
+/// 供 `exec_line` 与管道各段共用，故管道里也能写 `/programs/xxx.elf`。
+///
+/// 退出码约定沿用 shell 惯例（与 `run_builtin` 的 127 一致）：
+///   * 127 —— 命令未找到（未知内建名）；
+///   * 126 —— 找到了但无法执行（不存在 / 非 ELF / 权限不足）。
+fn run_command(name: &[u8], arg: &[u8]) -> u8 {
+    match classify_command(name) {
+        Dispatch::Empty => 0,
+        // 内建名优先，避免「内建名恰好含斜杠」时被路径规则遮蔽。
+        Dispatch::Path if !is_builtin(name) => exec_via_path(name, arg),
+        Dispatch::Builtin | Dispatch::Path => run_builtin(name, arg),
+    }
 }
 
 /// 分发单条内建命令（`name` = 命令名，`arg` = 空格连接的剩余参数）。供
@@ -1861,10 +1881,11 @@ fn run_pipeline_stage(stage: &[Vec<u8>]) -> u8 {
         argbuf.extend_from_slice(w);
     }
     let arg = argbuf.as_slice();
+    // 与 `exec_line` 用同一个分发器：管道中也能写路径程序。
     if redirs.is_empty() {
-        run_builtin(name, arg)
+        run_command(name, arg)
     } else {
-        match with_redirects(&redirs, || run_builtin(name, arg)) {
+        match with_redirects(&redirs, || run_command(name, arg)) {
             Ok(s) => s,
             Err(()) => 1, // open/dup2 失败已报错
         }
@@ -2274,3 +2295,143 @@ fn cmd_driver(arg: &[u8]) -> u8 {
     }
 }
 
+
+// ==================== 路径执行（`/path/to/prog.elf`）====================
+
+/// 命令行首词应该如何分发。
+///
+/// **为何要单独抽成纯函数**：判定规则（什么算路径、什么算内建名）可以穷举，
+/// 而「真的去执行」不行。分离后就能在宿主上覆盖全部边界，
+/// 而不是只能在 QEMU 上敲几条例试（S23/S29）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dispatch {
+    /// 走内建命令表。
+    Builtin,
+    /// 走 VFS 路径装载（用户给了明确的路径）。
+    Path,
+    /// 空词，什么都不做。
+    Empty,
+}
+
+/// 判定命令行首词的分发方式。
+///
+/// **判据是「含 `/`」而不是「以 `/` 开头」**，理由是相对路径：
+/// 内核 `sys_exec` 会把相对路径与进程 cwd 拼接（见 `absolute_path`），
+/// 所以 `prog.elf`（无斜杠）与 `./prog.elf`（有斜杠）在**内核**看来一样。
+/// 若只认前导斜杠，`./prog.elf` 会被当成内建名而报 unknown command ——
+/// 那恰恰是 Unix 用户最先试的写法。含斜杠即交给内核解析，
+/// 是否存在、是否可执行由内核如实回答。
+///
+/// **为何不以「文件是否存在」为准**：那需要先探测文件系统，会给每个
+/// 未知内建名多加一次无谓的 VFS 查询，并引入 TOCTOU 窗口
+/// （探测与执行之间文件可能消失）。让内核在装载时判定更直接。
+pub(crate) fn classify_command(word: &[u8]) -> Dispatch {
+    if word.is_empty() {
+        return Dispatch::Empty;
+    }
+    if word.contains(&b'/') {
+        return Dispatch::Path;
+    }
+    Dispatch::Builtin
+}
+
+/// 该词是否为已知内建命令名。
+///
+/// **消歧用**：含 `/` 的词优先按路径处理，但若它恰好是内建名仍应走内建 ——
+/// 保留这一层是为了让规则不依赖「内建名恰好都不含斜杠」这一巧合。
+pub(crate) fn is_builtin(word: &[u8]) -> bool {
+    COMMANDS.iter().any(|c| *c == word)
+}
+
+/// 执行一个 VFS 路径指向的程序，如实报告三类不同的失败。
+///
+/// **三类失败必须分开报**（这是本功能的重点，不是装饰）：
+///
+/// 1. **文件不存在**（ENOENT）：路径打错了，或该文件不在当前启动模式下；
+/// 2. **不是可执行镜像**（ENOEXEC）：文件在，但内容不是可装载的 ELF；
+/// 3. **内核拒绝装载**（EACCES/EISDIR/ENOTDIR/E2BIG/EFAULT 等）：权限、
+///    对象类型、命令行过长、地址非法。
+///
+/// 笼统报一句 exec failed 会把这三类混在一起，而它们的排查方向完全不同 ——
+/// 与批次六 R2「失败原因必须区分」是同一条纪律。
+///
+/// 退出码沿用 shell 惯例：126 = 找到了但无法执行。
+fn exec_via_path(path: &[u8], arg: &[u8]) -> u8 {
+    let path_str = match core::str::from_utf8(path) {
+        Ok(s) => s,
+        Err(_) => {
+            out(b"boruix: path is not valid UTF-8: ");
+            out(path);
+            out(b"\n");
+            return 126;
+        }
+    };
+    match exec_path(path_str, arg) {
+        Ok(pid) => {
+            // 前台语义：等它跑完再回提示符（与内建命令一致）。
+            let mut b = [0u8; 24];
+            out(b"boruix: started pid=");
+            out(u64_to_dec(pid, &mut b));
+            out(b"\n");
+            match waitpid_any() {
+                Ok(wr) => wr.code as u8,
+                Err(e) => {
+                    out(b"boruix: wait failed: ");
+                    out(e.to_string().as_bytes());
+                    out(b"\n");
+                    126
+                }
+            }
+        }
+        Err(e) => {
+            report_exec_error(path, e);
+            126
+        }
+    }
+}
+
+/// 把装载失败映射成**具体、可行动**的提示。
+///
+/// 本函数的全部意义在于：不把不同性质的失败压扁成同一句话。
+fn report_exec_error(path: &[u8], e: libsys::Error) {
+    use libsys::Error;
+    out(b"boruix: cannot execute ");
+    out(path);
+    out(b": ");
+    match e {
+        Error::NotFound => {
+            out(b"no such file (ENOENT)\n");
+            // ADR-029：这是最容易被误解成「路径写错」的一类。
+            out(b"boruix: note: /programs is filled from the built-in liveCD payload only;\n");
+            out(b"boruix:       in installed mode it is a plain disk directory with no fallback (ADR-029)\n");
+        }
+        Error::ExecFormat => {
+            out(b"not a loadable ELF image (ENOEXEC)\n");
+        }
+        Error::PermissionDenied => {
+            out(b"permission denied (EACCES)\n");
+        }
+        Error::IsDirectory => {
+            out(b"is a directory, not a program (EISDIR)\n");
+        }
+        Error::NotDirectory => {
+            out(b"a path component is not a directory (ENOTDIR)\n");
+        }
+        Error::ArgListTooLong => {
+            out(b"command line too long (E2BIG)\n");
+        }
+        Error::BadAddress => {
+            out(b"bad user address (EFAULT)\n");
+        }
+        Error::NameTooLong => {
+            out(b"path too long (ENAMETOOLONG)\n");
+        }
+        other => {
+            out(other.to_string().as_bytes());
+            out(b" (errno=");
+            let mut b = [0u8; 24];
+            out(u64_to_dec(other.to_errno() as u64, &mut b));
+            out(b")\n");
+        }
+    }
+}
