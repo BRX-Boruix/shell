@@ -186,7 +186,7 @@ use libsys::nr::{INFO_BOOT_MS, INFO_CPU_COUNT, INFO_VERSION};
 use libsys::{
     chdir, close, chmod, dup2, exec_path, getcwd, info, kill, mkdir, now, open, pipe_create, ps,
     read, read_dir, read_to_end, read_wall_clock, sleep, sync_create, sync_delete, sync_wake,
-    unlink, waitpid_any, write, yield_now, OpenFlags, Permissions, PsEntry, STDIN, STDOUT,
+    unlink, waitpid_any, write, yield_now, Error, OpenFlags, Permissions, PsEntry, STDIN, STDOUT,
     power_off, reboot,
     driver_claim, driver_query, driver_register, driver_unregister,
 };
@@ -2385,13 +2385,33 @@ fn exec_via_path(path: &[u8], arg: &[u8]) -> u8 {
             out(b"boruix: started pid=");
             out(u64_to_dec(pid, &mut b));
             out(b"\n");
-            match waitpid_any() {
-                Ok(wr) => wr.code as u8,
-                Err(e) => {
-                    out(b"boruix: wait failed: ");
-                    out(e.to_string().as_bytes());
-                    out(b"\n");
-                    126
+            // 前台语义：等它跑完再回提示符。
+            //
+            // **`WouldBlock` 不是失败，必须重试。** 内核 `sys_task_wait` 在
+            // "目标子进程仍在运行，但**本核**就绪队列里没有别的进程可切" 时
+            // 返回 `WouldBlock`（拒绝阻塞，以免让出后无人可运行）。这在多核下
+            // 很常见：子进程 home 在别的核、或此刻所有可运行进程都在别的核上。
+            //
+            // 旧实现把 `WouldBlock` 当致命错误直接 `return 126` —— 于是**丢下
+            // 仍在运行的子进程**自己退出。init 的 supervisor 循环随即重拉一个
+            // shell，键盘缓冲被多个将死的 shell 并发 `read`，输入被瓜分
+            // （`clear` 变成 `r` / `clea`）——"命令对不对全靠运气"的真正来源。
+            //
+            // 故此处按语义重试：`WouldBlock` → 让出 CPU 后重问；其余错误才报。
+            loop {
+                match waitpid_any() {
+                    Ok(wr) => break wr.code as u8,
+                    Err(Error::WouldBlock) => {
+                        // 无就绪者时先让出，避免在本核忙转饿死其它进程。
+                        let _ = yield_now();
+                        continue;
+                    }
+                    Err(e) => {
+                        out(b"boruix: wait failed: ");
+                        out(e.to_string().as_bytes());
+                        out(b"\n");
+                        break 126;
+                    }
                 }
             }
         }
