@@ -9,7 +9,7 @@ pub(crate) const COMMANDS: &[&[u8]] = &[
     b"echo", b"help", b"now", b"time", b"uptime", b"version", b"uname", b"cpu", b"sleep",
     b"clear", b"env", b"export", b"unset", b"ps", b"kill", b"signal", b"alias", b"unalias",
     b"which", b"jobs", b"ls", b"cat", b"mkdir", b"touch", b"rm", b"tree", b"jtree", b"cd",
-    b"pwd", b"pipe", b"libccheck", b"poweroff", b"reboot", b"uiodemo", b"driver",
+    b"pwd", b"pipe", b"libccheck", b"poweroff", b"reboot", b"uiodemo", b"driver", b"selftest",
 ];
 
 /// 返回内建命令名列表（供补全遍历）。
@@ -1767,6 +1767,7 @@ fn run_builtin(name: &[u8], arg: &[u8]) -> u8 {
         b"reboot" => cmd_reboot(arg),
         b"uiodemo" => cmd_uiodemo(arg),
         b"driver" => cmd_driver(arg),
+        b"selftest" => cmd_selftest(arg),
         other => {
             out(b"boruix: unknown command: ");
             out(other);
@@ -2283,6 +2284,64 @@ fn driver_status(words: &[Vec<u8>]) -> u8 {
 }
 
 /// driver 主分发：<install|load|list|status> [args...]
+/// `selftest` 命令：按需运行开机自检（原 init 启动序列整体迁入 /programs/selftest.elf）。
+///
+/// 用法：selftest [audio|thread|quick]。无参 = 全量（含 SIGKILL 风暴，耗时最长）。
+/// 实现走 exec_path + waitpid_any 收尸，与用户手敲外部程序同一条真实路径。
+fn cmd_selftest(arg: &[u8]) -> u8 {
+    let mut b = [0u8; 24];
+    // 组参数：原样透传（空参 = 全量）。
+    let mut cmd: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    cmd.extend_from_slice(arg);
+    let child = match exec_path("/programs/selftest.elf", &cmd) {
+        Ok(pid) => pid,
+        Err(e) => {
+            out(b"selftest: spawn failed errno=");
+            out(u64_to_dec(e.to_errno() as u64, &mut b));
+            out(b"\n");
+            return 1;
+        }
+    };
+    out(b"selftest: spawned pid=");
+    out(u64_to_dec(child, &mut b));
+    out(b"\n");
+    // exec 返回时子进程可能尚未进入就绪队列：此刻 waitpid 会因
+    // "系统内无其他可运行进程"被拒绝（WouldBlock）。与 cmd_audioe2e 同法，
+    // 先让出若干轮给子进程起跑，再进入收尸阻塞。
+    for _ in 0..100 {
+        let _ = yield_now();
+    }
+    // 收尸并回显真实退出码（0=全绿）。
+    // EAGAIN（WouldBlock, errno 11）重试：exec 返回时子进程可能尚未进入
+    // 就绪队列，内核在"系统内无其他可运行进程"时**如实拒绝阻塞**（不猜测
+    // 等待）。让出后重试即可——子进程一经调度，下一次 waitpid 就走真正的
+    // 阻塞路径；这不是忙等，是内核诚实语义的正确用法。
+    let st = loop {
+        match waitpid_any() {
+            Ok(wr) => {
+                out(b"selftest: reaped pid=");
+                out(u64_to_dec(wr.pid, &mut b));
+                out(b" exit=");
+                out(u64_to_dec(wr.code as u64, &mut b));
+                out(b"\n");
+                if wr.pid != child {
+                    out(b"selftest: NOTE reaped unrelated pid (orphan)\n");
+                }
+                break if wr.code == 0 { 0 } else { 1 };
+            }
+            Err(e) if e.to_errno() == 11 => {
+                let _ = yield_now();
+            }
+            Err(_) => {
+                out(b"selftest: waitpid failed\n");
+                break 1;
+            }
+        }
+    };
+    st
+}
+
+
 fn cmd_driver(arg: &[u8]) -> u8 {
     let a = trim_bytes(arg);
     if a.is_empty() {
