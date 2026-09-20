@@ -939,6 +939,98 @@ fn cmd_pipe(_arg: &[u8]) -> u8 {
     out(b"\"\n");
     0
 }
+/// `acee2e`：显式 ACE 通道（A2-6 / ADR-040 §3.5.1 G4）的**真实用户态**验收（协调端）。
+///
+/// 流程：建 `/scratch/acee2e.txt`（0644）→ `exec_path("/programs/acee2e.elf")` 派生子
+/// 进程 → `waitpid_any()` 收退出码，断言 0。子进程经 libsys 封装（`set_aces`/
+/// `get_aces`/`aces_count`）穿越 syscall 边界读写 ACE，覆盖验收 #19（写入的策略经
+/// 求值生效）与 #20（ABI 往返保真），并含容量不足不截断、畸形如实拒绝且不留半套、
+/// 清空、以及"写 ACE 不动 classic 三段"五类边界。
+///
+/// 为何必须走子进程而非 shell 内联：ACE 的授权面是**节点属主或 CAP_OWNER**，而
+/// 强制判定发生在内核；用独立进程走完整 exec→syscall→exit 链路，才验证到真实
+/// 用户链路（§3.5.4「不得止于单测」）。子进程退出码即失败项编号，便于定位。
+///
+/// **依赖 `/programs/acee2e.elf` 存在**（liveCD 内嵌 payload 提供，ADR-028 单源）。
+/// 缺失时如实报错，不假定成功。定位为开发/验收期诊断，非生产特性。
+fn cmd_acee2e() -> u8 {
+    let mut b = [0u8; 24];
+    // 1. 前置：目标文件必须存在（mkdir 忽略已存在）。子进程只写 ACE，不建文件，
+    //    故此处失败即如实上报——不替它兜底。
+    let _ = mkdir("/scratch", Permissions::all());
+    match open("/scratch/acee2e.txt", OpenFlags::CREATE_OR_TRUNCATE, Permissions::all()) {
+        Ok(fd) => { let _ = close(fd); }
+        Err(_) => {
+            out(b"acee2e: cannot create /scratch/acee2e.txt\n");
+            return 1;
+        }
+    }
+    // 明确设为 0644：子进程断言 "set_aces 未扰动 classic 三段" 需已知基线。
+    let _ = chmod("/scratch/acee2e.txt", 0o644);
+    // 2. 派生测试子进程。
+    let child = match exec_path("/programs/acee2e.elf", &[]) {
+        Ok(pid) => pid,
+        Err(e) => {
+            out(b"acee2e: spawn failed errno=");
+            out(u64_to_dec(e.to_errno() as u64, &mut b));
+            out(b" (/programs/acee2e.elf missing; liveCD supplies it from the built-in\n");
+            out(b"        payload)\n");
+            return 1;
+        }
+    };
+    out(b"acee2e: spawned pid=");
+    out(u64_to_dec(child, &mut b));
+    out(b"\n");
+    // 3. 收退出码。0 = 全部通过；非零 = 子进程内首个失败项编号。
+    //    纪律（实测得出，非推断）：`exec_path` 是**非阻塞**派生（立即返回 pid），
+    //    而 `waitpid_any` 在"子进程尚未退出、且当下无法切换"时如实返回 WouldBlock
+    //    （errno 11）——**不是**错误，只是"还没有可收的结果"。
+    //    故固定次数的 yield 循环是不够的（子进程工作量不定长：实测其跑完需数百次
+    //    调度机会，固定额度要么不够、要么白等）。正确形态是**按 WouldBlock 重试**，
+    //    直到收到真实退出码或遇到非 WouldBlock 的硬错误。
+    //    这与 synce2e 的差别在子进程工作量：synce2e 的等待端一进去就阻塞，父进程
+    //    几次 yield 即可；acee2e 的子进程要跑完十余个 syscall，故需循环重试。
+    let mut attempt: u32 = 0;
+    let wr = loop {
+        match waitpid_any() {
+            Ok(w) => break w,
+            Err(Error::WouldBlock) => {
+                // 让出调度机会给子进程，然后重试。上限只为防"子进程永不退出"
+                // 造成的无界挂起（如实失败，不静默吞掉）。
+                attempt += 1;
+                if attempt > 2_000_000 {
+                    out(b"acee2e: child did not exit (retry budget exhausted)\n");
+                    return 1;
+                }
+                let _ = yield_now();
+            }
+            Err(e) => {
+                out(b"acee2e: waitpid failed errno=");
+                out(u64_to_dec(e.to_errno() as u64, &mut b));
+                out(b"\n");
+                return 1;
+            }
+        }
+    };
+    // 4. 断言退出码与 pid。
+    {
+        if wr.pid != child {
+            out(b"acee2e: waitpid pid=");
+            out(u64_to_dec(wr.pid, &mut b));
+            out(b" (expected the spawned child)\n");
+            return 1;
+        }
+        if wr.code != 0 {
+            out(b"acee2e: FAIL exit=");
+            out(u64_to_dec(wr.code, &mut b));
+            out(b" (see child output above)\n");
+            return 1;
+        }
+        out(b"acee2e: child exit=0 -- ALL OK (real user-space ACE channel)\n");
+    }
+    0
+}
+
 /// `synce2e`：SYNC 域（ADR-032）端到端**阻塞往返**测试（协调端）。
 ///
 /// 流程：create 同步字(id,0) → `exec_path("/programs/synce2e.elf", "waiter:<id>")`
@@ -1761,6 +1853,7 @@ fn run_builtin(name: &[u8], arg: &[u8]) -> u8 {
         b"pwd" => cmd_pwd(),
         b"pipe" => cmd_pipe(arg),
         b"synce2e" => cmd_synce2e(),
+        b"acee2e" => cmd_acee2e(),
         b"audioe2e" => cmd_audioe2e(),
         b"libccheck" => crate::libc_check::cmd_libccheck(arg),
         b"poweroff" => cmd_poweroff(arg),
