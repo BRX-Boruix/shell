@@ -1031,6 +1031,72 @@ fn cmd_acee2e() -> u8 {
     0
 }
 
+/// `trave2e`：目录遍历权限（A2-3 / ADR-040 §3.4）的**真实用户态**验收（协调端）。
+///
+/// 流程：`exec_path("/programs/trave2e.elf")` 派生子进程 → 收退出码断言 0。
+/// 子进程在**真实进程上下文**中：建夹具（0700 目录 + 0644 文件）→ 属主穿越成功 →
+/// 经 `identity_set` **真实降级**为 uid 2002 → 穿越无 x 目录必须 EACCES → 由属主补 x
+/// → 非属主再试应成功（对照）→ 恢复身份并清理。
+///
+/// 与内核停机测试 `[test-traverse]` 的分工：后者跑在内核态、直接构造 ProcessIdentity，
+/// 证明**检查逻辑**正确；本命令走真实用户链路（真实 PCB 身份经 syscall 变更、真实
+/// 用户指针、真实路径解析），证明**该检查在真实进程上可达且生效**——二者互补，
+/// 缺一不能声称"用户态确实被拦住"（§3.5.4「不得止于单测」）。
+///
+/// **依赖 `/programs/trave2e.elf` 存在**（liveCD 内嵌 payload，ADR-028 单源）。
+fn cmd_trave2e() -> u8 {
+    let mut b = [0u8; 24];
+    let child = match exec_path("/programs/trave2e.elf", &[]) {
+        Ok(pid) => pid,
+        Err(e) => {
+            out(b"trave2e: spawn failed errno=");
+            out(u64_to_dec(e.to_errno() as u64, &mut b));
+            out(b" (/programs/trave2e.elf missing; liveCD supplies it from the built-in\n");
+            out(b"         payload)\n");
+            return 1;
+        }
+    };
+    out(b"trave2e: spawned pid=");
+    out(u64_to_dec(child, &mut b));
+    out(b"\n");
+    // 收退出码：按 WouldBlock 重试（同 acee2e 纪律——`exec_path` 非阻塞派生，
+    // 子进程工作量不定长，固定次数 yield 不够；WouldBlock 不是错误，只是"还没结果"）。
+    let mut attempt: u32 = 0;
+    let wr = loop {
+        match waitpid_any() {
+            Ok(w) => break w,
+            Err(Error::WouldBlock) => {
+                attempt += 1;
+                if attempt > 2_000_000 {
+                    out(b"trave2e: child did not exit (retry budget exhausted)\n");
+                    return 1;
+                }
+                let _ = yield_now();
+            }
+            Err(e) => {
+                out(b"trave2e: waitpid failed errno=");
+                out(u64_to_dec(e.to_errno() as u64, &mut b));
+                out(b"\n");
+                return 1;
+            }
+        }
+    };
+    if wr.pid != child {
+        out(b"trave2e: waitpid pid=");
+        out(u64_to_dec(wr.pid, &mut b));
+        out(b" (expected the spawned child)\n");
+        return 1;
+    }
+    if wr.code != 0 {
+        out(b"trave2e: FAIL exit=");
+        out(u64_to_dec(wr.code, &mut b));
+        out(b" (see child output above)\n");
+        return 1;
+    }
+    out(b"trave2e: child exit=0 -- ALL OK (real user-space traversal check)\n");
+    0
+}
+
 /// `synce2e`：SYNC 域（ADR-032）端到端**阻塞往返**测试（协调端）。
 ///
 /// 流程：create 同步字(id,0) → `exec_path("/programs/synce2e.elf", "waiter:<id>")`
@@ -1854,6 +1920,7 @@ fn run_builtin(name: &[u8], arg: &[u8]) -> u8 {
         b"pipe" => cmd_pipe(arg),
         b"synce2e" => cmd_synce2e(),
         b"acee2e" => cmd_acee2e(),
+        b"trave2e" => cmd_trave2e(),
         b"audioe2e" => cmd_audioe2e(),
         b"libccheck" => crate::libc_check::cmd_libccheck(arg),
         b"poweroff" => cmd_poweroff(arg),
