@@ -2009,15 +2009,14 @@ fn write_file(path: &str, data: &[u8]) -> Result<(), libsys::Error> {
 }
 
 /// 把一个文件的权限收紧为 system_only（仅 System 可读/可 exec）。shell 是 System。
+///
+/// A1-7 修复：门禁位经 `GATE_SYSTEM_BIT`（wire bit9）显式写入——旧形态
+/// `system_only: true` 经 `to_bits()` 输出 bit3（≤0o7 区），A1-1 线格式迁移后
+/// 被内核兼容层误展开为 classic 段（静默失效），此处归位为 ABI 常量直通。
 fn make_system_only(path: &str) -> Result<(), libsys::Error> {
     chmod(
         path,
-        Permissions {
-            readable: true,
-            writable: true,
-            executable: true,
-            system_only: true,
-        },
+        0o755 | libsys::GATE_SYSTEM_BIT,
     )
 }
 
