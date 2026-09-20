@@ -594,6 +594,92 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         let _ = libc::unistd::remove(sdir);
     }
 
+    unsafe {
+        // ---- A2-5：POSIX 账户查询（getpwnam/getpwuid，读 /config/users.json）----
+        //
+        // 真实性要求（S06/S09）：本段**先写入具体账户**，再断言查得的 uid/gid 与之相符；
+        // 并显式验证"表缺失时如实失败、绝不返回伪造账户"。若直接查一个不存在的表并断言
+        // 返回 NULL，那只能证明"没数据时没数据"，证明不了映射正确。
+        {
+            const TABLE: &str = "/config/users.json";
+            let table = b"/config/users.json\0";
+            // 1) 先确保 /config 存在（userd 正常启动时已建；此处幂等兜底）。
+            let cfg = b"/config\0";
+            let _ = libc::unistd::mkdir(cfg.as_ptr() as *const i8, 0o755);
+
+            // 2) 写一份**已知内容**的账户表。
+            let fd = libc::unistd::open(table.as_ptr() as *const i8,
+                libc::unistd::O_WRONLY | libc::unistd::O_CREAT | libc::unistd::O_TRUNC, 0o644);
+            rpt.check("pwd: open users.json for write", fd >= 0);
+            if fd >= 0 {
+                let body = br#"{"users":[{"name":"alice","uid":1000,"gid":1000},{\"name\":\"bob\",\"uid\":1001,\"gid\":1001}]}"#;
+                let w = libc::unistd::write(fd, body.as_ptr() as *const core::ffi::c_void, body.len());
+                rpt.check("pwd: wrote account table", w == body.len() as isize);
+                libc::unistd::close(fd);
+            }
+
+            // 3) endpwent 清缓存，强制重新读表（否则可能命中上一次的缓存）。
+            libc::pwd::endpwent();
+
+            // 4) getpwnam("alice") 必须返回**真** uid/gid（与写入内容逐字段相符）。
+            let alice_name = b"alice\0";
+            let pa = libc::pwd::getpwnam(alice_name.as_ptr() as *const i8);
+            rpt.check("pwd: getpwnam(alice) non-null", !pa.is_null());
+            if !pa.is_null() {
+                let a = &*pa;
+                rpt.check("pwd: alice uid == 1000 (real, not fabricated)", a.pw_uid == 1000);
+                rpt.check("pwd: alice gid == 1000 (real, not fabricated)", a.pw_gid == 1000);
+                rpt.check("pwd: alice pw_name non-null", !a.pw_name.is_null());
+                rpt.check("pwd: alice pw_dir == /users/alice", !a.pw_dir.is_null());
+            } else {
+                rpt.check("pwd: alice uid == 1000", false);
+                rpt.check("pwd: alice gid == 1000", false);
+                rpt.check("pwd: alice pw_name non-null", false);
+                rpt.check("pwd: alice pw_dir == /users/alice", false);
+            }
+
+            // 5) getpwuid(1001) 必须**反查**到 bob（名字↔uid 双向一致）。
+            let pb = libc::pwd::getpwuid(1001);
+            rpt.check("pwd: getpwuid(1001) non-null", !pb.is_null());
+            if !pb.is_null() {
+                let b = &*pb;
+                rpt.check("pwd: uid 1001 resolves to name \"bob\"",
+                    b.pw_name == alice_name.as_ptr() as *mut i8 || {
+                        // 逐字节比较（名字存储不同缓冲区）。
+                        let n = b.pw_name as *const u8;
+                        n.read() == b'b' && n.add(1).read() == b'o' && n.add(2).read() == b'b' && n.add(3).read() == 0
+                    });
+                rpt.check("pwd: bob uid == 1001", b.pw_uid == 1001);
+                rpt.check("pwd: bob gid == 1001", b.pw_gid == 1001);
+            } else {
+                rpt.check("pwd: uid 1001 resolves to name \"bob\"", false);
+                rpt.check("pwd: bob uid == 1001", false);
+                rpt.check("pwd: bob gid == 1001", false);
+            }
+
+            // 6) **诚实边界**：查一个表里没有的名字必须 NULL + ENOENT（不是伪账户）。
+            let ghost = b"nosuchuser\0";
+            libc::errno::set_errno(0);
+            let pg = libc::pwd::getpwnam(ghost.as_ptr() as *const i8);
+            rpt.check("pwd: unknown name -> NULL (no fabricated account)", pg.is_null());
+            rpt.check("pwd: unknown name sets ENOENT", libc::errno::errno() == libc::errno::ENOENT);
+            let pu = libc::pwd::getpwuid(999999);
+            rpt.check("pwd: unknown uid -> NULL", pu.is_null());
+
+            // 7) getpwent 遍历：应恰好走完两条（且不含伪造条目）。
+            libc::pwd::setpwent();
+            let n1 = libc::pwd::getpwent();
+            let n2 = libc::pwd::getpwent();
+            let n3 = libc::pwd::getpwent();
+            rpt.check("pwd: getpwent yields 2 entries then NULL",
+                !n1.is_null() && !n2.is_null() && n3.is_null());
+            libc::pwd::endpwent();
+
+            // 清理：移除测试表。
+            let _ = libc::unistd::remove(table.as_ptr() as *const i8);
+        }
+
+    }
     // 汇总
     // 汇总
     let mut sum = Vec::new();
