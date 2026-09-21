@@ -17,6 +17,36 @@ pub(crate) fn command_names() -> &'static [&'static [u8]] {
     COMMANDS
 }
 
+/// 【R13 后续（实测定案）】文件打开失败的**诚实错误文案**：按 errno 类别
+/// 区分，不再一律显示 "No such file or directory"。实测成因：alice 读
+/// 0600 root 属主的 /config/shadow.json 被 DAC 正确拒绝（内核
+/// check_access 返回 EACCES=13，libsys read_to_end 如实透传），但本 shell
+/// 曾把所有 Err(_) 统一显示成 NotFound——用户无法区分"文件不存在"与
+/// "无权读取"，且后者正是权限模型工作的证据，被文案吞掉了。
+/// 文案纪律（本仓无 strerror 表，S09 不编造可读字符串）：NotFound 与
+/// PermissionDenied 用 POSIX 惯用短语（这两类占文件访问失败的绝大多数，
+/// 且文案在 man page 语义上稳定）；其余类别打 `errno=N`（与本文件
+/// kill/acee2e/driver 的既有风格一致）。
+fn file_error_text(e: libsys::Error) -> &'static [u8] {
+    match e {
+        libsys::Error::NotFound => b"No such file or directory",
+        libsys::Error::PermissionDenied => b"Permission denied",
+        _ => b"error (see errno)",
+    }
+}
+
+/// 打印 `<prefix><path>': <file_error_text>\n`（供 ls/jtree 等共用）。
+fn print_file_error(prefix: &[u8], path: &[u8], e: libsys::Error) {
+    out(prefix);
+    out(path);
+    out(b"': ");
+    out(file_error_text(e));
+    let mut b = [0u8; 24];
+    out(b" (errno ");
+    out(u64_to_dec(e.to_errno() as u64, &mut b));
+    out(b")\n");
+}
+
 extern crate alloc;
 
 use alloc::string::ToString;
@@ -853,10 +883,8 @@ fn cmd_ls(arg: &[u8]) -> u8 {
             }
             0
         }
-        Err(_) => {
-            out(b"ls: cannot access '");
-            out(path.as_bytes());
-            out(b"': No such file or directory\n");
+        Err(e) => {
+            print_file_error(b"ls: cannot access '", path.as_bytes(), e);
             1
         }
     }
@@ -888,10 +916,15 @@ fn cmd_cat(arg: &[u8]) -> u8 {
             }
             0
         }
-        Err(_) => {
+        Err(e) => {
             out(b"cat: ");
             out(a);
-            out(b": No such file or directory\n");
+            out(b": ");
+            out(file_error_text(e));
+            let mut b = [0u8; 24];
+            out(b" (errno ");
+            out(u64_to_dec(e.to_errno() as u64, &mut b));
+            out(b")\n");
             1
         }
     }
@@ -1440,10 +1473,8 @@ fn cmd_jtree(arg: &[u8]) -> u8 {
                     }
                 }
             }
-            Err(_) => {
-                out(b"jtree: cannot read '");
-                out(json_text.as_bytes());
-                out(b"': No such file or directory\n");
+            Err(e) => {
+                print_file_error(b"jtree: cannot read '", json_text.as_bytes(), e);
                 1
             }
         }
@@ -1462,8 +1493,13 @@ fn cmd_cd(arg: &[u8]) -> u8 {
     }
     match chdir(&target) {
         Ok(()) => 0,
-        Err(_) => {
-            out(b"cd: no such directory: ");
+        Err(e) => {
+            out(b"cd: ");
+            out(file_error_text(e));
+            let mut b = [0u8; 24];
+            out(b" (errno ");
+            out(u64_to_dec(e.to_errno() as u64, &mut b));
+            out(b"): ");
             out(target.as_bytes());
             out(b"\n");
             1
