@@ -745,6 +745,103 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         let _ = libc::unistd::remove(gtable.as_ptr() as *const i8);
     }
 
+    // ---- A2-7：SHA-256 已知答案测试（FIPS 180-4 向量，**在真实内核上执行**）----
+    //
+    // 为何放在这里：libc 的 #[cfg(test)] 在 host 上无法执行（裸机目标），故向量的**真实**
+    // 校验必须在目标机完成——这正是本段的意义。若本段不过，ADR-041 的整条认证链不成立。
+    unsafe {
+        fn hex32(d: &[u8; 32]) -> [u8; 64] {
+            let mut out = [0u8; 64];
+            libc::sha256::to_hex(d, &mut out);
+            out
+        }
+        // 与文本常量比对（避免把实现输出当期望值的自证循环：期望值来自 FIPS/独立复算）。
+        fn eq_hex(d: &[u8; 32], want: &[u8]) -> bool {
+            let got = hex32(d);
+            &got[..want.len()] == want
+        }
+
+        // (1) 空串
+        rpt.check(
+            "sha256: empty string (FIPS vector)",
+            eq_hex(
+                &libc::sha256::sha256(b""),
+                b"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+        );
+        // (2) "abc"
+        rpt.check(
+            "sha256: \"abc\" (FIPS vector)",
+            eq_hex(
+                &libc::sha256::sha256(b"abc"),
+                b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+        );
+        // (3) 448 比特双块消息（覆盖多块拼接）
+        rpt.check(
+            "sha256: 448-bit two-block message (FIPS vector)",
+            eq_hex(
+                &libc::sha256::sha256(
+                    b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+                ),
+                b"248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+            ),
+        );
+        // (4)(5)(6) **填充边界**：55 / 56 / 64 字节——SHA-256 实现最易出错处
+        rpt.check(
+            "sha256: 55-byte input (length fits in same block)",
+            eq_hex(
+                &libc::sha256::sha256(&[b'a'; 55]),
+                b"9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318",
+            ),
+        );
+        rpt.check(
+            "sha256: 56-byte input (forces extra padding block)",
+            eq_hex(
+                &libc::sha256::sha256(&[b'a'; 56]),
+                b"b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a",
+            ),
+        );
+        rpt.check(
+            "sha256: 64-byte input (exactly one block)",
+            eq_hex(
+                &libc::sha256::sha256(&[b'a'; 64]),
+                b"ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+            ),
+        );
+        // (7) 流式 == 一次性（覆盖 update() 的块拼接路径）
+        {
+            let mut data = [0u8; 256];
+            for (i, b) in data.iter_mut().enumerate() {
+                *b = i as u8;
+            }
+            let one = libc::sha256::sha256(&data);
+            let mut c = libc::sha256::Sha256::new();
+            for chunk in data.chunks(7) {
+                c.update(chunk);
+            }
+            let streamed = c.finish();
+            rpt.check("sha256: streaming == one-shot (7-byte chunks)", one == streamed);
+        }
+        // (8) 同一策略下的口令校验语义（自检：同口令同盐 → 同哈希；异盐 → 异哈希）
+        {
+            let mut a = libc::sha256::Sha256::new();
+            a.update(b"0123456789abcdef");
+            a.update(b"hunter2");
+            let h1 = a.finish();
+            let mut b = libc::sha256::Sha256::new();
+            b.update(b"0123456789abcdef");
+            b.update(b"hunter2");
+            let h2 = b.finish();
+            rpt.check("sha256: same salt+password is deterministic", h1 == h2);
+            let mut c = libc::sha256::Sha256::new();
+            c.update(b"fedcba9876543210");
+            c.update(b"hunter2");
+            let h3 = c.finish();
+            rpt.check("sha256: different salt changes the hash", h1 != h3);
+        }
+    }
+
     // 汇总
     // 汇总
     let mut sum = Vec::new();
