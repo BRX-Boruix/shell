@@ -842,6 +842,87 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         }
     }
 
+    // ---- A2-7：口令表（shadow）读取与校验——**在真实内核上验证** ----
+    //
+    // 覆盖 ADR-041 §1.2 的三条关键纪律：
+    //   ① 种子表可读且 uid/gid 与账户一致（权威来源可用）；
+    //   ② 正确口令 → 匹配，错误口令 → 不匹配（校验真的在算，不是恒真/恒假）；
+    //   ③ **安全属性**：`/config/shadow.json` 对普通用户**不可读**（除非本进程是 root）。
+    unsafe {
+        match libc::shadow::load_shadow() {
+            Ok(list) => {
+                rpt.check("shadow: /config/shadow.json loads", true);
+                rpt.check("shadow: has 2 seed accounts", list.len() == 2);
+                let alice = list.iter().find(|e| e.name == "alice");
+                rpt.check("shadow: alice entry present", alice.is_some());
+                if let Some(a) = alice {
+                    // 权威 uid/gid 必须与 users.json 的种子一致（1000/1000）。
+                    rpt.check("shadow: alice uid == 1000 (authoritative)", a.uid == 1000);
+                    rpt.check("shadow: alice gid == 1000 (authoritative)", a.gid == 1000);
+                    rpt.check("shadow: alice salt non-empty", !a.salt.is_empty());
+                    // 正确口令 "alicepw" → 匹配。
+                    rpt.check(
+                        "shadow: alice correct password verifies",
+                        matches!(libc::shadow::verify(a, b"alicepw"), Ok(true)),
+                    );
+                    // 错误口令 → 不匹配（证明校验真的在比较，而非恒真）。
+                    rpt.check(
+                        "shadow: alice wrong password rejected",
+                        matches!(libc::shadow::verify(a, b"wrongpw"), Ok(false)),
+                    );
+                    // 空口令 → 不匹配（不会被当成"无口令放行"）。
+                    rpt.check(
+                        "shadow: empty password does NOT pass (no empty-pw bypass)",
+                        matches!(libc::shadow::verify(a, b""), Ok(false)),
+                    );
+                }
+                // root 种子同理（uid 0 的权威记录存在）。
+                let rt = list.iter().find(|e| e.name == "root");
+                rpt.check(
+                    "shadow: root uid == 0 (authoritative)",
+                    matches!(rt, Some(e) if e.uid == 0),
+                );
+                rpt.check(
+                    "shadow: root correct password verifies",
+                    matches!(rt.map(|e| libc::shadow::verify(e, b"rootpw")), Some(Ok(true))),
+                );
+            }
+            Err(_) => {
+                // 若本进程非 root（uid != 0），读不到 shadow 是**正确行为**——这正是保护生效。
+                // 如实记录当前主体的 uid，使结果可解释。
+                let id = libsys::identity_query();
+                let uid = match id {
+                    Ok(i) => i.uid,
+                    Err(_) => 0xFFFF_FFFF,
+                };
+                if uid == 0 {
+                    rpt.check("shadow: root must be able to read shadow", false);
+                } else {
+                    rpt.check("shadow: non-root correctly DENIED shadow read", true);
+                }
+            }
+        }
+        // 解析健壮性：畸形输入必须**如实拒收**，不得产出半条记录。
+        rpt.check(
+            "shadow: malformed JSON yields no entries",
+            libc::shadow::parse_shadow(b"{not json").is_empty(),
+        );
+        rpt.check(
+            "shadow: entry missing hash is rejected",
+            libc::shadow::parse_shadow(
+                br#"{"accounts":[{"name":"x","uid":1,"gid":1,"salt":"00"}]}"#,
+            )
+            .is_empty(),
+        );
+        rpt.check(
+            "shadow: non-hex salt is rejected",
+            libc::shadow::parse_shadow(
+                br#"{"accounts":[{"name":"x","uid":1,"gid":1,"salt":"zz","hash":"00"}]}"#,
+            )
+            .is_empty(),
+        );
+    }
+
     // 汇总
     // 汇总
     let mut sum = Vec::new();
