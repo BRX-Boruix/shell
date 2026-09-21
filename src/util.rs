@@ -2,7 +2,8 @@
 //!
 //! 本模块不依赖 shell 其它模块，是其它模块的公共基础。
 
-use libsys::{write, STDOUT};
+use alloc::string::String;
+use libsys::{getcwd, identity_query, write, STDOUT};
 
 /// 把字节切片输出到标准输出（丢弃错误，静默失败）。
 pub(crate) fn out(s: &[u8]) {
@@ -15,9 +16,64 @@ pub(crate) fn outln(s: &[u8]) {
     out(b"\n");
 }
 
-/// 打印 shell 提示符。
+/// 查询当前进程用户名（R13 后续：提示符显示登录用户）。
+///
+/// 链路：`identity_query`（内核真实 uid）→ libc `getpwuid`（/config/users.json
+/// 账户表）→ 名字。查询失败（表缺失 / uid 不在表中）时**如实降级**为
+/// "uid<N>"——绝不编造名字；这同时是认证链路的日常可视化：提示符名字
+/// 与登录名一致即身份链路健康。
+fn current_user_name() -> String {
+    match identity_query() {
+        Ok(info) => {
+            // SAFETY：getpwuid 返回静态存储指针（POSIX 约定），随即只读拷贝
+            // 出名字，无跨调用持有。
+            let name = unsafe {
+                let pw = libc::pwd::getpwuid(info.uid);
+                if pw.is_null() {
+                    None
+                } else {
+                    let name_ptr = (*pw).pw_name;
+                    let mut len = 0usize;
+                    while *name_ptr.add(len) != 0 {
+                        len += 1;
+                    }
+                    let bytes = core::slice::from_raw_parts(name_ptr.cast::<u8>(), len);
+                    core::str::from_utf8(bytes).ok().map(String::from)
+                }
+            };
+            name.unwrap_or_else(|| alloc::format!("uid{}", info.uid))
+        }
+        Err(_) => String::from("uid?"),
+    }
+}
+
+/// 计算提示符用的 cwd 显示串：家目录前缀（/users/<user>）折叠为 ~，
+/// 其余原样；getcwd 失败时如实显示 "?"。
+fn prompt_cwd(user: &str) -> String {
+    let home = alloc::format!("/users/{}", user);
+    match getcwd() {
+        Ok(cwd) => {
+            if cwd == home {
+                String::from("~")
+            } else if cwd.starts_with(&home) && cwd.as_bytes().get(home.len()) == Some(&b'/') {
+                alloc::format!("~{}", &cwd[home.len()..])
+            } else {
+                cwd
+            }
+        }
+        Err(_) => String::from("?"),
+    }
+}
+
+/// 打印 shell 提示符：`<user>:<cwd>$ `（R13 后续：显示登录用户与当前目录；
+/// 此前是恒定的 "boruix$ "，无法区分 alice 与 root、也不知道自己在哪）。
 pub(crate) fn prompt() {
-    out(b"boruix$ ");
+    let user = current_user_name();
+    let cwd = prompt_cwd(&user);
+    out(user.as_bytes());
+    out(b":");
+    out(cwd.as_bytes());
+    out(b"$ ");
 }
 
 /// `&[u8]` 的 `trim` 等价物：去掉首尾 ASCII 空白。
