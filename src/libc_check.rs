@@ -612,7 +612,7 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
                 libc::unistd::O_WRONLY | libc::unistd::O_CREAT | libc::unistd::O_TRUNC, 0o644);
             rpt.check("pwd: open users.json for write", fd >= 0);
             if fd >= 0 {
-                let body = br#"{"users":[{"name":"alice","uid":1000,"gid":1000},{\"name\":\"bob\",\"uid\":1001,\"gid\":1001}]}"#;
+                let body = br#"{"users":[{"name":"alice","uid":1000,"gid":1000},{"name":"bob","uid":1001,"gid":1001}]}"#;
                 let w = libc::unistd::write(fd, body.as_ptr() as *const core::ffi::c_void, body.len());
                 rpt.check("pwd: wrote account table", w == body.len() as isize);
                 libc::unistd::close(fd);
@@ -680,6 +680,71 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         }
 
     }
+    // ---- A2-4：组账户查询（getgrnam/getgrgid/getgrouplist，读 /config/groups.json）----
+    //
+    // 真实性要求同 A2-5：先写入**已知内容**的组表，再断言查得的 gid 与之相符；
+    // 并显式验证"表缺失时如实失败、绝不返回伪造组"。
+    unsafe {
+        let gtable = b"/config/groups.json\0";
+        let _ = libc::unistd::mkdir(b"/config\0".as_ptr() as *const i8, 0o755);
+
+        // 1) 写入已知内容的组表：dev(2000){alice,bob}、ops(2001){carol}。
+        let fd = libc::unistd::open(gtable.as_ptr() as *const i8,
+            libc::unistd::O_WRONLY | libc::unistd::O_CREAT | libc::unistd::O_TRUNC, 0o644);
+        rpt.check("grp: open groups.json for write", fd >= 0);
+        if fd >= 0 {
+            let body = br#"{"groups":[{"name":"dev","gid":2000,"members":["alice","bob"]},{"name":"ops","gid":2001,"members":["carol"]}]}"#;
+            let w = libc::unistd::write(fd, body.as_ptr() as *const core::ffi::c_void, body.len());
+            rpt.check("grp: wrote group table", w == body.len() as isize);
+            libc::unistd::close(fd);
+        }
+
+        libc::pwd::endgrent();
+
+        // 2) getgrnam("dev") 必须返回**真** gid 2000。
+        let g = libc::pwd::getgrnam(b"dev\0".as_ptr() as *const i8);
+        rpt.check("grp: getgrnam(dev) non-null", !g.is_null());
+        rpt.check("grp: dev gid == 2000 (real, not fabricated)",
+            !g.is_null() && (*g).gr_gid == 2000);
+
+        // 3) getgrgid(2001) 必须反查到 ops（名字<->gid 双向一致）。
+        let g2 = libc::pwd::getgrgid(2001);
+        let ops_ok = !g2.is_null() && {
+            let n = (*g2).gr_name as *const u8;
+            !n.is_null() && n.read() == b'o' && n.add(1).read() == b'p'
+                && n.add(2).read() == b's' && n.add(3).read() == 0 && (*g2).gr_gid == 2001
+        };
+        rpt.check("grp: getgrgid(2001) -> ops(2001) (bidirectional)", ops_ok);
+
+        // 4) **诚实边界**：查不存在的组必须 NULL + ENOENT（不是伪组）。
+        libc::errno::set_errno(0);
+        let ghost = libc::pwd::getgrnam(b"nosuchgroup\0".as_ptr() as *const i8);
+        rpt.check("grp: unknown group -> NULL (no fabricated group)", ghost.is_null());
+        rpt.check("grp: unknown group sets ENOENT", libc::errno::errno() == libc::errno::ENOENT);
+
+        // 5) getgrouplist：alice 的组 = 主组 + 所属补充组 dev(2000)。
+        let mut buf = [0u32; 8];
+        let n = libc::pwd::getgrouplist("alice", 1000, &mut buf);
+        rpt.check("grp: getgrouplist(alice) reports 2 groups", n == 2);
+        rpt.check("grp: alice primary group first", n >= 1 && buf[0] == 1000);
+        rpt.check("grp: alice supplementary dev(2000) present",
+            n >= 2 && buf[..n].contains(&2000));
+        // bob 同属 dev，carol 不属 dev。
+        let nb = libc::pwd::getgrouplist("bob", 1001, &mut [0u32; 8]);
+        rpt.check("grp: getgrouplist(bob) -> 2 (primary + dev)", nb == 2);
+        let nc = libc::pwd::getgrouplist("carol", 1002, &mut [0u32; 8]);
+        rpt.check("grp: carol is NOT in dev -> 2 (primary + ops)", nc == 2);
+
+        // 6) 缓冲不足必须**如实返回所需条数**，不截断、不越界。
+        let mut tiny = [0u32; 1];
+        let need = libc::pwd::getgrouplist("alice", 1000, &mut tiny);
+        rpt.check("grp: insufficient buffer reports required count (2)", need == 2);
+
+        // 清理。
+        libc::pwd::endgrent();
+        let _ = libc::unistd::remove(gtable.as_ptr() as *const i8);
+    }
+
     // 汇总
     // 汇总
     let mut sum = Vec::new();
