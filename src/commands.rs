@@ -269,6 +269,7 @@ fn cmd_help() -> u8 {
         (b"cd", b"change the working directory"),
         (b"pwd", b"print the working directory"),
         (b"pipe", b"self-test: create a pipe, write+read roundtrip"),
+        (b"tty", b"report whether fd 0/1/2 are terminals (isatty)"),
     ];
     out(b"boruix shell builtins:\n");
     for (c, d) in ITEMS {
@@ -1936,6 +1937,32 @@ pub(crate) fn exec_line(line: &[u8]) {
 /// 退出码约定沿用 shell 惯例（与 `run_builtin` 的 127 一致）：
 ///   * 127 —— 命令未找到（未知内建名）；
 ///   * 126 —— 找到了但无法执行（不存在 / 非 ELF / 权限不足）。
+/// `tty`\uff1a报告 fd 0/1/2 是否终端\uff08**J-TOKEN-A \u2261 T-ISATTY \u771f\u503c\u9a8c\u6536**\uff09\u3002
+///
+/// \u8fd9\u662f `libc::isatty` \u7684\u7528\u6237\u53ef\u89c1\u9762\uff1a\u8d70\u771f\u5b9e `SYS_STREAM_FSTAT`\uff0c
+/// \u771f\u503c\u53d6\u81ea\u8282\u70b9\u81ea\u8ff0\u3002\u91cd\u5b9a\u5411\uff08`> file`\uff09\u4f1a\u7528 `dup2` \u628a fd 1
+/// \u6362\u6210\u666e\u901a\u6587\u4ef6\u8282\u70b9\uff0c\u6545\u672c\u547d\u4ee4\u5fc5\u987b\u5982\u5b9e\u6539\u53e3\u2014\u2014
+/// \u65e7\u786c\u7f16\u7801 `fd \u2208 {0,1,2} \u2192 1` \u6c38\u8fdc\u8bf4\u4e0d\u5230\u8fd9\u4e00\u70b9\u3002
+fn cmd_tty() -> u8 {
+    let mut b = [0u8; 24];
+    for (fd, name) in [(0u64, &b"stdin"[..]), (1, &b"stdout"[..]), (2, &b"stderr"[..])] {
+        out(name);
+        out(b": ");
+        match libsys::fstat(fd) {
+            Ok(info) => {
+                if info.is_terminal != 0 {
+                    out(b"isatty=1\n");
+                } else {
+                    out(b"isatty=0\n");
+                }
+            }
+            Err(_) => out(b"isatty=0 (fstat failed)\n"),
+        }
+    }
+    let _ = &mut b;
+    0
+}
+
 fn run_command(name: &[u8], arg: &[u8]) -> u8 {
     match classify_command(name) {
         Dispatch::Empty => 0,
@@ -1981,6 +2008,7 @@ fn run_builtin(name: &[u8], arg: &[u8]) -> u8 {
         b"cd" => cmd_cd(arg),
         b"pwd" => cmd_pwd(),
         b"pipe" => cmd_pipe(arg),
+        b"tty" => cmd_tty(),
         b"synce2e" => cmd_synce2e(),
         b"acee2e" => cmd_acee2e(),
         b"trave2e" => cmd_trave2e(),
