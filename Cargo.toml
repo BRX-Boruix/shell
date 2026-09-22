@@ -6,6 +6,7 @@ build = "build.rs"
 
 [dependencies]
 libsys = { path = "../libsys" }
+libline = { path = "../libline" }
 libc = { path = "../libc" }
 spin = "0.9"
 
