@@ -196,18 +196,29 @@ fn cmd_jobs(arg: &[u8]) -> u8 {
         if !job.active {
             continue;
         }
+        // 渲染行由 libsys::job_lines 单点定义——与宿主测试断言的是**同一段**
+        // 逻辑，杜绝「测试测的和实际打印的是两套」（S06）。
+        let lines = libsys::job_lines(&alive, job.pid, i + 1);
         let live = alive.iter().any(|p| p.pid == job.pid);
-        out(b"[");
-        out(u64_to_dec((i + 1) as u64, &mut b));
-        out(b"] ");
-        out(u64_to_dec(job.pid as u64, &mut b));
-        if live {
-            out(b" Running    ");
-        } else {
-            out(b" Done       ");
+        for line in &lines {
+            if line.is_root {
+                out(b"[");
+                out(u64_to_dec(line.job as u64, &mut b));
+                out(b"] ");
+                out(u64_to_dec(line.pid as u64, &mut b));
+                if live {
+                    out(b" Running    ");
+                } else {
+                    out(b" Done       ");
+                }
+                out(&job.cmd);
+                out(b"\n");
+            } else {
+                out("    \u{2514} ".as_bytes());
+                out(u64_to_dec(line.pid as u64, &mut b));
+                out(b"\n");
+            }
         }
-        out(&job.cmd);
-        out(b"\n");
     }
     0
 }
@@ -536,10 +547,26 @@ fn cmd_ps(arg: &[u8]) -> u8 {
     let mut buf = [PsEntry::EMPTY; 32];
     match ps(&mut buf) {
         Ok(n) => {
-            out(b"PID  STATE\n");
+            let mut entries: Vec<PsEntry> = buf[..n].to_vec();
+            // 内核按分桶顺序返回，**不是** pid 序。此处按 pid 排序，使同一次
+            // 输出可复现（同样的进程集合得到同样的行序）——否则行序随桶分布
+            // 漂移，无法比对、无法验收。
+            entries.sort_unstable_by_key(|p| p.pid);
+            let entries = &entries[..];
+            out(b"PID   PPID  STATE\n");
             let mut b = [0u8; 24];
-            for e in &buf[..n] {
+            for e in entries {
+                // 缩进反映与父的关系：init(ppid=0) 顶格，其子进程缩进——这就是
+                // ADR-043 支柱 1 的进程树在人类可读输出里的可见形态。
+                let depth = libsys::job_depth(entries, e.pid);
+                let mut d = 0u32;
+                while d < depth && d < 8 {
+                    out(b"  ");
+                    d += 1;
+                }
                 out(u64_to_dec(e.pid as u64, &mut b));
+                out(b"   ");
+                out(u64_to_dec(e.ppid as u64, &mut b));
                 out(b"   ");
                 let st: &[u8] = match e.state {
                     1 => &b"Ready"[..],
