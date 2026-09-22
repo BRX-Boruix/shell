@@ -92,7 +92,14 @@ fn repl_loop() {
                 }
             }
             EditAction::Interrupted => {
-                // L-4 会在此处向前台 child 投递 SIGINT；本点只恢复行。
+                // `^C` 在空闲提示符处被按下：作废当前行即可。
+                //
+                // **为何这里不发信号**：此刻 **没有前台子进程**——
+                // shell 正在自己读键盘。`libline` 的
+                // `interrupt_target` 在前台等待期间才设为 `Some(child)`，
+                // 而那段时间里 shell 压根不在 `repl_loop`（在
+                // `exec_via_path` 里），故那一路由 `probe_interrupt` 处理。
+                // 两边合起来才是完整的「随时可打断」。
                 out(b"\n");
             }
             EditAction::Eof(_) => {
@@ -120,21 +127,39 @@ impl libline::InputSource for StdinSource {
         self.inner.next_item()
     }
 
-    /// 从 fd 0 尽力取字节（非阻塞：无键可读即停）。
+    /// 从 fd 0 取一个字节，**键盘空闲时原地重试**（不返回 `false` 去让出 CPU）。
     ///
-    /// 返回「是否新增了字节」——`libline` 据此决定立刻重试还是让出 CPU。
-    /// `WouldBlock`（键盘空闲）与 `Ok(0)`（诚实 EOF）都如实报「没有新增」，
-    /// **不**伪装成有数据。
+    /// # 为何必须重试而不是让出（§6.7 的真实缺陷，L-4 实测复现）
+    ///
+    /// 本内核的键盘阻塞是**单等待者**语义：`read` 空读经 `block_for_kbd`
+    /// 以 CAS 登记 `KBD_WAITER` 并挂起自己；键盘中断经 `wake_kbd` 把
+    /// **登记过的那个 pid** 放回就绪队列（`kernel/crates/task/src/scheduler.rs`
+    /// 的 `block_for_kbd` / `wake_kbd`）。
+    ///
+    /// 而 `libsys::yield_now()` 走 `SYS_TASK_WAIT(0,0)`——**纯让出，不登记
+    /// `KBD_WAITER`**。若本方法在无键可读时返回 `false`，`libline` 就
+    /// `yield_now()` 空转：此时**没人登记等待**，`wake_kbd` 无处可唤醒，
+    /// 击键只能躺在键盘队列里直到下一次 `read` 恰被调用。
+    ///
+    /// **实测症状**（真实 QEMU + 真实 PS/2 按键）：以 0.3s/键的节奏输入
+    /// `echo hi`，屏幕上只出现 `echo h`——**最后一键丢失**；再按回车
+    /// **不执行**。L-2 用 0.14s/键时侥幸没踩到（节奏越慢越容易丢），
+    /// 所以这个缺陷此前一直潜伏。
+    ///
+    /// 修法 = 在 `WouldBlock` 上 `continue`（保持在内核里登记为键盘等待者）。
+    /// 这与 L-3 对 `login` 的修法一致，理由见 `docs/TODO/terminal-input.md` §6.7。
     fn refill(&mut self) -> bool {
-        let mut got = false;
+        let mut one = [0u8; 1];
         loop {
-            let mut one = [0u8; 1];
             match libsys::read(STDIN, &mut one) {
                 Ok(1) => {
                     self.inner.push_bytes(&one);
-                    got = true;
+                    return true;
                 }
-                _ => return got,
+                // 键盘空闲：**继续重试**，不要把控制权让出去。
+                Err(libsys::Error::WouldBlock) => continue,
+                // 真错误 / 诚实 EOF：如实报「没有新增字节」。
+                _ => return false,
             }
         }
     }
