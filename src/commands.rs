@@ -533,7 +533,7 @@ fn cmd_ps(arg: &[u8]) -> u8 {
         }
     }
 
-    let mut buf = [PsEntry { pid: 0, state: 0, _pad: [0; 3] }; 32];
+    let mut buf = [PsEntry::EMPTY; 32];
     match ps(&mut buf) {
         Ok(n) => {
             out(b"PID  STATE\n");
