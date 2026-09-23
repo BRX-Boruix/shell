@@ -2675,18 +2675,6 @@ pub(crate) fn is_builtin(word: &[u8]) -> bool {
 /// 同时轮询频率不致过高而浪费 CPU（每片仅一次系统调用）。
 const WAIT_SLICE_NS: u64 = 10_000_000;
 
-/// 前台等待循环「只看一眼」的极短超时：用于先确认子进程是否还在跑。
-///
-/// # 为何不能传 0
-///
-/// 内核 `sys_task_wait` 以 `timeout>0` 作为「有界等待」的判据（见
-/// `kernel/src/syscall.rs` 的 `let bounded = target_pid != 0 && timeout_ns > 0`）。
-/// 传 0 会让它退化成**无界阻塞** `waitpid`——那正是本修正要消灭的
-/// 行为（子进程已死时会永久挂住）。故取 1 纳秒——它足够小到
-/// 实质等于「不等」，但又严格大于 0，故能走到内核的非阻塞
-/// **预收尸**路径（`waitpid_timeout` 的 `frame=None` 那一步）。
-const PROBE_ALIVE_NS: u64 = 1;
-
 /// 前台子进程运行中，shell 若只闷头 `waitpid_any()`，键盘就没有读者：
 /// 用户按的 `^C` 会**留在键盘队列里**，直到子进程自己结束、下一条命令
 /// 开始读行时才被取走——届时它会立刻中断**那一行**（表现为「Ctrl-C 延迟
@@ -2695,6 +2683,26 @@ const PROBE_ALIVE_NS: u64 = 1;
 /// # 为什么是「探」而不是「阻塞读」
 ///
 /// 子进程（如 `cat`）**有权读自己的 stdin**——前台进程共享同一个键盘。
+/// shell 若在这里阻塞读，就会与子进程抢输入。故本函数只做一次**非阻塞**探：
+///
+/// # 裁决甲（§6.12.5）：本函数曾与自己的文档矛盾
+///
+/// 上面这句「只做一次**非阻塞**探」是**本函数最初的意图**，但旧实现用的是
+/// 阻塞 `read`——文档与代码**直接矛盾**，而这不是笔误、是**实现缺陷**：
+/// 交互 stdin 空读会让内核登记 `KBD_WAITER` 并把本进程切走。
+///
+/// 后果实测（真实 QEMU + 真实 PS/2 按键）：前台子进程被 `^C` 杀死后，
+/// shell 回到等待循环开头、又立刻阻塞在这里，**永远走不到 `waitpid`**；
+/// 提示符永不回来，且此后对任何按键毫无反应（连字符回显都没有）。
+///
+/// 现改用 [`libsys::read_nonblocking`]：无键可读时内核**不登记等待者**，
+/// 如实返回 `WouldBlock`，本函数立刻返回。
+/// 「探键」与「等待」从此彻底解耦——这正是裁决甲要达成的效果。
+///
+/// 副作用（正向）：旧实现每次空探都会阻塞切走，使「等待循环 → 行编辑」
+/// 的交接窗口异常地长，窗口内的击键大量落进无人登记的空档。
+/// 现在探键不再切走进程，交接是**同步**完成的。
+///
 /// shell 若在这里阻塞读，就会与子进程抢输入。故本函数只做一次**非阻塞**探：
 /// 无键可读就立刻返回，绝不消费任何**非 `0x03`** 的字节（那些属于子进程）。
 ///
@@ -2710,25 +2718,16 @@ const PROBE_ALIVE_NS: u64 = 1;
 /// 那是真实竞态，而且用户要的是「中断这件事发生」，已经发生。静默即可。
 fn probe_interrupt(child: u64) {
     let mut one = [0u8; 1];
-    match read(STDIN, &mut one) {
-        Ok(1) => {
-            if one[0] == 0x03 {
-                let _ = kill(child, libsys::signal::SIGINT as u64);
-            }
-            // 非 0x03：**不消费语义上属于子进程的输入**。
-            //
-            // 诚实说明本实现的边界：这一次 `read` 已经把该字节取走了。
-            // 要真正「放回」需要内核提供 pushback 或多读者路由，二者都
-            // 不存在（ADR-043 §2.2.3 已把「谁该收到哪个事件」列为挂起项）。
-            // 故当前行为的**净效果**是：子进程期间的非 `^C` 击键会被丢弃。
-            // 这在交互式前台程序里是可接受的折衷（它们多半自己读 stdin，
-            // 而 shell 只在 `waitpid_any` 返回 `WouldBlock` 的空档才探一次），
-            // 但它**是一个真实的局限**，故在此如实写明，不假装完备。
+    match libsys::read_nonblocking(STDIN, &mut one) {
+        Ok(1) if one[0] == 0x03 => {
+            let mut sink = [0u8; 1];
+            let _ = read(STDIN, &mut sink);
+            let _ = kill(child, libsys::signal::SIGINT as u64);
         }
-        // 无键可读 / 已 EOF：什么都不做，立刻返回把控制权还给等待循环。
         _ => {}
     }
 }
+
 /// 执行一个 VFS 路径指向的程序，如实报告三类不同的失败。
 ///
 /// **三类失败必须分开报**（这是本功能的重点，不是装饰）：
@@ -2781,50 +2780,48 @@ fn exec_via_path(path: &[u8], arg: &[u8]) -> u8 {
             // 其余字节**原样留在队列里**交给子进程——前台程序（如 `cat`）
             // 有权读自己的 stdin，shell **不得**替它消费。
             loop {
-                // ---- 顺序铁律：**先查子进程死活，再探键盘** ----
+                // ---- 顺序：**先探键盘，再等子进程**（裁决甲后此顺序重新安全） ----
                 //
-                // 旧顺序是 `probe_interrupt(pid); waitpid_any_timeout(...)`，
-                // 而 `probe_interrupt` 内部的 `read(STDIN)` 在**无键可读时会
-                // 真阻塞**（内核按 §6.7 设计让交互 stdin 空读登记 `KBD_WAITER`
-                // 并挂起）。于是子进程被 `^C` 杀死后，下一轮循环刚进 `probe_interrupt`
-                // 就**永久挂住**——再也走不到 `waitpid`，提示符永不回来。
+                // 为何这个顺序曾经不安全：`probe_interrupt` 内部用的是**阻塞**
+                // `read`，交互 stdin 空读会让内核登记 `KBD_WAITER` 并把本进程
+                // 切走。于是「先探键」等于「先阻塞」——子进程被 `^C` 杀死后，
+                // shell 回到循环开头又立刻挂在探键上，**永远走不到 `waitpid`**。
+                // 实测症状：提示符永不回来，此后对任何按键毫无反应。
                 //
-                // 实测症状（真实 QEMU + 真实 PS/2 按键，本轮独立复现）：
-                // `^C` 确实杀掉了前台 `spinburn`（内核侧 `sys_kill target=8 sig=2`
-                // 有据），但 shell 之后**对任何按键再无反应**——连字符回显都没有。
-                // 原因就是这个「先探键」的阻塞读。
+                // 裁决甲（§6.12.5）之后 `probe_interrupt` 改用
+                // `libsys::read_nonblocking`：无键可读时内核**不登记等待者**，
+                // 如实返回 `WouldBlock`，本函数立刻返回。
+                // 故「探键」不再有任何阻塞可能，本顺序**重新成立且更自然**：
+                // 每次等待前先照看一次键盘，然后交给有界等待。
                 //
-                // 修法：**先**用零超时的有界等待查一次死活（非阻塞）；
-                //   * 子进程已结束 → 直接收尸/返回，**绝不**再碰键盘；
-                //   * 子进程仍在   → 此刻才短超时等待，醒来后探一次键盘。
-                // 这样「探键盘」只发生在**确实有前台子进程在跑**的时候，
-                // 与 `probe_interrupt` 的文档承诺（「非阻塞探键」）一致。
-                //
-                // 不为此新增系统调用：复用既有的有界等待动词，
-                // `PROBE_ALIVE_NS` 极短（说明见常量定义），效果就是「只看一眼、不久等」。
-                // **切不可传 0**：内核 `sys_task_wait` 以
-                // `timeout>0` 为有界等待的判据，传 0 会退化成
-                // **无界阻塞**——那正是本修正要消灭的行为。
-                match waitpid_any_timeout(PROBE_ALIVE_NS) {
+                // **不再需要**「先用极短超时查死活」那种绕法——那会在计时器
+                // 粒度上引入竞态（1ns 定时器立即到期），并让 `NotFound` 这种
+                // 瞬态结果被误当成「子进程已结束」而抛弃仍在运行的子进程。
+                // 现在只有一条等待路径、一种超时值，语义单一（S13）。
+                probe_interrupt(pid);
+                match waitpid_any_timeout(WAIT_SLICE_NS) {
                     Ok(wr) => break wr.code as u8,
                     Err(Error::WouldBlock) => {
-                        probe_interrupt(pid);
-                        match waitpid_any_timeout(WAIT_SLICE_NS) {
-                            Ok(wr) => break wr.code as u8,
-                            Err(Error::WouldBlock) => {
-                                let _ = yield_now();
-                                continue;
-                            }
-                            Err(Error::NotFound) => break 0,
-                            Err(e) => {
-                                out(b"boruix: wait failed: ");
-                                out(e.to_string().as_bytes());
-                                out(b"\n");
-                                break 126;
-                            }
-                        }
+                        // 真超时 / 内核拒绝阻塞：**都应重试**，
+                        // 回到循环开头再探一次键盘。
+                        let _ = yield_now();
+                        continue;
                     }
-                    Err(Error::NotFound) => break 0,
+                    // `NotFound` = 内核 `waitpid_inner` 报「无子进程可等」。
+                    //
+                    // **刻意与 `WouldBlock` 同等对待（重试）而非当成完成**——
+                    // 这是实测纠正的一个错误假设：`waitpid_any` 的 `NotFound`
+                    // 可能在子进程**仍在运行**时瞬态出现（实测：子进程
+                    // state 仍为 Running 的同时本分支被判为 `NotFound`）。把它当成
+                    // 「收工」会让 shell **抛弃仍在运行的前台子进程**直接回提示符，
+                    // 而子进程还在跑——提示符看似回来了，行为完全错乱。
+                    //
+                    // 正确做法：当作「此刻没收到」重试。真正的结束由
+                    // `Ok(wr)` 分支交付（它带真实退出码），那才是可靠信号。
+                    Err(Error::NotFound) => {
+                        let _ = yield_now();
+                        continue;
+                    }
                     Err(e) => {
                         out(b"boruix: wait failed: ");
                         out(e.to_string().as_bytes());
