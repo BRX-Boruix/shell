@@ -2675,6 +2675,18 @@ pub(crate) fn is_builtin(word: &[u8]) -> bool {
 /// 同时轮询频率不致过高而浪费 CPU（每片仅一次系统调用）。
 const WAIT_SLICE_NS: u64 = 10_000_000;
 
+/// 前台等待循环「只看一眼」的极短超时：用于先确认子进程是否还在跑。
+///
+/// # 为何不能传 0
+///
+/// 内核 `sys_task_wait` 以 `timeout>0` 作为「有界等待」的判据（见
+/// `kernel/src/syscall.rs` 的 `let bounded = target_pid != 0 && timeout_ns > 0`）。
+/// 传 0 会让它退化成**无界阻塞** `waitpid`——那正是本修正要消灭的
+/// 行为（子进程已死时会永久挂住）。故取 1 纳秒——它足够小到
+/// 实质等于「不等」，但又严格大于 0，故能走到内核的非阻塞
+/// **预收尸**路径（`waitpid_timeout` 的 `frame=None` 那一步）。
+const PROBE_ALIVE_NS: u64 = 1;
+
 /// 前台子进程运行中，shell 若只闷头 `waitpid_any()`，键盘就没有读者：
 /// 用户按的 `^C` 会**留在键盘队列里**，直到子进程自己结束、下一条命令
 /// 开始读行时才被取走——届时它会立刻中断**那一行**（表现为「Ctrl-C 延迟
@@ -2769,40 +2781,50 @@ fn exec_via_path(path: &[u8], arg: &[u8]) -> u8 {
             // 其余字节**原样留在队列里**交给子进程——前台程序（如 `cat`）
             // 有权读自己的 stdin，shell **不得**替它消费。
             loop {
-                // 非阻塞探键：拿到 0x03 就向**我们自己 spawn 的 child** 投递 SIGINT。
+                // ---- 顺序铁律：**先查子进程死活，再探键盘** ----
                 //
-                // **为何是 `pid`（exec_path 的返回值）而不是 `waitpid_any` 收到的**：
-                // `waitpid_any` 可能收尸到**无关孤儿**（见下方 `Ok(_)` 分支与
-                // `shell/src/commands.rs` 里 "reaped unrelated pid" 的记录），
-                // 故"杀掉我正在等的那个"语义不成立；`pid` 才是精确目标
-                // （ADR-046 §1.2 裁决依据）。
-                probe_interrupt(pid);
-                // §6.11 裁决 B：**有界**等待。
+                // 旧顺序是 `probe_interrupt(pid); waitpid_any_timeout(...)`，
+                // 而 `probe_interrupt` 内部的 `read(STDIN)` 在**无键可读时会
+                // 真阻塞**（内核按 §6.7 设计让交互 stdin 空读登记 `KBD_WAITER`
+                // 并挂起）。于是子进程被 `^C` 杀死后，下一轮循环刚进 `probe_interrupt`
+                // 就**永久挂住**——再也走不到 `waitpid`，提示符永不回来。
                 //
-                // 旧实现用 `waitpid_any()`（无界）——子进程运行期间它会**真阻塞**，
-                // 只在子进程**退出**时才被唤醒。于是这个 `loop` 实际上只转一圈，
-                // `probe_interrupt` 再也没机会跑——用户按下的 `^C` 进了键盘队列，
-                // 却**无人消费**直到子进程自己退出（实测：前台 `spinburn` 运行中
-                // Ctrl-C 完全无效。内核侧已确认 `0x03` 确实进了缓冲）。
+                // 实测症状（真实 QEMU + 真实 PS/2 按键，本轮独立复现）：
+                // `^C` 确实杀掉了前台 `spinburn`（内核侧 `sys_kill target=8 sig=2`
+                // 有据），但 shell 之后**对任何按键再无反应**——连字符回显都没有。
+                // 原因就是这个「先探键」的阻塞读。
                 //
-                // 改用有界形态后，每隔 `WAIT_SLICE_NS` 就**如实**拿到一次
-                // `WouldBlock`，于是能回到循环开头再探一次键盘。
+                // 修法：**先**用零超时的有界等待查一次死活（非阻塞）；
+                //   * 子进程已结束 → 直接收尸/返回，**绝不**再碰键盘；
+                //   * 子进程仍在   → 此刻才短超时等待，醒来后探一次键盘。
+                // 这样「探键盘」只发生在**确实有前台子进程在跑**的时候，
+                // 与 `probe_interrupt` 的文档承诺（「非阻塞探键」）一致。
                 //
-                // 超时值的选择：短到能让 `^C` 在人类可感知的延迟内生效，
-                // 长到不至于把 CPU 浪费在频繁轮询上（10ms，与调度 tick 同量级）。
-                match waitpid_any_timeout(WAIT_SLICE_NS) {
+                // 不为此新增系统调用：复用既有的有界等待动词，
+                // `PROBE_ALIVE_NS` 极短（说明见常量定义），效果就是「只看一眼、不久等」。
+                // **切不可传 0**：内核 `sys_task_wait` 以
+                // `timeout>0` 为有界等待的判据，传 0 会退化成
+                // **无界阻塞**——那正是本修正要消灭的行为。
+                match waitpid_any_timeout(PROBE_ALIVE_NS) {
                     Ok(wr) => break wr.code as u8,
                     Err(Error::WouldBlock) => {
-                        // 两种情形都走这里，且**都应重试**：
-                        //   ① 真超时——子进程仍在运行；
-                        //   ② 内核拒绝阻塞（本核无可切进程）。
-                        // 旧实现在这里 `yield_now()` 让出；但无论哪种情形，
-                        // 让出后都应回到循环开头**先探一次键盘**（不再
-                        // 盲目继续等）——故不再单独 `continue`，
-                        // 而是落到本分支末尾统一处理。
-                        let _ = yield_now();
-                        continue;
+                        probe_interrupt(pid);
+                        match waitpid_any_timeout(WAIT_SLICE_NS) {
+                            Ok(wr) => break wr.code as u8,
+                            Err(Error::WouldBlock) => {
+                                let _ = yield_now();
+                                continue;
+                            }
+                            Err(Error::NotFound) => break 0,
+                            Err(e) => {
+                                out(b"boruix: wait failed: ");
+                                out(e.to_string().as_bytes());
+                                out(b"\n");
+                                break 126;
+                            }
+                        }
                     }
+                    Err(Error::NotFound) => break 0,
                     Err(e) => {
                         out(b"boruix: wait failed: ");
                         out(e.to_string().as_bytes());
