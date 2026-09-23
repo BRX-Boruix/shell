@@ -227,7 +227,8 @@ use libsys::nr::{INFO_BOOT_MS, INFO_CPU_COUNT, INFO_VERSION};
 use libsys::{
     chdir, close, chmod, dup2, exec_path, getcwd, info, kill, mkdir, now, open, pipe_create, ps,
     read, read_dir, read_to_end, read_wall_clock, sleep, sync_create, sync_delete, sync_wake,
-    unlink, waitpid_any, write, yield_now, Error, OpenFlags, Permissions, PsEntry, STDIN, STDOUT,
+    unlink, waitpid_any, waitpid_any_timeout, write, yield_now, Error, OpenFlags, Permissions,
+    PsEntry, STDIN, STDOUT,
     power_off, reboot,
     driver_claim, driver_query, driver_register, driver_unregister,
 };
@@ -2668,6 +2669,12 @@ pub(crate) fn is_builtin(word: &[u8]) -> bool {
 ///
 /// # 为什么在前台等待里做这件事（L-4）
 ///
+/// 前台等待的**时间片**（§6.11 裁决 B）：有界 waitpid 每次最多等这么久。
+///
+/// 选 10ms 的理由：与调度 tick 同量级，因此 `^C` 的响应延迟在人类可感知范围内；
+/// 同时轮询频率不致过高而浪费 CPU（每片仅一次系统调用）。
+const WAIT_SLICE_NS: u64 = 10_000_000;
+
 /// 前台子进程运行中，shell 若只闷头 `waitpid_any()`，键盘就没有读者：
 /// 用户按的 `^C` 会**留在键盘队列里**，直到子进程自己结束、下一条命令
 /// 开始读行时才被取走——届时它会立刻中断**那一行**（表现为「Ctrl-C 延迟
@@ -2770,10 +2777,29 @@ fn exec_via_path(path: &[u8], arg: &[u8]) -> u8 {
                 // 故"杀掉我正在等的那个"语义不成立；`pid` 才是精确目标
                 // （ADR-046 §1.2 裁决依据）。
                 probe_interrupt(pid);
-                match waitpid_any() {
+                // §6.11 裁决 B：**有界**等待。
+                //
+                // 旧实现用 `waitpid_any()`（无界）——子进程运行期间它会**真阻塞**，
+                // 只在子进程**退出**时才被唤醒。于是这个 `loop` 实际上只转一圈，
+                // `probe_interrupt` 再也没机会跑——用户按下的 `^C` 进了键盘队列，
+                // 却**无人消费**直到子进程自己退出（实测：前台 `spinburn` 运行中
+                // Ctrl-C 完全无效。内核侧已确认 `0x03` 确实进了缓冲）。
+                //
+                // 改用有界形态后，每隔 `WAIT_SLICE_NS` 就**如实**拿到一次
+                // `WouldBlock`，于是能回到循环开头再探一次键盘。
+                //
+                // 超时值的选择：短到能让 `^C` 在人类可感知的延迟内生效，
+                // 长到不至于把 CPU 浪费在频繁轮询上（10ms，与调度 tick 同量级）。
+                match waitpid_any_timeout(WAIT_SLICE_NS) {
                     Ok(wr) => break wr.code as u8,
                     Err(Error::WouldBlock) => {
-                        // 无就绪者时先让出，避免在本核忙转饿死其它进程。
+                        // 两种情形都走这里，且**都应重试**：
+                        //   ① 真超时——子进程仍在运行；
+                        //   ② 内核拒绝阻塞（本核无可切进程）。
+                        // 旧实现在这里 `yield_now()` 让出；但无论哪种情形，
+                        // 让出后都应回到循环开头**先探一次键盘**（不再
+                        // 盲目继续等）——故不再单独 `continue`，
+                        // 而是落到本分支末尾统一处理。
                         let _ = yield_now();
                         continue;
                     }
