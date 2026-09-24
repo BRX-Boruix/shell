@@ -8,7 +8,7 @@
 pub(crate) const COMMANDS: &[&[u8]] = &[
     b"echo", b"help", b"now", b"time", b"uptime", b"version", b"uname", b"cpu", b"sleep",
     b"clear", b"env", b"export", b"unset", b"ps", b"kill", b"signal", b"alias", b"unalias",
-    b"which", b"jobs", b"ls", b"cat", b"mkdir", b"touch", b"rm", b"tree", b"jtree", b"cd",
+    b"which", b"jobs", b"jobout", b"ls", b"cat", b"mkdir", b"touch", b"rm", b"tree", b"jtree", b"cd",
     b"pwd", b"pipe", b"libccheck", b"poweroff", b"reboot", b"uiodemo", b"driver", b"selftest",
 ];
 
@@ -122,6 +122,14 @@ struct JobEntry {
 
 static JOBS: Mutex<Vec<JobEntry>> = Mutex::new(Vec::new());
 
+/// 预览下一个作业号（不登记）。供 `spawn_background` 在 `job_add` 之前
+/// 构造输出文件名用——文件名必须进命令行，而命令行先于登记执行。
+/// 单线程 REPL 串行调用保证「预览值 = 随后 `job_add` 的返回值」。
+pub(crate) fn next_job_index() -> usize {
+    let jobs = JOBS.lock();
+    jobs.len() + 1
+}
+
 /// 登记一个后台作业，返回作业号（1 基，供 `%n` 引用）。
 pub(crate) fn job_add(pid: u32, cmd: &[u8]) -> usize {
     let mut jobs = JOBS.lock();
@@ -155,6 +163,44 @@ fn job_remove(idx: usize) {
     if idx <= jobs.len() {
         jobs[idx - 1].active = false;
     }
+}
+
+/// `jobout <n>`：读第 n 个后台作业的输出文件并回显到前台（J-TOKEN-C）。
+///
+/// 这是「后台输出按策略处置」的**读回**通道：后台输出默认转存
+/// `/tmp/job<n>.out`（见 `main.rs::spawn_background`），本命令把它（或其
+/// 自 `--tail` 之前的全部内容）取回前台。文件不存在 = 作业尚无输出
+/// 或用户显式重定向到了别处——两种情况都如实回显空并返回 0（文件缺失
+/// 不算命令失败：作业刚 spawn 还没写属常态）。
+fn cmd_jobout(arg: &[u8]) -> u8 {
+    let arg = trim_bytes(arg);
+    let Some(n) = parse_u64(arg) else {
+        out(b"usage: jobout <job-number>\n");
+        return 2;
+    };
+    if n == 0 || job_pid(n as usize).is_none() {
+        out(b"jobout: no such job\n");
+        return 1;
+    }
+    let mut path: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    path.extend_from_slice(b"/tmp/job");
+    let mut nb = [0u8; 24];
+    path.extend_from_slice(u64_to_dec(n, &mut nb));
+    path.extend_from_slice(b".out");
+    // 打开失败（不存在）→ 空输出、成功返回：语义见上。
+    let path_str = match core::str::from_utf8(&path) { Ok(s) => s, Err(_) => return 1 };
+    let Ok(fd) = open(path_str, OpenFlags::READ_ONLY, Permissions::read_write()) else {
+        return 0;
+    };
+    let mut buf = [0u8; 512];
+    loop {
+        match libsys::read(fd, &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(k) => out(&buf[..k]),
+        }
+    }
+    let _ = libsys::close(fd);
+    0
 }
 
 /// `jobs`：列出全部后台作业及其存活状态。支持 `--json` 格式。返回 0。
@@ -260,6 +306,7 @@ fn cmd_help() -> u8 {
         (b"unalias", b"remove alias(es)"),
         (b"which", b"locate a builtin/alias command"),
         (b"jobs", b"list background jobs"),
+        (b"jobout", b"show background job output"),
         (b"ls", b"list directory contents (-a show hidden, -l long, --json)"),
         (b"cat", b"print file contents"),
         (b"mkdir", b"create a directory"),
@@ -1999,6 +2046,7 @@ fn run_builtin(name: &[u8], arg: &[u8]) -> u8 {
         b"unalias" => cmd_unalias(arg),
         b"which" => cmd_which(arg),
         b"jobs" => cmd_jobs(arg),
+        b"jobout" => cmd_jobout(arg),
         b"ls" => cmd_ls(arg),
         b"cat" => cmd_cat(arg),
         b"mkdir" => cmd_mkdir(arg),

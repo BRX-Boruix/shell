@@ -192,8 +192,67 @@ fn background_split(line: &[u8]) -> Option<&[u8]> {
     Some(&line[..k])
 }
 
+/// 后台作业输出文件目录（/scratch 的符号链接，启动期已确保存在）。
+const JOB_OUT_DIR: &[u8] = b"/tmp";
+
+/// 判断命令词序列里是否已含输出重定向操作符。
+///
+/// 有则**尊重显式重定向**——用户明确写了 `>`/`>>` 时，作业输出的处置策略
+/// 已经由用户决定，自动追加反而会**覆盖**用户的意图（后面的 `>` 会取代
+/// 前面的，内层 `split_redirects` 按「最后一条生效」之前的语义是全部生效、
+/// 但两条 stdout 重定向只有一条真正留在 fd 1 上）。
+fn has_stdout_redirect(cmd: &[u8]) -> bool {
+    // 逐词扫描太重（这里只有一条字节串）；够用的近似：找独立的 " > "/" >> " 
+    // 边界。为避免误伤文件名里的 `>`，检查空格包围的形态。
+    let mut i = 0usize;
+    while i + 1 < cmd.len() {
+        if cmd[i] == b' ' && (cmd[i + 1] == b'>') {
+            // " >" 或 " >>"（后跟空格或串尾）。
+            let after = cmd.get(i + 2);
+            match after {
+                None => return true, // "cmd >"（内层会报语法错，但策略上不再追加）
+                Some(b' ') => return true,
+                Some(_) => {}
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 fn spawn_background(cmd: &[u8]) {
-    match exec(PROG_SHELL, cmd) {
+    // ==== J-TOKEN-C（ADR-043 决策 2 / §2.1）：令牌移交的用户态策略 ====
+    //
+    // **策略**：后台作业**不持前台输出令牌**——其输出默认**转存文件**
+    // （`/tmp/job<N>.out`，截断式），前台交互输出保持无混杂。
+    // 用户显式写了 `>`/`>>` 时尊重用户的选择（见 [`has_stdout_redirect`]）。
+    //
+    // **为何这是用户态的事**（ADR-043 §2.1 成文约束）：处置通道是「文件」，
+    // 由 shell（用户态）分配与持有；内核 console 只照单直出，**不提供队列**，
+    // 本改动**零内核改动**。这与 `jobs` 表（用户态维护）同族。
+    //
+    // **移交语义**：前台子进程运行期间（`exec_via_path` 的等待循环）输出令牌
+    // 事实归它——shell 自己不写；后台作业从 spawn 起就被本策略**剥夺**直写
+    // console 的通道（fd 1 指向文件），其 `console_owner` 真值（fd1 节点）
+    // 因继承 shell 的 fd 表而仍是 shell 的 pid——该真值如实反映「令牌没给
+    // 后台」，策略与真值自洽。
+    let redirected: alloc::vec::Vec<u8> = if has_stdout_redirect(cmd) {
+        cmd.to_vec()
+    } else {
+        let mut v = cmd.to_vec();
+        v.extend_from_slice(b" > ");
+        v.extend_from_slice(JOB_OUT_DIR);
+        v.extend_from_slice(b"/job");
+        // 作业号在 job_add 之后才知道，但 exec 在前——先按「下一个槽位」预估。
+        // 竞态窗口（两次并发 spawn_background）在本 shell 的单线程 REPL 中
+        // 不存在：spawn_background 只从 repl_loop 串行调用。
+        let n = crate::commands::next_job_index();
+        let mut nb = [0u8; 24];
+        v.extend_from_slice(util::u64_to_dec(n as u64, &mut nb));
+        v.extend_from_slice(b".out");
+        v
+    };
+    match exec(PROG_SHELL, &redirected) {
         Ok(pid) => {
             let idx = job_add(pid as u32, cmd);
             let mut b = [0u8; 24];
@@ -203,6 +262,11 @@ fn spawn_background(cmd: &[u8]) {
             out(u64_to_dec(pid, &mut b));
             out(b" ");
             out(cmd);
+            if !has_stdout_redirect(cmd) {
+                out(b"  [output: /tmp/job");
+                out(u64_to_dec(idx as u64, &mut b));
+                out(b".out]");
+            }
             out(b"\n");
         }
         Err(_) => {
