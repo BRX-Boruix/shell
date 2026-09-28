@@ -14,13 +14,15 @@ execute that one command and exit. The system boot sequence uses this to run sel
 
 ## Line syntax
 
+- `A | B | C` — pipelines: the output of one stage feeds the input of the next; multiple stages are supported
+- `>` and `>>` — output redirection (truncate and append); `<` — input redirection
 - `&` — a trailing ampersand runs the line in the background; `jobs` and `jobout` show jobs and their output
-- `>` and `>>` — output redirection (truncate and append)
 - `"` — quotes protect the spaces inside them
-- `$VAR` — variable expansion
+- `$VAR` and `$?` — variable expansion and the exit status of the previous command
+- `#` — inline comments; from `#` to end of line is ignored
 
-**There is no `|` pipeline syntax.** The command named `pipe` is a demonstration program that creates
-a pipe itself and reads and writes it, verifying the pipe system calls — it is not shell syntax.
+The built-in command named `pipe` is a demonstration program: it creates a pipe itself and reads and
+writes it, verifying the pipe system calls directly.
 
 ## Built-in commands
 
@@ -37,15 +39,15 @@ Driver management: `install`, `load`, `list`, `status`, `driver`, `uiodemo`
 Built-in acceptance commands: `selftest`, `libccheck`, `acee2e`, `synce2e`, `trave2e`, `audioe2e` —
 these invoke the corresponding acceptance programs to confirm subsystems work on real hardware.
 
-External commands run by path: a command word containing `/` is handed to the system for loading
-via the VFS path — `/programs/xxx.elf` and `/volumes/.../3p/xxx.elf` on the data disk both work.
-Exit codes follow shell convention, with file-not-found and load-failure reported separately. See
+External commands run by path: a command word containing `/` is handed to the system for loading via
+the VFS path — `/programs/xxx.elf` and `/volumes/.../3p/xxx.elf` on the data disk both work. Exit codes
+follow shell convention, with file-not-found and load-failure reported separately. See
 [`coreutils`](https://github.com/BRX-Boruix/coreutils) for the standalone external commands.
 
 ## Known limitations
 
-- External commands run by path from `/programs` and the data disk; see [`coreutils`](https://github.com/BRX-Boruix/coreutils)
 - A word with no `/` that is not a built-in is treated as a built-in name and reported as unknown
+- Pipelines are sequential: each stage runs to completion before the next starts, not concurrently
 - No script files; interactive line-by-line input only
 
 ## Building
