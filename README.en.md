@@ -41,8 +41,8 @@ these invoke the corresponding acceptance programs to confirm subsystems work on
 
 External commands run by path: a command word containing `/` is handed to the system for loading via
 the VFS path — `/programs/xxx.elf` and `/volumes/.../3p/xxx.elf` on the data disk both work. Exit codes
-follow shell convention, with file-not-found and load-failure reported separately. See
-[`coreutils`](https://github.com/BRX-Boruix/coreutils) for the standalone external commands.
+follow shell convention, with file-not-found and load-failure reported separately. Standalone
+external commands are provided by [`coreutils`](https://github.com/BRX-Boruix/coreutils) (planned).
 
 ## Known limitations
 
@@ -79,7 +79,7 @@ shell/
 - [`init`](https://github.com/BRX-Boruix/init) — starts this program
 - [`login`](https://github.com/BRX-Boruix/login) — login authentication
 - [`libline`](https://github.com/BRX-Boruix/libline) — line editing, history, completion
-- [`coreutils`](https://github.com/BRX-Boruix/coreutils) — standalone external commands
+- [`coreutils`](https://github.com/BRX-Boruix/coreutils) — standalone external commands (planned)
 
 ## License
 

@@ -38,8 +38,8 @@ BORUIX 的用户 shell：命令行解释器，一个独立的用户态程序。
 验收程序，在真机上确认子系统工作正常。
 
 外部命令按路径执行：命令词含 `/` 时交给系统按 VFS 路径装载，`/programs/xxx.elf` 与数据盘上的
-`/volumes/.../3p/xxx.elf` 都可以；退出码沿用 shell 惯例，找不到文件与装载失败分开报告。见
-[`coreutils`](https://github.com/BRX-Boruix/coreutils) 提供的独立外部命令。
+`/volumes/.../3p/xxx.elf` 都可以；退出码沿用 shell 惯例，找不到文件与装载失败分开报告。
+独立的外部命令程序由 [`coreutils`](https://github.com/BRX-Boruix/coreutils) 提供（规划中）。
 
 ## 已知限制
 
@@ -76,7 +76,7 @@ shell/
 - [`init`](https://github.com/BRX-Boruix/init) —— 启动本程序
 - [`login`](https://github.com/BRX-Boruix/login) —— 登录认证
 - [`libline`](https://github.com/BRX-Boruix/libline) —— 行编辑、历史与补全
-- [`coreutils`](https://github.com/BRX-Boruix/coreutils) —— 独立的外部命令程序
+- [`coreutils`](https://github.com/BRX-Boruix/coreutils) —— 独立的外部命令程序（规划中）
 
 ## 许可
 
