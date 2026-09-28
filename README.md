@@ -1,97 +1,54 @@
 # shell
 
-BORUIX 的**用户 shell**——命令行解释器，一个独立的用户态程序。
+BORUIX 的用户 shell：命令行解释器，一个独立的用户态程序。
 
 [English](README.en.md)
 
-## 支持的命令
-
-### 文件与目录
-
-| 命令 | 说明 |
-| --- | --- |
-| `ls` | 列目录（支持 `--json` 输出） |
-| `cat` | 显示文件内容 |
-| `mkdir` | 建目录 |
-| `touch` | 建空文件 |
-| `rm` | 删除 |
-| `tree` | 树状列出目录 |
-| `cd` / `pwd` | 切换与显示当前目录 |
-
-### 环境与变量
-
-| 命令 | 说明 |
-| --- | --- |
-| `export` / `env` / `unset` | 设置、列出、删除环境变量 |
-| `alias` / `unalias` | 命令别名 |
-| `which` | 查询命令来源 |
-
-### 进程与作业
-
-| 命令 | 说明 |
-| --- | --- |
-| `ps` | 列出进程 |
-| `kill` / `signal` | 发送信号、列出信号 |
-| `jobs` / `jobout` | 查看后台作业及其输出 |
-| `pipe` | 演示管道：创建、写入、读出 |
-
-### 系统信息
-
-| 命令 | 说明 |
-| --- | --- |
-| `now` / `time` / `uptime` | 时间与运行时长 |
-| `version` / `uname` | 版本信息 |
-| `cpu` | CPU 信息 |
-| `sleep` | 等待 |
-| `clear` | 清屏 |
-| `poweroff` / `reboot` | 关机、重启（需权限） |
-| `help` | 命令列表 |
-
-### 驱动管理
-
-| 命令 | 说明 |
-| --- | --- |
-| `install` / `load` | 安装、加载驱动 |
-| `list` / `status` | 列出驱动、查询状态 |
-| `driver` / `uiodemo` | 驱动演示与调试 |
-
-### 内置验收命令
-
-这些命令直接调用对应的验收程序，用于在真机上确认各子系统工作正常：
-
-| 命令 | 对应程序 |
-| --- | --- |
-| `acee2e` | [`acee2e`](https://github.com/BRX-Boruix/acee2e) —— 访问控制 |
-| `synce2e` | [`synce2e`](https://github.com/BRX-Boruix/synce2e) —— 同步原语 |
-| `trave2e` | [`trave2e`](https://github.com/BRX-Boruix/trave2e) —— 权限降级 |
-| `audioe2e` | [`audioe2e`](https://github.com/BRX-Boruix/audioe2e) —— 音频 |
-| `libccheck` | [`libc`](https://github.com/BRX-Boruix/libc) —— C 库接口 |
-| `selftest` | [`selftest`](https://github.com/BRX-Boruix/selftest) —— 系统自检 |
-
-## 行语法
-
-| 语法 | 含义 |
-| --- | --- |
-| `&` | 后台运行（行尾） |
-| `>` / `>>` | 输出重定向 |
-| `"` | 引号，保护其中的空格 |
-| `$VAR` | 变量展开 |
-
-**不支持 `|` 管道语法。** 名为 `pipe` 的命令是一个演示程序，它自己创建管道并读写，用于验证管道
-系统调用，而不是 shell 的语法。
-
-## 行编辑
-
-输入行支持**历史记录**与 **Tab 补全**，由 [`libline`](https://github.com/BRX-Boruix/libline) 组件提供。
+由系统初始化进程启动，作为第二个用户进程运行；行编辑、历史与 Tab 补全由 [`libline`](https://github.com/BRX-Boruix/libline) 提供。
 
 ## 使用方法
 
-`init` 启动后自动运行，无需手动调用。也可以带命令行参数运行，直接执行一条命令后退出——系统
-初始化阶段用它执行自检。
+开机后自动运行，无需手动调用。也可以带命令行参数运行——直接执行一条命令后退出，系统初始化阶段
+用它执行自检。
 
-```
-$ echo hello
-hello
+## 行语法
+
+- `&`——行尾表示后台运行，`jobs` 与 `jobout` 查看作业与其输出
+- `>` 与 `>>`——输出重定向（覆盖与追加）
+`"`——引号保护其中的空格
+- `$VAR`——变量展开
+
+**不支持 `|` 管道语法。** 名为 `pipe` 的命令是一个演示程序，它自己创建管道并读写，用于验证管道
+系统调用，不是 shell 语法。
+
+## 内建命令
+
+文件与目录：`ls`（支持 `--json`）、`cat`、`mkdir`、`touch`、`rm`、`tree`、`jtree`、`cd`、`pwd`
+
+环境与变量：`export`、`env`、`unset`、`alias`、`unalias`、`which`
+
+进程与信号：`ps`、`kill`、`signal`、`jobs`、`jobout`、`pipe`、`tty`、`echo`、`sleep`、`clear`
+
+系统信息：`now`、`time`、`uptime`、`version`、`uname`、`cpu`、`help`、`poweroff`、`reboot`（需权限）
+
+驱动管理：`install`、`load`、`list`、`status`、`driver`、`uiodemo`
+
+内置验收命令：`selftest`、`libccheck`、`acee2e`、`synce2e`、`trave2e`、`audioe2e`——直接调用对应的
+验收程序，在真机上确认子系统工作正常。
+
+外部命令按路径执行：命令词含 `/` 时交给系统按 VFS 路径装载，`/programs/xxx.elf` 与数据盘上的
+`/volumes/.../3p/xxx.elf` 都可以；退出码沿用 shell 惯例，找不到文件与装载失败分开报告。见
+[`coreutils`](https://github.com/BRX-Boruix/coreutils) 提供的独立外部命令。
+
+## 已知限制
+
+- 不含 `/` 且不是内建的词按内建名处理，报「未知命令」
+- 没有脚本文件执行，只有交互式逐行输入
+
+## 构建
+
+```bash
+cargo build --release
 ```
 
 ## 文件结构
@@ -102,17 +59,15 @@ shell/
 ├── build.rs        # 注入链接脚本
 ├── linker.ld       # 用户态段布局
 └── src/
-    ├── main.rs     # 入口与 REPL 循环
+    ├── main.rs     # 入口与交互循环
     ├── commands.rs # 内建命令与分发
     ├── tokenize.rs # 引号感知分词与变量展开
     ├── env.rs      # 环境变量表
-    ├── json_tree.rs# JSON 树状渲染
+    ├── json_tree.rs # JSON 树状渲染
     ├── linehost.rs # 与行编辑组件的对接
     ├── libc_check.rs # C 库接口验收命令
     └── util.rs     # 输出与通用工具
 ```
-
-各模块依赖单向、无环。JSON 由 [`libsys`](https://github.com/BRX-Boruix/libsys) 解析，本程序只负责呈现。
 
 ## 相关项目
 
