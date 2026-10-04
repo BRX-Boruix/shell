@@ -1809,6 +1809,7 @@ fn with_redirects(redirs: &[Redirect], run: impl FnOnce() -> u8) -> Result<u8, (
                 append: true,
                 directory: false,
                 pipe: false,
+                cloexec: false,
             }
         } else {
             // 截断写：write + create + truncate（不存在则建，存在则清空）。
@@ -1820,6 +1821,7 @@ fn with_redirects(redirs: &[Redirect], run: impl FnOnce() -> u8) -> Result<u8, (
                 append: false,
                 directory: false,
                 pipe: false,
+                cloexec: false,
             }
         };
         let path = match core::str::from_utf8(&r.path) {
