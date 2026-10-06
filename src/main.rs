@@ -43,6 +43,9 @@ const STDIN: u64 = 0;
 /// shell 入口（libsys `_start` 调用）：输出横幅并进入 REPL 循环。
 #[unsafe(no_mangle)]
 pub extern "C" fn user_main(argc: isize, argv: *const *const u8) -> i32 {
+    // `PATH` 内置默认（仅当用户/环境未定义时写入一次）。必须在任何分发之前——
+    // `--run=` 的非交互路径同样要用 PATH 查找（如 `tcc hello.c -o hello`）。
+    crate::env::init_path_default();
     if argc >= 1 && !argv.is_null() {
         let cmd = unsafe { *argv };
         if !cmd.is_null() {

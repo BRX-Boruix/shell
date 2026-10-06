@@ -304,7 +304,7 @@ fn cmd_help() -> u8 {
         (b"signal", b"list available signals"),
         (b"alias", b"define or list aliases"),
         (b"unalias", b"remove alias(es)"),
-        (b"which", b"locate a builtin/alias command"),
+        (b"which", b"locate a builtin/alias/PATH command"),
         (b"jobs", b"list background jobs"),
         (b"jobout", b"show background job output"),
         (b"ls", b"list directory contents (-a show hidden, -l long, --json)"),
@@ -319,6 +319,18 @@ fn cmd_help() -> u8 {
         (b"pipe", b"self-test: create a pipe, write+read roundtrip"),
         (b"tty", b"report whether fd 0/1/2 are terminals (isatty)"),
     ];
+    // 列表与查找是**语法/查找**能力，不是内建命令，故单列说明（否则用户在
+    // help 里找不到 `&&` 与 `PATH` 的任何线索）。
+    out(b"lists:   A && B   run B only if A succeeded (exit 0)\n");
+    out(b"         A || B   run B only if A failed\n");
+    out(b"         A ; B    run B unconditionally\n");
+    out(b"lookup:  a word without '/' that is not a builtin is searched in $PATH\n");
+    out(b"         default PATH: ");
+    out(crate::env::DEFAULT_PATH);
+    out(b"\n");
+    out(b"         override with: export PATH=/dir1:/dir2\n");
+    out(b"         each entry is tried as NAME, then NAME.elf\n");
+    out(b"\n");
     out(b"boruix shell builtins:\n");
     for (c, d) in ITEMS {
         out(b"  ");
@@ -808,7 +820,10 @@ fn cmd_unalias(arg: &[u8]) -> u8 {
     0
 }
 
-/// `which NAME`：查找命令类型。
+/// `which NAME`：查找命令类型（别名 → 内建 → `PATH` 中的程序）。
+///
+/// `PATH` 命中时打印**解析出的完整路径**（POSIX `which` 的输出形态），
+/// 与真正执行共用 `path_candidate` 同一套规则——不重复实现查找。
 fn cmd_which(arg: &[u8]) -> u8 {
     let name = trim_bytes(arg);
     if name.is_empty() {
@@ -830,6 +845,12 @@ fn cmd_which(arg: &[u8]) -> u8 {
             out(b": shell built-in command\n");
             return 0;
         }
+    }
+    // `PATH` 查找：命中则打印**解析出的完整路径**。
+    if let Some(cand) = path_candidate(name) {
+        out(&cand);
+        out(b"\n");
+        return 0;
     }
     out(name);
     out(b": not found\n");
@@ -1898,6 +1919,81 @@ fn with_redirects(redirs: &[Redirect], run: impl FnOnce() -> u8) -> Result<u8, (
 }
 
 /// 执行一行输入。
+// ==================== 命令列表（`&&` / `||` / `;`）====================
+
+/// 命令列表分隔符（POSIX 的 AND-OR 列表与顺序列表）。
+///
+/// **必须是独立的词**（前后有空白）——与既有 `|` 完全同一纪律：`tokenize_line`
+/// 按空白切词，故 `a && b` 里的 `&&` 是独立的词，而 `a&&b` 是一个词、不会被当作
+/// 分隔符。这个选择顺带让**引号天然安全**：`echo "a;b"` 分词后是一个词
+/// `"a;b"`，不会被误切——若改为在原始行上找 `;`，就必须自己重做一遍引号处理。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ListSep {
+    /// 列表首项（无前驱分隔符）。
+    First,
+    /// `;`：无条件执行。
+    Always,
+    /// `&&`：仅当**前一项成功**（退出码 0）时执行。
+    OnSuccess,
+    /// `||`：仅当**前一项失败**（退出码非 0）时执行。
+    OnFailure,
+}
+
+/// 把一个词判为列表分隔符（纯函数，边界可穷举）。
+pub(crate) fn list_sep_of(word: &[u8]) -> Option<ListSep> {
+    match word {
+        b";" => Some(ListSep::Always),
+        b"&&" => Some(ListSep::OnSuccess),
+        b"||" => Some(ListSep::OnFailure),
+        _ => None,
+    }
+}
+
+/// 执行命令列表 `A && B ; C || D`（POSIX 短路语义）。
+///
+/// 返回**最后实际执行**的那一项的退出状态——被短路跳过的项不改变它。这正是
+/// POSIX「列表的退出状态 = 最后一条命令的状态」，也是 `&&`/`||` 能与 `$?` 互相
+/// 组合的基础（`a && b || c` 的常见写法依赖它）。
+///
+/// **空项如实报语法错误**（退出码 2）而不是静默跳过：`a && && b` 若被静默跳过，
+/// 用户会以为整行执行成功。唯一例外是**尾随 `;`**（`a ;` 合法，POSIX 允许）。
+fn exec_list(words: &[Vec<u8>]) -> u8 {
+    // 切段为 `(前导分隔符, 词区间)`。
+    let mut items: Vec<(ListSep, &[Vec<u8>])> = Vec::new();
+    let mut start = 0usize;
+    let mut sep = ListSep::First;
+    for (i, w) in words.iter().enumerate() {
+        if let Some(s) = list_sep_of(w) {
+            items.push((sep, &words[start..i]));
+            sep = s;
+            start = i + 1;
+        }
+    }
+    items.push((sep, &words[start..]));
+
+    let last = items.len().saturating_sub(1);
+    let mut status = 0u8;
+    for (i, (sep, seg)) in items.iter().enumerate() {
+        if seg.is_empty() {
+            // 尾随 `;`：POSIX 允许（`a ;` 等价 `a`）。
+            if i == last && *sep == ListSep::Always {
+                continue;
+            }
+            out(b"boruix: syntax error: empty command in list\n");
+            return 2;
+        }
+        let run = match sep {
+            ListSep::First | ListSep::Always => true,
+            ListSep::OnSuccess => status == 0,
+            ListSep::OnFailure => status != 0,
+        };
+        if run {
+            status = exec_words(seg);
+        }
+    }
+    status
+}
+
 pub(crate) fn exec_line(line: &[u8]) {
     let line = trim_bytes(line);
     if line.is_empty() || line.first() == Some(&b'#') {
@@ -1932,27 +2028,34 @@ pub(crate) fn exec_line(line: &[u8]) {
     if final_words.is_empty() {
         return;
     }
+    // 命令列表（`&&` / `||` / `;`）：先于管道切分——它们是**保留分隔符**，
+    // 不作为普通命令/参数（与既有 `|` 同一纪律）。
+    let status = exec_list(&final_words);
+    set_last_status(status);
+}
+
+/// 执行一条**已分词**的命令（单命令或管道），返回退出状态。
+///
+/// 从 `exec_line` 抽出：命令列表（`exec_list`）需要对每一项单独执行、并按退出码
+/// 决定是否短路，故「执行一项」必须是可独立调用的单元。
+fn exec_words(words: &[Vec<u8>]) -> u8 {
     // 管道 `|`：若存在独立的 `|` 词，按管道执行（pipe-features A3）。
     // 先于单命令分发——`|` 是保留分隔符，不作为普通命令/参数。
-    if final_words.iter().any(|w| w.as_slice() == b"|") {
-        let status = exec_pipeline(&final_words);
-        set_last_status(status);
-        return;
+    if words.iter().any(|w| w.as_slice() == b"|") {
+        return exec_pipeline(words);
     }
     // 单命令路径：先剥离重定向（> / >> / <），剩下的才是指令词。
-    let (clean_words, redirs) = match split_redirects(&final_words) {
+    let (clean_words, redirs) = match split_redirects(words) {
         Ok(v) => v,
         Err(()) => {
             out(b"boruix: malformed redirect\n");
-            set_last_status(1);
-            return;
+            return 1;
         }
     };
     if clean_words.is_empty() {
         // 只有重定向没有命令（如 > f）——无可执行指令，如实报错。
         out(b"boruix: missing command before redirect\n");
-        set_last_status(1);
-        return;
+        return 1;
     }
     let name = clean_words[0].as_slice();
 
@@ -1965,19 +2068,16 @@ pub(crate) fn exec_line(line: &[u8]) {
     }
     let arg = argbuf.as_slice();
 
-    // 路径执行：首词含 `/` 即按 VFS 路径装载，否则按内建命令名分发。
-    //
-    // **内建名优先**：即使某个内建名里含斜杠（当前没有），也仍走内建，
-    // 使规则不依赖「内建名恰好都不含斜杠」这一巧合。
-    let status = if redirs.is_empty() {
+    // 分发：内建名优先；含 `/` 走 VFS 路径装载；其余按 `PATH` 查找
+    // （判据集中在 `run_command` 一处）。
+    if redirs.is_empty() {
         run_command(name, arg)
     } else {
         match with_redirects(&redirs, || run_command(name, arg)) {
             Ok(s) => s,
             Err(()) => 1, // open/dup2 失败已报错
         }
-    };
-    set_last_status(status);
+    }
 }
 
 /// 分发单条命令：内建名走内建，含 `/` 的走 VFS 路径装载。
@@ -2013,13 +2113,35 @@ fn cmd_tty() -> u8 {
     0
 }
 
+/// 分发单条命令：**内建名 → 内建；含 `/` → VFS 路径装载；其余 → `PATH` 查找**。
+///
+/// 供 `exec_words` 与管道各段共用，故管道里也能写 `/programs/xxx.elf`。
+///
+/// 退出码约定沿用 shell 惯例（与 `run_builtin` 的 127 一致）：
+///   * 127 —— 命令未找到（未知内建名，且 `PATH` 各目录都没有）；
+///   * 126 —— 找到了但无法执行（不存在 / 非 ELF / 权限不足 / 是目录）。
+///
+/// **`PATH` 查找为什么放在这里而不是 `classify_command` 里**：`classify_command`
+/// 只回答「这个词看起来像路径还是像名字」这一**纯语法**问题（可穷举）；「名字该
+/// 去哪里找」依赖运行期的 `PATH` 变量，属**策略**，故留在分发层。
 fn run_command(name: &[u8], arg: &[u8]) -> u8 {
-    match classify_command(name) {
-        Dispatch::Empty => 0,
-        // 内建名优先，避免「内建名恰好含斜杠」时被路径规则遮蔽。
-        Dispatch::Path if !is_builtin(name) => exec_via_path(name, arg),
-        Dispatch::Builtin | Dispatch::Path => run_builtin(name, arg),
+    if name.is_empty() {
+        return 0;
     }
+    // 内建名优先，避免「内建名恰好含斜杠」时被路径规则遮蔽（既有纪律）。
+    if is_builtin(name) {
+        return run_builtin(name, arg);
+    }
+    // 含 `/` 的词交给内核解析（相对路径也走这里：内核会与 cwd 拼接）。
+    if classify_command(name) == Dispatch::Path {
+        return exec_via_path(name, arg);
+    }
+    // 既非内建、又不含 `/` → 按 `PATH` 逐目录查找（POSIX 语义）。
+    //
+    // 修复前这里直接落到 `run_builtin` 的 unknown command 分支（127），于是
+    // 「按名字调用一个不在内建表里的程序」在 shell 里**根本不可能**——
+    // 3P6-1 的 `tcc hello.c -o hello` 正是卡在这一条。
+    exec_via_search_path(name, arg)
 }
 
 /// 分发单条内建命令（`name` = 命令名，`arg` = 空格连接的剩余参数）。供
@@ -2776,6 +2898,107 @@ fn probe_interrupt(child: u64) {
         }
         _ => {}
     }
+}
+
+// ==================== `PATH` 查找 ====================
+
+/// 当前 `PATH` 的目录列表（`:` 分隔；空项忽略）。
+///
+/// 取值顺序：用户 `export PATH=...`（或环境带入）优先，否则内置默认
+/// （见 `env::DEFAULT_PATH`，由 `env::init_path_default` 在 shell 启动时写入）。
+///
+/// `PATH` 被 `unset` 时返回**空列表**——**不偷偷恢复默认值**：POSIX 下未设
+/// PATH 就是「没有可搜索目录，只有内建可用」，如实报错（见 `exec_via_search_path`）。
+pub(crate) fn path_dirs() -> Vec<Vec<u8>> {
+    let raw = match crate::env::env_get(b"PATH") {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let mut dirs = Vec::new();
+    for part in raw.split(|&c| c == b':') {
+        let part = trim_bytes(part);
+        if !part.is_empty() {
+            dirs.push(part.to_vec());
+        }
+    }
+    dirs
+}
+
+/// `PATH` 里**第一个存在且不是目录**的候选路径。
+///
+/// **单点**：`which`（打印解析结果）与真正执行（`exec_via_search_path`）共用同一套
+/// 解析规则——两处各写一份必然分叉（S13：同一个判断只允许一个真相来源）。
+///
+/// **两级尝试 `name` → `name.elf`**：BORUIX 的可执行文件统一带 `.elf`
+/// （`ls` 正是用它作为「可执行」标记，见 `cmd_ls` 的文档），而 POSIX 习惯不带
+/// 扩展名。用户敲 `tcc` 与敲 `tcc.elf` 应当命中同一个文件——3P6-1 的验收原文
+/// 就是 `tcc hello.c -o hello`（不带扩展名）。**顺序固定为精确名优先**，
+/// 故 `.elf` 只是后备，不会遮蔽同名的精确文件；名字本身已以 `.elf` 结尾时
+/// 不再追加（省一次无意义的 stat）。
+///
+/// **跳过目录**：POSIX 的 PATH 查找只接受普通文件，同名目录不应遮蔽后面的真程序
+/// （`node_type` 判据来自 `libsys::StatInfo::TYPE_DIR`，不手写魔数）。
+/// 非 UTF-8 的 PATH 项同样跳过（它不可能是可执行路径），但**不改写成别的路径**
+/// ——那会把一次失败伪装成成功（S09）。
+///
+/// **为什么这里可以探测文件是否存在**（`classify_command` 的文档曾明确反对探测）：
+/// 那条纪律针对的是**每个未知命令名**（含所有手误输入）——为它探测会给每次打错
+/// 多加一次 VFS 查询且无收益。这里是**已经确定要查找**的 PATH 候选（目录数 ≤ 几），
+/// 探测只用于**选择交给谁执行**，能否执行仍由内核装载时判定；残余 TOCTOU 窗口的
+/// 后果有限：探测到存在而执行时消失 → `exec` 如实报 ENOENT。
+fn path_candidate(name: &[u8]) -> Option<Vec<u8>> {
+    // 精确名优先；名字本身不以 `.elf` 结尾时再试一次 `name.elf`。
+    let rounds = if name.ends_with(b".elf") { 1 } else { 2 };
+    for dir in path_dirs() {
+        for k in 0..rounds {
+            let mut cand: Vec<u8> = Vec::with_capacity(dir.len() + 1 + name.len() + 4);
+            cand.extend_from_slice(&dir);
+            cand.push(b'/');
+            cand.extend_from_slice(name);
+            if k == 1 {
+                cand.extend_from_slice(b".elf");
+            }
+            let Ok(cand_str) = core::str::from_utf8(&cand) else {
+                continue;
+            };
+            match libsys::stat(cand_str) {
+                // 目录不遮蔽后续候选（POSIX：PATH 查找只接受普通文件）。
+                Ok(info) if info.node_type == libsys::StatInfo::TYPE_DIR => continue,
+                Ok(_) => return Some(cand),
+                Err(_) => continue,
+            }
+        }
+    }
+    None
+}
+
+/// 按 `PATH` 逐目录查找 `name` 并执行（POSIX 语义）。
+///
+/// 全部候选都不存在 → 127，并**如实列出搜索过的目录**——「PATH 没配对」与
+/// 「程序真的不存在」必须可区分（批次六 R2：失败原因必须区分）。`PATH` 未设时
+/// 单独给一句话说明「只有内建可用」，而不是让用户对着 not found 猜。
+fn exec_via_search_path(name: &[u8], arg: &[u8]) -> u8 {
+    if path_dirs().is_empty() {
+        out(b"boruix: command not found: ");
+        out(name);
+        out(b" (PATH is unset or empty; only built-ins are available)\n");
+        return 127;
+    }
+    if let Some(cand) = path_candidate(name) {
+        // 交给既有路径执行器：它负责三类失败的区分报告与前台等待。
+        return exec_via_path(&cand, arg);
+    }
+    out(b"boruix: command not found: ");
+    out(name);
+    out(b" (searched: ");
+    for (i, d) in path_dirs().iter().enumerate() {
+        if i > 0 {
+            out(b":");
+        }
+        out(d);
+    }
+    out(b")\n");
+    127
 }
 
 /// 执行一个 VFS 路径指向的程序，如实报告三类不同的失败。
