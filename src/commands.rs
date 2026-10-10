@@ -10,6 +10,7 @@ pub(crate) const COMMANDS: &[&[u8]] = &[
     b"clear", b"env", b"export", b"unset", b"ps", b"kill", b"signal", b"alias", b"unalias",
     b"which", b"jobs", b"jobout", b"ls", b"cat", b"mkdir", b"touch", b"rm", b"tree", b"jtree", b"cd",
     b"pwd", b"pipe", b"libccheck", b"poweroff", b"reboot", b"uiodemo", b"driver", b"selftest",
+    b"source", b".",
 ];
 
 /// 返回内建命令名列表（供补全遍历）。
@@ -109,7 +110,7 @@ pub(crate) fn for_each_alias<F: FnMut(&[u8], &[u8])>(mut f: F) {
     }
 }
 
-use crate::env::{cmd_env, cmd_export, env_unset, set_last_status};
+use crate::env::{cmd_env, cmd_export, env_unset, last_status, set_last_status};
 use crate::tokenize::tokenize_line;
 use crate::util::{out, outln, pad2, parse_u64, string_content, trim_bytes, u64_to_dec, unescape};
 
@@ -318,6 +319,7 @@ fn cmd_help() -> u8 {
         (b"pwd", b"print the working directory"),
         (b"pipe", b"self-test: create a pipe, write+read roundtrip"),
         (b"tty", b"report whether fd 0/1/2 are terminals (isatty)"),
+    (b"source", b"run a script file line by line (also spelled: . <file>)"),
     ];
     // 列表与查找是**语法/查找**能力，不是内建命令，故单列说明（否则用户在
     // help 里找不到 `&&` 与 `PATH` 的任何线索）。
@@ -473,6 +475,67 @@ fn cmd_sleep(arg: &[u8]) -> u8 {
 }
 /// `poweroff`：请求 ACPI 软关机（S5）。成功后机器断电，永不返回；
 /// 电源管理不可用时打印错误并返回 1。
+/// 脚本嵌套深度上限（防 `a` source `b` source `a` 的无限递归）。
+const SOURCE_MAX_DEPTH: usize = 8;
+static SOURCE_DEPTH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// `source <file>` / `. <file>`：在**当前 shell 内**逐行执行脚本文件。
+///
+/// ## 为什么需要（清单第 15 项，不是"看起来该有"）
+///
+/// `tools/3psrc/<pkg>/BUILD` 是「逐行命令」清单；此前 shell 没有脚本解释器，
+/// 机内只能一条一条手敲。有了它，`source BUILD` 一条命令即可跑完一个源码包的构建配方。
+///
+/// ## 语义（与 POSIX 的 `.` 一致）
+///
+/// 在**当前 shell 进程内**执行（不是子进程），故脚本里的 `cd` 对后续行**可见**——
+/// 这正是 `BUILD` 需要的语义（配方靠 `cd` 切目录）。脚本的每一行走与交互输入
+/// **同一条** `exec_line` 通路（S15 单点：脚本与交互不分叉）。
+///
+/// ## 诚实边界（S09）
+///
+/// - **不做 `$变量` 展开，也没有 `if`/`for`**——本 shell 没有这些语言特性；
+///   脚本 = 若干行普通 shell 命令 + `#` 注释，**不假装是完整脚本语言**。
+/// - 空行与 `#` 开头的行跳过；行尾注释由 `exec_line` 的 `strip_comment` 处理。
+/// - **嵌套深度上限**：`source` 递归超过 8 层如实报错并返回非 0（不静默截断）。
+/// - 退出码 = 最后一行命令的退出码（POSIX `.` 的语义）。
+fn cmd_source(arg: &[u8]) -> u8 {
+    use core::sync::atomic::Ordering;
+    let raw = trim_bytes(arg);
+    let path = match core::str::from_utf8(raw) {
+        Ok(p) if !p.is_empty() => p,
+        _ => {
+            out(b"source: usage: source <file>\n");
+            return 2;
+        }
+    };
+    let bytes = match read_to_end(path) {
+        Ok(b) => b,
+        Err(e) => {
+            out(b"source: ");
+            out(raw);
+            out(b": ");
+            out(file_error_text(e));
+            out(b"\n");
+            return 1;
+        }
+    };
+    if SOURCE_DEPTH.fetch_add(1, Ordering::SeqCst) >= SOURCE_MAX_DEPTH {
+        SOURCE_DEPTH.fetch_sub(1, Ordering::SeqCst);
+        out(b"source: nesting too deep (recursive source?)\n");
+        return 1;
+    }
+    for line in bytes.split(|&c| c == b'\n') {
+        let line = trim_bytes(line);
+        if line.is_empty() || line.first() == Some(&b'#') {
+            continue;
+        }
+        exec_line(line);
+    }
+    SOURCE_DEPTH.fetch_sub(1, Ordering::SeqCst);
+    last_status()
+}
+
 fn cmd_poweroff(arg: &[u8]) -> u8 {
     if !trim_bytes(arg).is_empty() {
         out(b"poweroff: usage: poweroff (no args)\n");
@@ -2272,6 +2335,7 @@ fn run_builtin(name: &[u8], arg: &[u8]) -> u8 {
         b"trave2e" => cmd_trave2e(),
         b"audioe2e" => cmd_audioe2e(),
         b"libccheck" => crate::libc_check::cmd_libccheck(arg),
+        b"source" | b"." => cmd_source(arg),
         b"poweroff" => cmd_poweroff(arg),
         b"reboot" => cmd_reboot(arg),
         b"uiodemo" => cmd_uiodemo(arg),
