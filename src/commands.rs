@@ -1595,29 +1595,43 @@ fn cmd_mkdir(arg: &[u8]) -> u8 {    let a = trim_bytes(arg);
     }
 }
 
-/// `touch <file>`：创建空文件。
+/// `touch <file>...`：创建空文件。
+///
+/// **支持多个操作数**（POSIX `touch file...`）。修复前它把整段余下文本当成**一个**路径：
+/// `touch a b c` 会报 `touch: cannot touch 'a b c'` 且一个文件都不建。
+/// 机内最小复现（`tools/diskfiles/3p/dircount.c`）：
+/// `touch a1 b1 c1` 之后目录里是 **0** 个文件（期望 3）。
+///
+/// **部分失败如实报告**：逐个操作数处理，任一个失败就打印它自己的错误并把退出码置 1，
+/// **已经建成的照旧保留**——不因为后面一个失败就回滚前面的（POSIX 语义），也不静默吞掉失败。
 fn cmd_touch(arg: &[u8]) -> u8 {
-    let a = trim_bytes(arg);
-    if a.is_empty() {
+    let words = split_words(arg);
+    if words.is_empty() {
         out(b"touch: missing file operand\n");
         return 1;
     }
-    let path = match core::str::from_utf8(a) {
-        Ok(p) => p,
-        Err(_) => return 1,
-    };
-    match open(path, OpenFlags::CREATE_OR_TRUNCATE, Permissions::all()) {
-        Ok(fd) => {
-            let _ = close(fd);
-            0
-        }
-        Err(_) => {
-            out(b"touch: cannot touch '");
-            out(a);
-            out(b"'\n");
-            1
+    let mut rc = 0u8;
+    for w in &words {
+        let path = match core::str::from_utf8(w.as_slice()) {
+            Ok(p) => p,
+            Err(_) => {
+                rc = 1;
+                continue;
+            }
+        };
+        match open(path, OpenFlags::CREATE_OR_TRUNCATE, Permissions::all()) {
+            Ok(fd) => {
+                let _ = close(fd);
+            }
+            Err(_) => {
+                out(b"touch: cannot touch '");
+                out(w);
+                out(b"'\n");
+                rc = 1;
+            }
         }
     }
+    rc
 }
 
 /// `rm <file_or_dir>`：删除文件或空目录。
