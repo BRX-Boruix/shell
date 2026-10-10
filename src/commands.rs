@@ -859,6 +859,101 @@ fn cmd_which(arg: &[u8]) -> u8 {
 
 // ==================== M6.5 文件系统内建命令 ====================
 
+/// 条目徽标 / 颜色 / 尾标——`ls` 显示规则的**单点**。
+///
+/// 目录模式与「路径是文件」模式共用同一套判据，避免两条显示路径各写一份而在
+/// 后续改动里漂移（S15）。`node_type` 用内核 dirent JSON 的同一套标签。
+fn entry_badge(name: &str, node_type: &str) -> (&'static str, &'static [u8], &'static str) {
+    match node_type {
+        "dir" | "Directory" => ("<DIR>   ", b"\x1b[1;34m", "/"),
+        "link" | "Symlink" => ("<LNK>   ", b"\x1b[1;36m", "@"),
+        "chardev" | "blkdev" | "Device" => ("<DEV>   ", b"\x1b[1;33m", "%"),
+        _ => {
+            if name.ends_with(".elf") {
+                ("<BIN>   ", b"\x1b[1;32m", "*")
+            } else {
+                ("<FILE>  ", b"\x1b[0m", "")
+            }
+        }
+    }
+}
+
+/// `StatInfo` 的数字类型标签 → 内核 dirent JSON 的同一套字符串标签。
+///
+/// 单文件路径只有 `stat`（数字标签），要复用 [`entry_badge`] 的判据就必须先
+/// 换算到同一词汇表——换算表在此**单点**定义。
+fn dirent_type_name(tag: u32) -> &'static str {
+    match tag {
+        libsys::StatInfo::TYPE_DIR => "dir",
+        libsys::StatInfo::TYPE_SYMLINK => "link",
+        libsys::StatInfo::TYPE_CHARDEV => "chardev",
+        libsys::StatInfo::TYPE_BLKDEV => "blkdev",
+        libsys::StatInfo::TYPE_FIFO => "fifo",
+        libsys::StatInfo::TYPE_SOCKET => "sock",
+        _ => "file",
+    }
+}
+
+/// 路径的 basename（`ls <文件>` 显示用）。仅斜杠/空串的退化输入如实回退原串。
+fn path_basename(path: &str) -> &str {
+    let t = path.trim_end_matches('/');
+    if t.is_empty() {
+        return path;
+    }
+    match t.rfind('/') {
+        Some(i) => &t[i + 1..],
+        None => t,
+    }
+}
+
+/// `ls <路径>` 且该路径**不是目录**时的输出（POSIX：列出条目本身）。
+///
+/// 三种模式（普通 / `-l` / `--json`）与目录模式逐项同构，徽标走同一
+/// [`entry_badge`]。
+fn ls_single_entry(path: &str, st: libsys::StatInfo, long_mode: bool, json_mode: bool) -> u8 {
+    let name = path_basename(path);
+    let (badge, color, indicator) = entry_badge(name, dirent_type_name(st.node_type));
+    if json_mode {
+        use libsys::json::{JsonWriter, VecTarget};
+        let mut target = VecTarget::new();
+        let mut writer = JsonWriter::new(&mut target);
+        if let Ok(mut arr) = writer.start_array() {
+            let _ = arr.push_object(|obj| {
+                let _ = obj.field_str("name", name);
+                let _ = obj.field_str("type", dirent_type_name(st.node_type));
+                let _ = obj.field_u64("size", st.size);
+                Ok(())
+            });
+            let _ = arr.end();
+        }
+        let mut b = target.into_bytes();
+        b.push(b'\n');
+        out(&b);
+        return 0;
+    }
+    if long_mode {
+        out(b"TYPE        SIZE   NAME\n");
+        out(badge.as_bytes());
+        let mut buf = [0u8; 24];
+        let digits = u64_to_dec(st.size, &mut buf);
+        for _ in 0..8usize.saturating_sub(digits.len()) {
+            out(b" ");
+        }
+        out(digits);
+        out(b"   ");
+        out(color);
+        out(name.as_bytes());
+        out(indicator.as_bytes());
+        out(b"\x1b[0m\n");
+    } else {
+        out(color);
+        out(name.as_bytes());
+        out(indicator.as_bytes());
+        out(b"\x1b[0m\n");
+    }
+    0
+}
+
 /// `ls [-l] [--json] [path]`：列出目录项（带颜色高亮与类型区分标识）。
 ///
 /// 特殊显示规则：
@@ -928,18 +1023,8 @@ fn cmd_ls(arg: &[u8]) -> u8 {
                     if !show(&entry.name) {
                         continue;
                     }
-                    let (type_badge, color, indicator): (&str, &[u8], &str) = match entry.node_type.as_str() {
-                        "dir" | "Directory" => ("<DIR>   ", b"\x1b[1;34m", "/"),
-                        "link" | "Symlink" => ("<LNK>   ", b"\x1b[1;36m", "@"),
-                        "chardev" | "blkdev" | "Device" => ("<DEV>   ", b"\x1b[1;33m", "%"),
-                        _ => {
-                            if entry.name.ends_with(".elf") {
-                                ("<BIN>   ", b"\x1b[1;32m", "*")
-                            } else {
-                                ("<FILE>  ", b"\x1b[0m", "")
-                            }
-                        }
-                    };
+                    let (type_badge, color, indicator) =
+                        entry_badge(&entry.name, entry.node_type.as_str());
                     out(type_badge.as_bytes());
                     let size_bytes = u64_to_dec(entry.size, &mut b);
                     let pad = 8usize.saturating_sub(size_bytes.len());
@@ -959,18 +1044,8 @@ fn cmd_ls(arg: &[u8]) -> u8 {
                     if !show(&entry.name) {
                         continue;
                     }
-                    let (color, indicator): (&[u8], &str) = match entry.node_type.as_str() {
-                        "dir" | "Directory" => (b"\x1b[1;34m", "/"),
-                        "link" | "Symlink" => (b"\x1b[1;36m", "@"),
-                        "chardev" | "blkdev" | "Device" => (b"\x1b[1;33m", "%"),
-                        _ => {
-                            if entry.name.ends_with(".elf") {
-                                (b"\x1b[1;32m", "*")
-                            } else {
-                                (b"\x1b[0m", "")
-                            }
-                        }
-                    };
+                    let (_, color, indicator) =
+                        entry_badge(&entry.name, entry.node_type.as_str());
                     out(color);
                     out(entry.name.as_bytes());
                     out(indicator.as_bytes());
@@ -981,6 +1056,14 @@ fn cmd_ls(arg: &[u8]) -> u8 {
             0
         }
         Err(e) => {
+            // POSIX：`ls <文件>` 必须列出**该条目本身**，不是报错。内核在非目录
+            // 路径上对 read_dir 如实返回 NotDirectory（ENOTDIR）——那不是「访问
+            // 失败」，而是「这条路径该走 stat」。此前无条件报错，于是
+            // `ls -l <相对文件>` 打出 ENOTDIR 而 `cat <同一文件>` 正常（同一个
+            // 路径、两种结论），把使用者引向「文件坏了」的错误方向。
+            if let Ok(st) = libsys::stat(&path) {
+                return ls_single_entry(&path, st, long_mode, json_mode);
+            }
             print_file_error(b"ls: cannot access '", path.as_bytes(), e);
             1
         }
