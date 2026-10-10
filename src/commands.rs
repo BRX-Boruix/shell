@@ -1134,9 +1134,21 @@ fn cmd_ls(arg: &[u8]) -> u8 {
 }
 
 /// `cat [path]`：打印文件内容；无路径时读 stdin（支持管道右段 `A | cat`）。
+/// `cat [file...]`：把文件内容写到 stdout；**无操作数时读 stdin**。
+///
+/// **支持多个操作数**（POSIX `cat file...`）：按顺序连接。修复前它把整段余下文本当成
+/// **一个**路径（`cat c1 c2` 报 `cat: c1 c2: No such file or directory`）。
+/// **部分失败如实报告**：逐个文件处理，任一失败就打印它自己的错误并把退出码置 1；
+/// 已输出的内容**保留**（不回滚）。
+///
+/// **末尾补换行**（沿用既有约定，便于控制台显示）：
+/// - 有内容输出：最后不是换行就补一个；**多文件只在整段末尾补一次**，
+///   文件之间**不插任何字节**——否则 `cat` 就不再忠实连接（POSIX 的 `cat` 不做这件事）；
+/// - 所有操作数都是空文件：沿用既有行为补一个空行（`cat empty` 原本如此）；
+/// - 一个操作数都没成功：不补（错误行自带换行，不再多加一个空行）。
 fn cmd_cat(arg: &[u8]) -> u8 {
-    let a = trim_bytes(arg);
-    if a.is_empty() {
+    let words = split_words(arg);
+    if words.is_empty() {
         // 无路径：从 stdin（fd 0）读到 EOF，直接转发到 stdout。
         // 管道右段 `echo hi | cat` 走此路径（pipe-features A3）。
         return match read_stdin_all(&mut |chunk: &[u8]| out(chunk)) {
@@ -1147,30 +1159,46 @@ fn cmd_cat(arg: &[u8]) -> u8 {
             }
         };
     }
-    let path = match core::str::from_utf8(a) {
-        Ok(p) => p,
-        Err(_) => return 1,
-    };
-    match read_to_end(path) {
-        Ok(bytes) => {
-            out(&bytes);
-            if !bytes.ends_with(b"\n") {
-                out(b"\n");
+    let mut rc = 0u8;
+    let mut last_byte: Option<u8> = None;
+    let mut saw_bytes = false;
+    for w in &words {
+        let path = match core::str::from_utf8(w.as_slice()) {
+            Ok(p) => p,
+            Err(_) => {
+                rc = 1;
+                continue;
             }
-            0
-        }
-        Err(e) => {
-            out(b"cat: ");
-            out(a);
-            out(b": ");
-            out(file_error_text(e));
-            let mut b = [0u8; 24];
-            out(b" (errno ");
-            out(u64_to_dec(e.to_errno() as u64, &mut b));
-            out(b")\n");
-            1
+        };
+        match read_to_end(path) {
+            Ok(bytes) => {
+                if let Some(&b) = bytes.last() {
+                    last_byte = Some(b);
+                    saw_bytes = true;
+                }
+                out(&bytes);
+            }
+            Err(e) => {
+                out(b"cat: ");
+                out(w);
+                out(b": ");
+                out(file_error_text(e));
+                let mut b = [0u8; 24];
+                out(b" (errno ");
+                out(u64_to_dec(e.to_errno() as u64, &mut b));
+                out(b")\n");
+                rc = 1;
+            }
         }
     }
+    if saw_bytes {
+        if last_byte != Some(b'\n') {
+            out(b"\n");
+        }
+    } else if rc == 0 {
+        out(b"\n");
+    }
+    rc
 }
 
 /// `pipe`：管道自检（pipe-features.md 第 1 层验收）。创建一对匿名管道端，
@@ -1574,25 +1602,36 @@ fn cmd_audioe2e() -> u8 {
     0
 }
 
-/// `mkdir <dir>`：创建目录。
-fn cmd_mkdir(arg: &[u8]) -> u8 {    let a = trim_bytes(arg);
-    if a.is_empty() {
+/// `mkdir <dir>...`：创建目录。
+///
+/// **支持多个操作数**（POSIX `mkdir dir...`）。修复前它把整段余下文本当成**一个**路径：
+/// `mkdir d1 d2 d3` 只建一个名叫 `d1 d2 d3`（含空格）的目录，且**返回 0**。
+/// 与 `cmd_touch` 是同一处缺陷形状（见该函数的说明）。
+/// **部分失败如实报告**：逐个操作数处理，任一失败就打印它自己的错误并把退出码置 1；
+/// 已建成的**保留**（POSIX 语义），不回滚。
+fn cmd_mkdir(arg: &[u8]) -> u8 {
+    let words = split_words(arg);
+    if words.is_empty() {
         out(b"mkdir: missing operand\n");
         return 1;
     }
-    let path = match core::str::from_utf8(a) {
-        Ok(p) => p,
-        Err(_) => return 1,
-    };
-    match mkdir(path, Permissions::all()) {
-        Ok(_) => 0,
-        Err(_) => {
+    let mut rc = 0u8;
+    for w in &words {
+        let path = match core::str::from_utf8(w.as_slice()) {
+            Ok(p) => p,
+            Err(_) => {
+                rc = 1;
+                continue;
+            }
+        };
+        if mkdir(path, Permissions::all()).is_err() {
             out(b"mkdir: cannot create directory '");
-            out(a);
+            out(w);
             out(b"'\n");
-            1
+            rc = 1;
         }
     }
+    rc
 }
 
 /// `touch <file>...`：创建空文件。
@@ -1634,26 +1673,34 @@ fn cmd_touch(arg: &[u8]) -> u8 {
     rc
 }
 
-/// `rm <file_or_dir>`：删除文件或空目录。
+/// `rm <file_or_dir>...`：删除文件或空目录。
+///
+/// **支持多个操作数**（POSIX `rm file...`）。修复前它把整段余下文本当成**一个**路径。
+/// **部分失败如实报告**：逐个处理，任一失败就打印它自己的错误并把退出码置 1；
+/// 已删掉的**保留**（不回滚）。
 fn cmd_rm(arg: &[u8]) -> u8 {
-    let a = trim_bytes(arg);
-    if a.is_empty() {
+    let words = split_words(arg);
+    if words.is_empty() {
         out(b"rm: missing operand\n");
         return 1;
     }
-    let path = match core::str::from_utf8(a) {
-        Ok(p) => p,
-        Err(_) => return 1,
-    };
-    match unlink(path) {
-        Ok(_) => 0,
-        Err(_) => {
+    let mut rc = 0u8;
+    for w in &words {
+        let path = match core::str::from_utf8(w.as_slice()) {
+            Ok(p) => p,
+            Err(_) => {
+                rc = 1;
+                continue;
+            }
+        };
+        if unlink(path).is_err() {
             out(b"rm: cannot remove '");
-            out(a);
+            out(w);
             out(b"'\n");
-            1
+            rc = 1;
         }
     }
+    rc
 }
 
 /// `jtree [--utf8] <path_or_json_string>`：自动树状可视化展示 JSON 结构（默认 ASCII，加 `--utf8` 开启 UTF-8 盒子绘图）。
