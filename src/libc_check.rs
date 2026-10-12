@@ -746,6 +746,30 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         let need0 = libc::pwd::groups_of_user("alice", 1000, &mut []);
         rpt.check("grp: zero-capacity buffer reports required count (2), no panic", need0 == 2);
 
+        // ---- getgroups（D.2 本轮：补内核查询动词 SYS_TASK_GROUPS_GET 0x3E + libc 出口）----
+        {
+            // 先装配一组**已知**的补充组（自动化通道持 CAP_SYSTEM，可设）。
+            let want = [3000u32, 3001];
+            rpt.check("grp: groups_set for getgroups", libsys::groups_set(&want).is_ok());
+            // 探测形态：size == 0（list 可为 NULL）⇒ 只问条数。
+            let n = libc::process::getgroups(0, core::ptr::null_mut());
+            rpt.check("grp: getgroups(0, NULL) reports 2", n == 2);
+            // 正常形态：写入真实 gid。
+            let mut gbuf = [0u32; 8];
+            let n2 = libc::process::getgroups(8, gbuf.as_mut_ptr());
+            rpt.check("grp: getgroups(8, buf) returns 2", n2 == 2);
+            rpt.check("grp: getgroups wrote the real gids", gbuf[0] == 3000 && gbuf[1] == 3001);
+            // 缓冲不足 ⇒ -1 置 EINVAL（POSIX：不截断、不写半个列表）。
+            let mut tiny = [0u32; 1];
+            libc::errno::set_errno(0);
+            let n3 = libc::process::getgroups(1, tiny.as_mut_ptr());
+            rpt.check("grp: getgroups too-small -> -1", n3 == -1);
+            rpt.check("grp: getgroups too-small sets EINVAL", libc::errno::errno() == libc::errno::EINVAL);
+            // 复原，避免影响后续检查。
+            let _ = libsys::groups_clear();
+            let n4 = libc::process::getgroups(0, core::ptr::null_mut());
+            rpt.check("grp: groups_clear then getgroups reports 0", n4 == 0);
+        }
         // 清理。
         libc::pwd::endgrent();
         let _ = libc::unistd::remove(gtable.as_ptr() as *const i8);
