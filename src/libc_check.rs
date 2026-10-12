@@ -800,6 +800,40 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             }
             let _ = libc::unistd::remove(p.as_ptr() as *const i8);
         }
+        // ---- fchmod / fchown（D.2 本轮：内核 SYS_STREAM_FCHMOD 0x1B / FCHOWN 0x1C + libc 出口）----
+        {
+            let p = b"/config/fchmod_probe.tmp\0";
+            let fd = libc::unistd::open(
+                p.as_ptr() as *const i8,
+                libc::unistd::O_CREAT | libc::unistd::O_RDWR,
+                0o600,
+            );
+            rpt.check("fchmod: open probe file", fd >= 0);
+            if fd >= 0 {
+                // 改成 0400：按 owner 位折叠 ⇒ 写位**真的**消失，可证 fchmod 生效。
+                rpt.check("fchmod(fd, 0400) returns 0", libc::unistd::fchmod(fd, 0o400) == 0);
+                let mut st: libc::unistd::stat = unsafe { core::mem::zeroed() };
+                rpt.check("fstat after fchmod ok", unsafe { libc::unistd::fstat(fd, &mut st) } == 0);
+                rpt.check("fchmod took effect (owner write cleared)", (st.st_mode & 0o200) == 0);
+                rpt.check("fchmod kept owner read", (st.st_mode & 0o400) != 0);
+                // fchown 走通（改为自己 = 不变；易他主需 CAP_SYSTEM，这里不测越权面）。
+                let u = libc::process::getuid();
+                let g = libc::process::getgid();
+                rpt.check("fchown(fd, self) returns 0", libc::unistd::fchown(fd, u, g) == 0);
+                // POSIX：-1 表示不变。
+                rpt.check("fchown(fd, -1, -1) returns 0", libc::unistd::fchown(fd, u32::MAX, u32::MAX) == 0);
+                let _ = libc::unistd::close(fd);
+            }
+            rpt.check("fchmod(bad fd) -> -1", libc::unistd::fchmod(9999, 0o644) == -1);
+            rpt.check("fchown(bad fd) -> -1", libc::unistd::fchown(9999, 0, 0) == -1);
+            let mut pfd2 = [0i32; 2];
+            if libc::posix_batch2::pipe(pfd2.as_mut_ptr()) == 0 {
+                rpt.check("fchmod(pipe) -> -1", libc::unistd::fchmod(pfd2[0], 0o644) == -1);
+                let _ = libc::unistd::close(pfd2[0]);
+                let _ = libc::unistd::close(pfd2[1]);
+            }
+            let _ = libc::unistd::remove(p.as_ptr() as *const i8);
+        }
         // 清理。
         libc::pwd::endgrent();
         let _ = libc::unistd::remove(gtable.as_ptr() as *const i8);
