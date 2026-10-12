@@ -1013,6 +1013,93 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             rpt.check("alarm: SIGALRM delivered within bound",
                 ALRM.load(core::sync::atomic::Ordering::SeqCst) == 1);
         }
+        // ---- sigaltstack（D.2 本轮：内核 SYS_SIGNAL_ALTSTACK 0x88 + SA_ONSTACK 切栈）----
+        {
+            use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+            static ON_ALT: AtomicU32 = AtomicU32::new(0);
+            static SP_IN_RANGE: AtomicU32 = AtomicU32::new(0);
+            static ALT_BASE: AtomicU64 = AtomicU64::new(0);
+            static ALT_SIZE: AtomicU64 = AtomicU64::new(0);
+            extern "C" fn on_usr2(_sig: i32) {
+                // **关键**：取本函数局部变量的地址，看它是否落在备用栈范围内。
+                // 落在里面才证明「handler 真的跑在备用栈上」，而不是只改了个状态字段。
+                let local: u64 = 0;
+                let addr = &local as *const u64 as u64;
+                let base = ALT_BASE.load(Ordering::SeqCst);
+                let size = ALT_SIZE.load(Ordering::SeqCst);
+                if addr >= base && addr < base.saturating_add(size) {
+                    SP_IN_RANGE.fetch_add(1, Ordering::SeqCst);
+                }
+                ON_ALT.fetch_add(1, Ordering::SeqCst);
+            }
+            // 1) 初始查询：应为 SS_DISABLE。
+            let mut cur = libc::signal::stack_t { ss_sp: core::ptr::null_mut(), ss_flags: 0, ss_size: 0 };
+            rpt.check("sigaltstack: initial query ok",
+                unsafe { libc::signal::sigaltstack(core::ptr::null(), &mut cur) } == 0);
+            rpt.check("sigaltstack: initially SS_DISABLE", cur.ss_flags == libc::signal::SS_DISABLE);
+            // 2) 设栈。
+            let asize: u64 = 64 * 1024;
+            let abase = libsys::mmap(asize).unwrap_or(0);
+            rpt.check("sigaltstack: mmap alt stack", abase != 0);
+            ALT_BASE.store(abase, Ordering::SeqCst);
+            ALT_SIZE.store(asize, Ordering::SeqCst);
+            // **必须先触碰备用栈**：mmap 给的是按需分页，而信号投递前会预校验「帧能否写入」，
+            // 页面未落地时校验不过 ⇒ 投递失败 ⇒ 进程按契约终止（实测退出码 12 = SIGUSR2 默认动作）。
+            // 与普通用户栈一样，备用栈也要先落地。
+            {
+                let mut off: u64 = 0;
+                while off < asize {
+                    unsafe { core::ptr::write_volatile((abase + off) as *mut u8, 0) };
+                    off += 4096;
+                }
+            }
+            let ss = libc::signal::stack_t {
+                ss_sp: abase as *mut core::ffi::c_void,
+                ss_flags: 0,
+                ss_size: asize as usize,
+            };
+            let mut old = libc::signal::stack_t { ss_sp: core::ptr::null_mut(), ss_flags: 0, ss_size: 0 };
+            rpt.check("sigaltstack: set ok",
+                unsafe { libc::signal::sigaltstack(&ss, &mut old) } == 0);
+            rpt.check("sigaltstack: old was SS_DISABLE", old.ss_flags == libc::signal::SS_DISABLE);
+            // 3) 查询应与设置一致，且**不改状态**（这是本轮修掉的缺陷：原实现用 set(0,0) 读旧值）。
+            let mut q2 = libc::signal::stack_t { ss_sp: core::ptr::null_mut(), ss_flags: 0, ss_size: 0 };
+            rpt.check("sigaltstack: query ok",
+                unsafe { libc::signal::sigaltstack(core::ptr::null(), &mut q2) } == 0);
+            rpt.check("sigaltstack: query consistent with set",
+                q2.ss_sp as u64 == abase && q2.ss_size == asize as usize && q2.ss_flags == 0);
+            // 4) SA_ONSTACK handler：投递后必须**真的跑在备用栈上**。
+            let act = libc::signal::sigaction {
+                sa_handler: on_usr2 as usize,
+                sa_mask: 0,
+                sa_flags: libc::signal::SA_ONSTACK,
+                sa_restorer: core::ptr::null_mut(),
+            };
+            rpt.check("sigaltstack: install SA_ONSTACK handler",
+                unsafe { libc::signal::sigaction(libc::signal::SIGUSR2, &act, core::ptr::null_mut()) } == 0);
+            let me2 = libc::process::getpid();
+            rpt.check("sigaltstack: raise SIGUSR2", libc::process::kill(me2, libc::signal::SIGUSR2) == 0);
+            rpt.check("sigaltstack: handler ran exactly once", ON_ALT.load(Ordering::SeqCst) == 1);
+            rpt.check("sigaltstack: handler ran ON THE ALT STACK", SP_IN_RANGE.load(Ordering::SeqCst) == 1);
+            // 5) 边界：只给一半（sp 有、size 0）⇒ EINVAL。
+            let half = libc::signal::stack_t {
+                ss_sp: abase as *mut core::ffi::c_void,
+                ss_flags: 0,
+                ss_size: 0,
+            };
+            libc::errno::set_errno(0);
+            rpt.check("sigaltstack: half-specified rejected",
+                unsafe { libc::signal::sigaltstack(&half, core::ptr::null_mut()) } == -1);
+            rpt.check("sigaltstack: half-specified sets EINVAL",
+                libc::errno::errno() == libc::errno::EINVAL);
+            // 6) 禁用。
+            let dis = libc::signal::stack_t { ss_sp: core::ptr::null_mut(), ss_flags: libc::signal::SS_DISABLE, ss_size: 0 };
+            rpt.check("sigaltstack: disable ok",
+                unsafe { libc::signal::sigaltstack(&dis, core::ptr::null_mut()) } == 0);
+            let mut q3 = libc::signal::stack_t { ss_sp: core::ptr::null_mut(), ss_flags: 0, ss_size: 0 };
+            let _ = unsafe { libc::signal::sigaltstack(core::ptr::null(), &mut q3) };
+            rpt.check("sigaltstack: disabled shows SS_DISABLE", q3.ss_flags == libc::signal::SS_DISABLE);
+        }
         // 清理。
         libc::pwd::endgrent();
         let _ = libc::unistd::remove(gtable.as_ptr() as *const i8);
