@@ -934,6 +934,54 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             let _ = libc::process::setpriority(0, 0, 20);
             rpt.check("nice: restored to nice 0", libc::process::getpriority(0, 0) == 20);
         }
+        // ---- sigsuspend（D.2 本轮：内核 SYS_SIGNAL_SUSPEND 0x86）----
+        {
+            // SIG_BLOCK=0 / SIG_SETMASK=2（见 libc/include/signal.h:102-104）。
+            const SIG_BLOCK: i32 = 0;
+            const SIG_SETMASK: i32 = 2;
+            const SIG_UNBLOCK: i32 = 1;
+            static HITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            extern "C" fn on_usr1(_sig: i32) {
+                HITS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            }
+            let act = libc::signal::sigaction {
+                sa_handler: on_usr1 as usize,
+                sa_mask: 0,
+                sa_flags: 0,
+                sa_restorer: core::ptr::null_mut(),
+            };
+            rpt.check("sigsuspend: install SIGUSR1 handler",
+                unsafe { libc::signal::sigaction(libc::signal::SIGUSR1, &act, core::ptr::null_mut()) } == 0);
+            // 屏蔽 SIGUSR1，再投递（被挡住 ⇒ 进 pending）。
+            let mut blk: libc::signal::sigset_t = 0;
+            unsafe { libc::signal::sigemptyset(&mut blk) };
+            unsafe { libc::signal::sigaddset(&mut blk, libc::signal::SIGUSR1) };
+            rpt.check("sigsuspend: block SIGUSR1",
+                unsafe { libc::signal::sigprocmask(SIG_BLOCK, &blk, core::ptr::null_mut()) } == 0);
+            let me_pid = libc::process::getpid();
+            rpt.check("sigsuspend: raise SIGUSR1 while blocked",
+                libc::process::kill(me_pid, libc::signal::SIGUSR1) == 0);
+            // **关键**：sigsuspend(空集) 原子解除屏蔽并等信号。此刻已有可投递信号
+            // ⇒ 不该睡死（这正是「换屏蔽集期间不丢信号」的可证形态）。
+            let empty: libc::signal::sigset_t = 0;
+            libc::errno::set_errno(0);
+            let rc = unsafe { libc::signal::sigsuspend(&empty) };
+            rpt.check("sigsuspend returns -1", rc == -1);
+            rpt.check("sigsuspend sets EINTR", libc::errno::errno() == libc::errno::EINTR);
+            rpt.check("sigsuspend: handler ran exactly once",
+                HITS.load(core::sync::atomic::Ordering::SeqCst) == 1);
+            // 屏蔽集被**还原**为 suspend 前的值（仍屏蔽 SIGUSR1）。
+            let mut now: libc::signal::sigset_t = 0;
+            let _ = unsafe { libc::signal::sigprocmask(SIG_SETMASK, core::ptr::null(), &mut now) };
+            rpt.check("sigsuspend: mask restored (SIGUSR1 still blocked)",
+                (now & (1u64 << libc::signal::SIGUSR1)) != 0);
+            // 复原：解除屏蔽。
+            let _ = unsafe { libc::signal::sigprocmask(SIG_UNBLOCK, &blk, core::ptr::null_mut()) };
+            // 空指针如实 EINVAL。
+            libc::errno::set_errno(0);
+            rpt.check("sigsuspend(NULL) -> -1", unsafe { libc::signal::sigsuspend(core::ptr::null()) } == -1);
+            rpt.check("sigsuspend(NULL) sets EINVAL", libc::errno::errno() == libc::errno::EINVAL);
+        }
         // 清理。
         libc::pwd::endgrent();
         let _ = libc::unistd::remove(gtable.as_ptr() as *const i8);
