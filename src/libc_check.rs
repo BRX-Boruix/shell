@@ -1100,6 +1100,35 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             let _ = unsafe { libc::signal::sigaltstack(core::ptr::null(), &mut q3) };
             rpt.check("sigaltstack: disabled shows SS_DISABLE", q3.ss_flags == libc::signal::SS_DISABLE);
         }
+        // ---- ttyname（D.2 本轮：纯 libc 实现——isatty + fstat/stat 的 st_ino 比对）----
+        {
+            // --run 下 stdout 就是 console ⇒ 应返回 /devices/console。
+            // 本实现只能忠实回答「不是终端」这一半。**是终端时也返回 NULL**——因为本系统
+            // 没有「节点自述名字」通道（INode::stable_id 默认是 self 地址，视图节点的 lookup
+            // 可能每次新建实例 ⇒ fstat/stat 的身份比对必然不等，实测如此），而编一个路径
+            // （如恒返回 /devices/console）会在 fd 属于别的终端时撒谎。
+            // 这两条断言**锁定如实失败**，防止将来有人塞一个假路径进来。
+            libc::errno::set_errno(0);
+            let p = unsafe { libc::unistd::ttyname(1) };
+            rpt.check("ttyname(terminal) -> NULL (no node-name channel yet)", p.is_null());
+            rpt.check("ttyname(terminal) sets ENOTTY", libc::errno::errno() == libc::errno::ENOTTY);            // 非终端（普通文件）⇒ NULL 置 ENOTTY。
+            let f = b"/ttyname_probe.tmp\0";
+            let fd = libc::unistd::open(
+                f.as_ptr() as *const i8,
+                libc::unistd::O_CREAT | libc::unistd::O_RDWR,
+                0o600,
+            );
+            rpt.check("ttyname: create regular file", fd >= 0);
+            if fd >= 0 {
+                libc::errno::set_errno(0);
+                let q = unsafe { libc::unistd::ttyname(fd) };
+                rpt.check("ttyname(regular file) -> NULL", q.is_null());
+                rpt.check("ttyname(regular file) sets ENOTTY",
+                    libc::errno::errno() == libc::errno::ENOTTY);
+                let _ = libc::unistd::close(fd);
+            }
+            let _ = libc::unistd::remove(f.as_ptr() as *const i8);
+        }
         // 清理。
         libc::pwd::endgrent();
         let _ = libc::unistd::remove(gtable.as_ptr() as *const i8);
