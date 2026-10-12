@@ -724,21 +724,27 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
 
         // 5) getgrouplist：alice 的组 = 主组 + 所属补充组 dev(2000)。
         let mut buf = [0u32; 8];
-        let n = libc::pwd::getgrouplist("alice", 1000, &mut buf);
+        let n = libc::pwd::groups_of_user("alice", 1000, &mut buf);
         rpt.check("grp: getgrouplist(alice) reports 2 groups", n == 2);
         rpt.check("grp: alice primary group first", n >= 1 && buf[0] == 1000);
         rpt.check("grp: alice supplementary dev(2000) present",
             n >= 2 && buf[..n].contains(&2000));
         // bob 同属 dev，carol 不属 dev。
-        let nb = libc::pwd::getgrouplist("bob", 1001, &mut [0u32; 8]);
+        let nb = libc::pwd::groups_of_user("bob", 1001, &mut [0u32; 8]);
         rpt.check("grp: getgrouplist(bob) -> 2 (primary + dev)", nb == 2);
-        let nc = libc::pwd::getgrouplist("carol", 1002, &mut [0u32; 8]);
+        let nc = libc::pwd::groups_of_user("carol", 1002, &mut [0u32; 8]);
         rpt.check("grp: carol is NOT in dev -> 2 (primary + ops)", nc == 2);
 
         // 6) 缓冲不足必须**如实返回所需条数**，不截断、不越界。
         let mut tiny = [0u32; 1];
-        let need = libc::pwd::getgrouplist("alice", 1000, &mut tiny);
+        let need = libc::pwd::groups_of_user("alice", 1000, &mut tiny);
         rpt.check("grp: insufficient buffer reports required count (2)", need == 2);
+        // 6b) **容量 0**：这是缺陷的**回归锁**。旧实现用 `out[..n]` 去重，n 是逻辑条数、
+        //     可超过缓冲长度 ⇒ 容量 0 时第 1 次 push 就 `out[..1]` 越界 panic。
+        //     注：上面的 `[u32; 1]` 用例**不足以**触发它（需要「所需条数 − 容量 ≥ 2」），
+        //     这正是该缺陷此前能存活的原因——补上这条才真正锁住。
+        let need0 = libc::pwd::groups_of_user("alice", 1000, &mut []);
+        rpt.check("grp: zero-capacity buffer reports required count (2), no panic", need0 == 2);
 
         // 清理。
         libc::pwd::endgrent();
