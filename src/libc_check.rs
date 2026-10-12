@@ -982,6 +982,37 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             rpt.check("sigsuspend(NULL) -> -1", unsafe { libc::signal::sigsuspend(core::ptr::null()) } == -1);
             rpt.check("sigsuspend(NULL) sets EINVAL", libc::errno::errno() == libc::errno::EINVAL);
         }
+        // ---- alarm（D.2 本轮：内核 SYS_SIGNAL_ALARM 0x87）----
+        {
+            static ALRM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            extern "C" fn on_alrm(_sig: i32) {
+                ALRM.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            }
+            let act = libc::signal::sigaction {
+                sa_handler: on_alrm as usize,
+                sa_mask: 0,
+                sa_flags: 0,
+                sa_restorer: core::ptr::null_mut(),
+            };
+            rpt.check("alarm: install SIGALRM handler",
+                unsafe { libc::signal::sigaction(libc::signal::SIGALRM, &act, core::ptr::null_mut()) } == 0);
+            // 首次设置应返回 0（没有上一个闹钟）。
+            rpt.check("alarm(1) returns 0 (no previous)", libc::signal::alarm(1) == 0);
+            // 立刻重设：应返回**上一个**的剩余秒数（向上取整 ⇒ 1）。
+            rpt.check("alarm(2) returns previous remaining (1)", libc::signal::alarm(2) == 1);
+            // 取消：返回 2，且此后不该触发。
+            rpt.check("alarm(0) cancels and returns 2", libc::signal::alarm(0) == 2);
+            // 重新设 1 秒并等它到期（带界轮询，避免挂死）。
+            rpt.check("alarm(1) again returns 0", libc::signal::alarm(1) == 0);
+            let mut waited = 0u32;
+            while ALRM.load(core::sync::atomic::Ordering::SeqCst) == 0 && waited < 200 {
+                // 50ms × 200 = 10s 上界；正常 1s 内触发。
+                let _ = libsys::sleep(50_000_000);
+                waited += 1;
+            }
+            rpt.check("alarm: SIGALRM delivered within bound",
+                ALRM.load(core::sync::atomic::Ordering::SeqCst) == 1);
+        }
         // 清理。
         libc::pwd::endgrent();
         let _ = libc::unistd::remove(gtable.as_ptr() as *const i8);
