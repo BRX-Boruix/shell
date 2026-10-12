@@ -866,6 +866,49 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             let _ = unsafe { libc::signal::sigpending(&mut pend2) };
             rpt.check("sigpending cleared after unblock", (pend2 & (1u64 << libc::signal::SIGCHLD)) == 0);
         }
+        // ---- link（D.2 本轮：VFS 硬链接 + 内核 SYS_ENTRY_LINK 0x49 + libc 出口）----
+        {
+            let f1 = b"/link_a.tmp\0";
+            let f2 = b"/link_b.tmp\0";
+            let _ = libc::unistd::remove(f1.as_ptr() as *const i8);
+            let _ = libc::unistd::remove(f2.as_ptr() as *const i8);
+            let fd = libc::unistd::open(
+                f1.as_ptr() as *const i8,
+                libc::unistd::O_CREAT | libc::unistd::O_RDWR,
+                0o600,
+            );
+            rpt.check("link: create file", fd >= 0);
+            if fd >= 0 {
+                let data = b"hello hardlink\n";
+                let w = libc::unistd::write(fd, data.as_ptr() as *const core::ffi::c_void, data.len());
+                rpt.check("link: write file", w == data.len() as isize);
+                let _ = libc::unistd::close(fd);
+            }
+            rpt.check("link(a,b) returns 0",
+                libc::unistd::link(f1.as_ptr() as *const i8, f2.as_ptr() as *const i8) == 0);
+            let mut s1: libc::unistd::stat = unsafe { core::mem::zeroed() };
+            let mut s2: libc::unistd::stat = unsafe { core::mem::zeroed() };
+            rpt.check("link: stat a ok", libc::unistd::stat(f1.as_ptr() as *const i8, &mut s1) == 0);
+            rpt.check("link: stat b ok", libc::unistd::stat(f2.as_ptr() as *const i8, &mut s2) == 0);
+            rpt.check("link: same st_ino (real identity)", s1.st_ino == s2.st_ino && s1.st_ino != 0);
+            rpt.check("link: st_nlink == 2", s1.st_nlink == 2 && s2.st_nlink == 2);
+            let fd2 = libc::unistd::open(f2.as_ptr() as *const i8, libc::unistd::O_RDONLY, 0);
+            rpt.check("link: open b", fd2 >= 0);
+            if fd2 >= 0 {
+                let mut buf = [0u8; 32];
+                let n = libc::unistd::read(fd2, buf.as_mut_ptr() as *mut core::ffi::c_void, 32);
+                rpt.check("link: content shared through b", n == 15 && &buf[..15] == b"hello hardlink\n");
+                let _ = libc::unistd::close(fd2);
+            }
+            rpt.check("link: unlink a", libc::unistd::remove(f1.as_ptr() as *const i8) == 0);
+            let mut s3: libc::unistd::stat = unsafe { core::mem::zeroed() };
+            rpt.check("link: b survives after unlink a",
+                libc::unistd::stat(f2.as_ptr() as *const i8, &mut s3) == 0);
+            rpt.check("link: nlink back to 1", s3.st_nlink == 1);
+            rpt.check("link: directory refused",
+                libc::unistd::link(b"/\0".as_ptr() as *const i8, b"/link_dir.tmp\0".as_ptr() as *const i8) == -1);
+            let _ = libc::unistd::remove(f2.as_ptr() as *const i8);
+        }
         // 清理。
         libc::pwd::endgrent();
         let _ = libc::unistd::remove(gtable.as_ptr() as *const i8);
