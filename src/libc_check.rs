@@ -770,6 +770,36 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             let n4 = libc::process::getgroups(0, core::ptr::null_mut());
             rpt.check("grp: groups_clear then getgroups reports 0", n4 == 0);
         }
+        // ---- fsync（D.2 本轮：内核 SYS_STREAM_FSYNC 0x1A + libc 出口）----
+        {
+            let p = b"/config/fsync_probe.tmp\0";
+            let fd = libc::unistd::open(
+                p.as_ptr() as *const i8,
+                libc::unistd::O_CREAT | libc::unistd::O_WRONLY,
+                0o600,
+            );
+            rpt.check("fsync: open probe file", fd >= 0);
+            if fd >= 0 {
+                let data = b"fsync probe\n";
+                let w = libc::unistd::write(fd, data.as_ptr() as *const core::ffi::c_void, data.len());
+                rpt.check("fsync: write probe file", w == data.len() as isize);
+                rpt.check("fsync(fd) returns 0", libc::unistd::fsync(fd) == 0);
+                let _ = libc::unistd::close(fd);
+            }
+            // fd 不存在 ⇒ -1（不假装成功）。
+            rpt.check("fsync(bad fd) -> -1", libc::unistd::fsync(9999) == -1);
+            // 管道端无持久化语义 ⇒ -1 置 EINVAL。
+            let mut pfd = [0i32; 2];
+            if libc::posix_batch2::pipe(pfd.as_mut_ptr()) == 0 {
+                libc::errno::set_errno(0);
+                let rc = libc::unistd::fsync(pfd[0]);
+                rpt.check("fsync(pipe) -> -1", rc == -1);
+                rpt.check("fsync(pipe) sets EINVAL", libc::errno::errno() == libc::errno::EINVAL);
+                let _ = libc::unistd::close(pfd[0]);
+                let _ = libc::unistd::close(pfd[1]);
+            }
+            let _ = libc::unistd::remove(p.as_ptr() as *const i8);
+        }
         // 清理。
         libc::pwd::endgrent();
         let _ = libc::unistd::remove(gtable.as_ptr() as *const i8);
