@@ -834,6 +834,38 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             }
             let _ = libc::unistd::remove(p.as_ptr() as *const i8);
         }
+        // ---- sigpending（D.2 本轮：内核 SYS_SIGNAL_PENDING 0x85 + libc 出口）----
+        {
+            // SIG_BLOCK=0 / SIG_UNBLOCK=1（见 libc/include/signal.h:102-103）。
+            const SIG_BLOCK: i32 = 0;
+            const SIG_UNBLOCK: i32 = 1;
+
+            // 1) 基本契约：成功返回 0，且位图 bit63 清零（syscall 错误编码用 bit63）。
+            let mut set: libc::signal::sigset_t = u64::MAX;
+            rpt.check("sigpending(set) returns 0", unsafe { libc::signal::sigpending(&mut set) } == 0);
+            rpt.check("sigpending clears bit63", (set & (1u64 << 63)) == 0);
+            // 2) 空指针 ⇒ -1 置 EINVAL。
+            libc::errno::set_errno(0);
+            rpt.check("sigpending(NULL) -> -1", unsafe { libc::signal::sigpending(core::ptr::null_mut()) } == -1);
+            rpt.check("sigpending(NULL) sets EINVAL", libc::errno::errno() == libc::errno::EINVAL);
+            // 3) **语义**：屏蔽 SIGCHLD（POSIX 默认动作=忽略 ⇒ 解除屏蔽也不会杀进程）→ 投递 →
+            //    待决集应出现该位；解除屏蔽后应被消费。这是「待决集 ≠ 屏蔽集」的可证形态。
+            let mut blk: libc::signal::sigset_t = 0;
+            unsafe { libc::signal::sigemptyset(&mut blk) };
+            unsafe { libc::signal::sigaddset(&mut blk, libc::signal::SIGCHLD) };
+            let rc = unsafe { libc::signal::sigprocmask(SIG_BLOCK, &blk, core::ptr::null_mut()) };
+            rpt.check("sigpending: block SIGCHLD", rc == 0);
+            let self_pid = libc::process::getpid();
+            rpt.check("sigpending: raise SIGCHLD", libc::process::kill(self_pid, libc::signal::SIGCHLD) == 0);
+            let mut pend: libc::signal::sigset_t = 0;
+            rpt.check("sigpending after raise ok", unsafe { libc::signal::sigpending(&mut pend) } == 0);
+            rpt.check("sigpending shows the blocked+raised signal",
+                (pend & (1u64 << libc::signal::SIGCHLD)) != 0);
+            let _ = unsafe { libc::signal::sigprocmask(SIG_UNBLOCK, &blk, core::ptr::null_mut()) };
+            let mut pend2: libc::signal::sigset_t = u64::MAX;
+            let _ = unsafe { libc::signal::sigpending(&mut pend2) };
+            rpt.check("sigpending cleared after unblock", (pend2 & (1u64 << libc::signal::SIGCHLD)) == 0);
+        }
         // 清理。
         libc::pwd::endgrent();
         let _ = libc::unistd::remove(gtable.as_ptr() as *const i8);
