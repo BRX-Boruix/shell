@@ -909,6 +909,31 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
                 libc::unistd::link(b"/\0".as_ptr() as *const i8, b"/link_dir.tmp\0".as_ptr() as *const i8) == -1);
             let _ = libc::unistd::remove(f2.as_ptr() as *const i8);
         }
+        // ---- nice / getpriority / setpriority（D.2 本轮：内核 SYS_TASK_NICE 0x3F）----
+        {
+            // 初始 nice 应为 0（「引入 nice 不改变既有进程调度行为」的前提）。
+            rpt.check("nice: initial getpriority == 20 (nice 0)", libc::process::getpriority(0, 0) == 20);
+            // setpriority(prio 25) ⇒ nice = 20 - 25 = -5。
+            rpt.check("nice: setpriority(0,0,25) == 0", libc::process::setpriority(0, 0, 25) == 0);
+            rpt.check("nice: getpriority == 25 (nice -5)", libc::process::getpriority(0, 0) == 25);
+            // nice(inc) 是**累加**：当前 -5，+3 ⇒ -2 ⇒ priority 22。
+            libc::errno::set_errno(0);
+            rpt.check("nice(+3) returns -2 (accumulated)", libc::process::nice(3) == -2);
+            rpt.check("nice: getpriority == 22", libc::process::getpriority(0, 0) == 22);
+            // 上界钳制：prio 0 ⇒ nice 20 ⇒ 钳到 19 ⇒ priority 1。
+            let _ = libc::process::setpriority(0, 0, 0);
+            rpt.check("nice: clamped to 19 (priority 1)", libc::process::getpriority(0, 0) == 1);
+            // 下界钳制：prio 100 ⇒ nice -80 ⇒ 钳到 -20 ⇒ priority 40。
+            let _ = libc::process::setpriority(0, 0, 100);
+            rpt.check("nice: clamped to -20 (priority 40)", libc::process::getpriority(0, 0) == 40);
+            // 本系统无进程组 ⇒ PRIO_PGRP 如实拒绝。
+            libc::errno::set_errno(0);
+            rpt.check("nice: PRIO_PGRP refused", libc::process::getpriority(1, 0) == -1);
+            rpt.check("nice: PRIO_PGRP sets EINVAL", libc::errno::errno() == libc::errno::EINVAL);
+            // 复原，避免影响后续检查的调度权重。
+            let _ = libc::process::setpriority(0, 0, 20);
+            rpt.check("nice: restored to nice 0", libc::process::getpriority(0, 0) == 20);
+        }
         // 清理。
         libc::pwd::endgrent();
         let _ = libc::unistd::remove(gtable.as_ptr() as *const i8);
