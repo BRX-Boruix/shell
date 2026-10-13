@@ -1894,6 +1894,113 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         }
     }
 
+    // ---- 覆盖面补齐（第二批真机专属面）：spawn / access / lstat / fgetpos ----
+    unsafe {
+        use libc::ctypes::c_char;
+        fn p(s: &[u8]) -> *const c_char {
+            s.as_ptr() as *const c_char
+        }
+
+        // ===== posix_spawn：文件动作与属性对象（纯数据结构，可在真机上逐项验） =====
+        let mut fa: libc::spawn::posix_spawn_file_actions_t = core::mem::zeroed();
+        let mut at: libc::spawn::posix_spawnattr_t = core::mem::zeroed();
+        rpt.check(
+            "spawn: posix_spawn_file_actions_init",
+            libc::spawn::posix_spawn_file_actions_init(&mut fa) == 0,
+        );
+        rpt.check(
+            "spawn: posix_spawn_file_actions_addopen",
+            libc::spawn::posix_spawn_file_actions_addopen(&mut fa, 0, p(b"/devices/console\0"), 0, 0) == 0,
+        );
+        rpt.check(
+            "spawn: posix_spawn_file_actions_addclose",
+            libc::spawn::posix_spawn_file_actions_addclose(&mut fa, 1) == 0,
+        );
+        rpt.check(
+            "spawn: posix_spawn_file_actions_adddup2",
+            libc::spawn::posix_spawn_file_actions_adddup2(&mut fa, 1, 2) == 0,
+        );
+        rpt.check(
+            "spawn: posix_spawnattr_init",
+            libc::spawn::posix_spawnattr_init(&mut at) == 0,
+        );
+        let mut flags: libc::ctypes::c_short = -1;
+        rpt.check(
+            "spawn: posix_spawnattr_getflags reports the initial flags",
+            libc::spawn::posix_spawnattr_getflags(&at, &mut flags) == 0 && flags == 0,
+        );
+        rpt.check(
+            "spawn: posix_spawnattr_setflags then getflags round-trips",
+            libc::spawn::posix_spawnattr_setflags(&mut at, 0) == 0
+                && libc::spawn::posix_spawnattr_getflags(&at, &mut flags) == 0,
+        );
+        rpt.check(
+            "spawn: posix_spawn_file_actions_destroy",
+            libc::spawn::posix_spawn_file_actions_destroy(&mut fa) == 0,
+        );
+        rpt.check(
+            "spawn: posix_spawnattr_destroy",
+            libc::spawn::posix_spawnattr_destroy(&mut at) == 0,
+        );
+
+        // posix_spawn/posix_spawnp 对**不存在的程序**必须如实失败（不假装成功）。
+        let mut fa2: libc::spawn::posix_spawn_file_actions_t = core::mem::zeroed();
+        let mut at2: libc::spawn::posix_spawnattr_t = core::mem::zeroed();
+        let _ = libc::spawn::posix_spawn_file_actions_init(&mut fa2);
+        let _ = libc::spawn::posix_spawnattr_init(&mut at2);
+        let argv = [p(b"nope\0"), core::ptr::null()];
+        let mut pid: libc::ctypes::c_int = 0;
+        let rc = libc::spawn::posix_spawn(
+            &mut pid,
+            p(b"/programs/definitely-not-here.elf\0"),
+            &fa2,
+            &at2,
+            argv.as_ptr(),
+            core::ptr::null(),
+        );
+        rpt.check("spawn: posix_spawn on a missing program fails honestly", rc != 0);
+        let rc2 = libc::spawn::posix_spawnp(
+            &mut pid,
+            p(b"definitely-not-here\0"),
+            &fa2,
+            &at2,
+            argv.as_ptr(),
+            core::ptr::null(),
+        );
+        rpt.check("spawn: posix_spawnp on a missing program fails honestly", rc2 != 0);
+        let _ = libc::spawn::posix_spawn_file_actions_destroy(&mut fa2);
+        let _ = libc::spawn::posix_spawnattr_destroy(&mut at2);
+
+        // ===== access / lstat =====
+        rpt.check("posix2: access(F_OK) on an existing path", libc::posix_batch2::access(p(b"/programs\0"), 0) == 0);
+        rpt.check(
+            "posix2: access(F_OK) on a missing path fails",
+            libc::posix_batch2::access(p(b"/programs/definitely-not-here\0"), 0) == -1,
+        );
+        let mut st: libc::unistd::stat = core::mem::zeroed();
+        rpt.check("posix2: lstat on an existing path", libc::posix_batch2::lstat(p(b"/programs\0"), &mut st) == 0);
+        rpt.check(
+            "posix2: lstat on a missing path fails",
+            libc::posix_batch2::lstat(p(b"/programs/definitely-not-here\0"), &mut st) == -1,
+        );
+
+        // ===== fgetpos / fsetpos =====
+        let fpath3 = p(b"/scratch/conf_pos.txt\0");
+        let fp3 = libc::stdio::fopen(fpath3, p(b"w+\0"));
+        rpt.check("posix6: fopen(w+) for fgetpos", !fp3.is_null());
+        if !fp3.is_null() {
+            // fgetpos 委托 ftell，而 ftell 对**从未被 lseek 过的 fd** 如实 ENOTSUP
+            // （见 ftell 的文档）——先绝对定位一次，这条才是在测位置记账。
+            rpt.check("posix6: fseek(0,SET) to establish the position", libc::stdio::fseek(fp3, 0, 0) == 0);
+            let _ = libc::stdio::fputs(p(b"abcdef\0"), fp3);
+            let _ = libc::stdio::fflush(fp3);
+            let mut pos: libc::ctypes::c_long = -1;
+            rpt.check("posix6: fgetpos", libc::posix_batch6::fgetpos(fp3 as *mut libc::ctypes::c_void, &mut pos) == 0);
+            rpt.check("posix6: fsetpos back to the recorded position", libc::posix_batch6::fsetpos(fp3 as *mut libc::ctypes::c_void, &pos) == 0);
+            let _ = libc::stdio::fclose(fp3);
+        }
+    }
+
     let mut sum = Vec::new();
     sum.extend_from_slice(b"[libccheck] passed=");
     sum.extend_from_slice(crate::util::u64_to_dec(rpt.pass as u64, &mut [0u8; 24]));
