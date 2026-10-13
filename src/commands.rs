@@ -207,7 +207,16 @@ fn cmd_jobout(arg: &[u8]) -> u8 {
 /// `jobs`：列出全部后台作业及其存活状态。支持 `--json` 格式。返回 0。
 fn cmd_jobs(arg: &[u8]) -> u8 {
     let is_json = trim_bytes(arg) == b"--json";
-    let alive = libsys::ps_list().unwrap_or_default();
+    // **不把失败伪装成"没有存活进程"**：读不到进程表就如实报错返回 1。
+    // 此前用 unwrap_or_default()，失败时每个作业都显示 Done——那是伪数据（S09）。
+    let alive = match libsys::ps_list() {
+        Ok(list) => list,
+        Err(_) => {
+            out(b"jobs: cannot read the process list
+");
+            return 1;
+        }
+    };
     let jobs = JOBS.lock();
 
     if is_json {
@@ -410,7 +419,14 @@ fn cmd_time(arg: &[u8]) -> u8 {
 
 /// `uptime`：开机至今。支持 `--json` 输出。
 fn cmd_uptime(arg: &[u8]) -> u8 {
-    let ms = info(INFO_BOOT_MS).unwrap_or(0);
+    // 取不到真值就如实报错——不打印 "uptime: 0.0 s" 这种**看起来正常**的伪数据（S09）。
+    let ms = match info(INFO_BOOT_MS) {
+        Ok(v) => v,
+        Err(_) => {
+            out(b"uptime: kernel INFO_BOOT_MS unavailable\n");
+            return 1;
+        }
+    };
     if trim_bytes(arg) == b"--json" {
         use libsys::json::{JsonWriter, VecTarget};
         let mut target = VecTarget::new();
@@ -437,7 +453,13 @@ fn cmd_uptime(arg: &[u8]) -> u8 {
 
 /// `version`/`uname`：内核版本。
 fn cmd_version() -> u8 {
-    let v = info(INFO_VERSION).unwrap_or(0);
+    let v = match info(INFO_VERSION) {
+        Ok(v) => v,
+        Err(_) => {
+            out(b"version: kernel INFO_VERSION unavailable\n");
+            return 1;
+        }
+    };
     let mut b = [0u8; 24];
     out(b"BORUIX v");
     out(u64_to_dec((v >> 16) & 0xff, &mut b));
@@ -451,7 +473,13 @@ fn cmd_version() -> u8 {
 
 /// `cpu`：在线 CPU 数。
 fn cmd_cpu() -> u8 {
-    let c = info(INFO_CPU_COUNT).unwrap_or(0);
+    let c = match info(INFO_CPU_COUNT) {
+        Ok(v) => v,
+        Err(_) => {
+            out(b"cpu: kernel INFO_CPU_COUNT unavailable\n");
+            return 1;
+        }
+    };
     let mut b = [0u8; 24];
     out(b"cpus: ");
     out(u64_to_dec(c, &mut b));
@@ -2303,7 +2331,6 @@ fn exec_words(words: &[Vec<u8>]) -> u8 {
 /// \u6362\u6210\u666e\u901a\u6587\u4ef6\u8282\u70b9\uff0c\u6545\u672c\u547d\u4ee4\u5fc5\u987b\u5982\u5b9e\u6539\u53e3\u2014\u2014
 /// \u65e7\u786c\u7f16\u7801 `fd \u2208 {0,1,2} \u2192 1` \u6c38\u8fdc\u8bf4\u4e0d\u5230\u8fd9\u4e00\u70b9\u3002
 fn cmd_tty() -> u8 {
-    let mut b = [0u8; 24];
     for (fd, name) in [(0u64, &b"stdin"[..]), (1, &b"stdout"[..]), (2, &b"stderr"[..])] {
         out(name);
         out(b": ");
@@ -2318,7 +2345,6 @@ fn cmd_tty() -> u8 {
             Err(_) => out(b"isatty=0 (fstat failed)\n"),
         }
     }
-    let _ = &mut b;
     0
 }
 

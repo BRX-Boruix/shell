@@ -1376,6 +1376,40 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         );
     }
 
+    // ---- flock：内核锁表经 libc 的真机链路（ADR-033 A2-1 R6）----
+    unsafe {
+        let path = b"/scratch/flock_probe.txt\0";
+        let fd = libc::unistd::open(
+            path.as_ptr() as *const libc::ctypes::c_char,
+            libc::unistd::O_RDWR | libc::unistd::O_CREAT,
+            0o644,
+        );
+        rpt.check("flock: probe file opened", fd >= 0);
+        if fd >= 0 {
+            rpt.check(
+                "flock: LOCK_EX|LOCK_NB acquires (real syscall)",
+                libc::unistd::flock(fd, libc::unistd::LOCK_EX | libc::unistd::LOCK_NB) == 0,
+            );
+            rpt.check(
+                "flock: LOCK_UN releases",
+                libc::unistd::flock(fd, libc::unistd::LOCK_UN) == 0,
+            );
+            libc::errno::set_errno(0);
+            let blocking = libc::unistd::flock(fd, libc::unistd::LOCK_EX);
+            rpt.check(
+                "flock: blocking form honestly ENOTSUP (no fake wait)",
+                blocking == -1 && libc::errno::errno() == libc::errno::ENOTSUP,
+            );
+            libc::errno::set_errno(0);
+            let bad = libc::unistd::flock(fd, 0);
+            rpt.check(
+                "flock: undefined operation is EINVAL",
+                bad == -1 && libc::errno::errno() == libc::errno::EINVAL,
+            );
+            let _ = libc::unistd::close(fd);
+        }
+    }
+
     let mut sum = Vec::new();
     sum.extend_from_slice(b"[libccheck] passed=");
     sum.extend_from_slice(crate::util::u64_to_dec(rpt.pass as u64, &mut [0u8; 24]));
