@@ -89,7 +89,7 @@ pub(crate) fn trim_bytes(s: &[u8]) -> &[u8] {
     &s[start..end]
 }
 
-/// 把带 `\n`/`\t`/`\\`/`\"` 转义的字面量内容解码为原始字节序列。
+/// 把带 `\n`/`\t`/`\`/`\"` 转义的字面量内容解码为原始字节序列。
 ///
 /// `src` 应已去掉外层双引号；返回解码后写入 `buf` 的字节数。
 pub(crate) fn unescape(src: &[u8], buf: &mut [u8]) -> usize {
