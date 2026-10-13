@@ -1410,6 +1410,109 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         }
     }
 
+    // ---- 全库转译审查（第二/三/四阶段）修掉的 libc 语义：在**真机**上逐条复验 ----
+    //
+    // 为什么必须进真机：宿主测试跑的是宿主 ABI，而 printf 的可变参数在
+    // os="boruix"（硬浮点，走 XMM）与 os="none"/宿主（走 GP）上是**两条不同的读取路径**
+    // （见 libc/src/stdio.rs 的 next_float_arg）。浮点打印只有在这里才算真验过。
+    unsafe {
+        let mut buf = [0u8; 64];
+
+        // C11 7.21.6.5：返回值 = 「若空间足够本应写入」的长度；截断时仍要 NUL 终止。
+        let n = libc::stdio::snprintf(
+            buf.as_mut_ptr() as *mut libc::ctypes::c_char,
+            4,
+            b"%s\0".as_ptr() as *const libc::ctypes::c_char,
+            b"hello\0".as_ptr() as *const libc::ctypes::c_char,
+        );
+        rpt.check("snprintf: truncation still reports the full length (5)", n == 5);
+        rpt.check("snprintf: truncation still NUL-terminates", buf[3] == 0 && &buf[..3] == b"hel");
+
+        // 浮点打印走**目标的**可变参数路径（与宿主不同）。
+        let n2 = libc::stdio::snprintf(
+            buf.as_mut_ptr() as *mut libc::ctypes::c_char,
+            64,
+            b"%.2f\0".as_ptr() as *const libc::ctypes::c_char,
+            1.5f64,
+        );
+        rpt.check("printf: %.2f of 1.5 -> 1.50 (target vararg path)", n2 == 4 && &buf[..4] == b"1.50");
+
+        let n3 = libc::stdio::snprintf(
+            buf.as_mut_ptr() as *mut libc::ctypes::c_char,
+            64,
+            b"%g\0".as_ptr() as *const libc::ctypes::c_char,
+            1e20f64,
+        );
+        rpt.check("printf: %g of 1e20 -> 1e+20 (fast-path overflow + strip)", n3 == 5 && &buf[..5] == b"1e+20");
+
+        // strtol 的 "0x" 前缀：后面没有十六进制数字时 endptr 停在 'x'。
+        let mut end: *const libc::ctypes::c_char = core::ptr::null();
+        let s = b"0x\0";
+        let v = libc::stdlib::strtol(s.as_ptr() as *const libc::ctypes::c_char, &mut end, 16);
+        rpt.check(
+            "strtol: 0x without digits -> 0 with endptr at 'x'",
+            v == 0 && end == s.as_ptr().add(1) as *const libc::ctypes::c_char,
+        );
+
+        // strtoul 负向溢出：返回 ULONG_MAX 并置 ERANGE。
+        libc::errno::set_errno(0);
+        let big = b"-18446744073709551616\0";
+        let u = libc::stdlib::strtoul(
+            big.as_ptr() as *const libc::ctypes::c_char,
+            core::ptr::null_mut(),
+            10,
+        );
+        rpt.check(
+            "strtoul: negative overflow -> ULONG_MAX + ERANGE",
+            u == u64::MAX && libc::errno::errno() == libc::errno::ERANGE,
+        );
+
+        // tolower(EOF) 原样返回 EOF（不是 255）。
+        rpt.check("tolower(EOF) returns EOF, not 255", libc::ctype::tolower(-1) == -1);
+
+        // fnmatch 的 FNM_PERIOD：紧跟 '/' 之后的句点必须由显式句点匹配。
+        let f = libc::posix_batch4::FNM_PATHNAME | libc::posix_batch4::FNM_PERIOD;
+        let rc = libc::posix_batch4::fnmatch(
+            b"a/*\0".as_ptr() as *const libc::ctypes::c_char,
+            b"a/.hidden\0".as_ptr() as *const libc::ctypes::c_char,
+            f,
+        );
+        rpt.check(
+            "fnmatch: FNM_PERIOD protects a period right after '/'",
+            rc == libc::posix_batch4::FNM_NOMATCH,
+        );
+
+        // regex 的 BRE：裸 '+' 是普通字符，模式合法（不得报 REG_BADRPT）。
+        let mut re: libc::regex::regex_t = core::mem::zeroed();
+        let c = libc::regex::regcomp(&mut re, b"a+b\0".as_ptr() as *const libc::ctypes::c_char, 0);
+        rpt.check("regcomp: BRE 'a+b' is legal (bare + is literal)", c == 0);
+        if c == 0 {
+            libc::regex::regfree(&mut re);
+        }
+
+        // setlocale 的返回值必须能再喂回自己（POSIX 硬要求）。
+        let cur = libc::locale::setlocale(0, core::ptr::null());
+        rpt.check("setlocale: query returns a name", !cur.is_null());
+        if !cur.is_null() {
+            rpt.check(
+                "setlocale: the returned name is accepted again",
+                !libc::locale::setlocale(0, cur).is_null(),
+            );
+        }
+
+        // mbstowcs 的 len==0：一个元素都不许写。
+        let mut sentinel = [0x7FFFi32; 2];
+        let m = libc::wchar::mbstowcs(
+            sentinel.as_mut_ptr(),
+            b"\0".as_ptr() as *const libc::ctypes::c_char,
+            0,
+        );
+        rpt.check(
+            "mbstowcs(len=0) writes nothing and returns 0",
+            m == 0 && sentinel[0] == 0x7FFF,
+        );
+    }
+
     let mut sum = Vec::new();
     sum.extend_from_slice(b"[libccheck] passed=");
     sum.extend_from_slice(crate::util::u64_to_dec(rpt.pass as u64, &mut [0u8; 24]));
