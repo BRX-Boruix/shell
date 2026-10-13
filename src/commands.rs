@@ -1060,7 +1060,15 @@ fn cmd_ls(arg: &[u8]) -> u8 {
     let mut long_mode = false;
     let mut json_mode = false;
     let mut show_all = false;
-    let mut path = getcwd().unwrap_or_else(|_| alloc::string::String::from("/"));
+    // 取不到当前目录就**如实报错**：此前回退成 "/"，于是用户会看到根目录的列表
+    // 而没有任何提示——那是伪数据（S09），且与"我 ls 的是当前目录"这个前提直接冲突。
+    let mut path = match getcwd() {
+        Ok(p) => p,
+        Err(_) => {
+            out(b"ls: cannot determine the current directory\n");
+            return 1;
+        }
+    };
 
     for tok in a.split(|&c| c.is_ascii_whitespace()).filter(|s| !s.is_empty()) {
         if tok == b"-l" {
@@ -1858,7 +1866,13 @@ fn cmd_pwd() -> u8 {
 fn cmd_tree(arg: &[u8]) -> u8 {
     let a = trim_bytes(arg);
     let mut use_utf8 = false;
-    let mut root_path = getcwd().unwrap_or_else(|_| alloc::string::String::from("/"));
+    let mut root_path = match getcwd() {
+        Ok(p) => p,
+        Err(_) => {
+            out(b"tree: cannot determine the current directory\n");
+            return 1;
+        }
+    };
 
     for tok in a.split(|&c| c.is_ascii_whitespace()).filter(|s| !s.is_empty()) {
         if tok == b"--utf8" {
