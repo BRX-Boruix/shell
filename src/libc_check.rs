@@ -1315,6 +1315,67 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
 
     // 汇总
     // 汇总
+    // ---- 全库转译审查（2026-10-13）新增契约的真机验证 ----
+    //
+    // 这三项都是「把 POSIX 概念落到本项目机制上」时容易只写不验的地方：
+    //   NAME_MAX：VFS 单点契约（vfs::mount::MAX_NAME_BYTES=255）。修复前 RamFS 不校验
+    //     长度，256 字节的名字能建出来，随后 readdir 会**静默截断**它（文件不可寻址）；
+    //   pathconf：曾为**不存在**的行规程子系统报 255（本系统按 ADR-042 无 canonical 模式）；
+    //   srandom：曾因两个**函数内** static 各自一份而根本没给 random 播种。
+    unsafe {
+        let mut long = [b'a'; 300];
+        long[0] = b'/';
+
+        // 255 字节名字（= NAME_MAX）必须成功。
+        long[256] = 0;
+        let ok = libc::unistd::mkdir(long.as_ptr() as *const libc::ctypes::c_char, 0o755);
+        rpt.check("name-max: name of exactly 255 bytes is accepted", ok == 0);
+        if ok == 0 {
+            let _ = libc::unistd::rmdir(long.as_ptr() as *const libc::ctypes::c_char);
+        }
+
+        // 256 字节必须如实 ENAMETOOLONG（不得静默接受，也不得截断成另一个名字）。
+        long[256] = b'a';
+        long[257] = 0;
+        libc::errno::set_errno(0);
+        let over = libc::unistd::mkdir(long.as_ptr() as *const libc::ctypes::c_char, 0o755);
+        rpt.check("name-max: name of 256 bytes is rejected", over == -1);
+        rpt.check(
+            "name-max: rejection is ENAMETOOLONG",
+            libc::errno::errno() == libc::errno::ENAMETOOLONG,
+        );
+
+        // pathconf：只报有真值的名字。
+        let root = b"/\0";
+        let rp = root.as_ptr() as *const libc::ctypes::c_char;
+        rpt.check(
+            "pathconf: _PC_NAME_MAX == 255",
+            libc::unistd::pathconf(rp, libc::unistd::_PC_NAME_MAX) == 255,
+        );
+        libc::errno::set_errno(0);
+        let link_max = libc::unistd::pathconf(rp, libc::unistd::_PC_LINK_MAX);
+        rpt.check("pathconf: _PC_LINK_MAX is 'no limit' (-1)", link_max == -1);
+        rpt.check("pathconf: 'no limit' does not set errno", libc::errno::errno() == 0);
+        libc::errno::set_errno(0);
+        let canon = libc::unistd::pathconf(rp, libc::unistd::_PC_MAX_CANON);
+        rpt.check(
+            "pathconf: no TTY -> _PC_MAX_CANON is EINVAL, not an invented number",
+            canon == -1 && libc::errno::errno() == libc::errno::EINVAL,
+        );
+
+        // srandom 真的给 random 播种。
+        libc::posix_batch2::srandom(12345);
+        let a = libc::posix_batch2::random();
+        libc::posix_batch2::srandom(12345);
+        let b = libc::posix_batch2::random();
+        rpt.check("srandom: the same seed reproduces the same value", a == b);
+        libc::posix_batch2::srandom(67890);
+        rpt.check(
+            "srandom: a different seed produces a different sequence",
+            libc::posix_batch2::random() != a,
+        );
+    }
+
     let mut sum = Vec::new();
     sum.extend_from_slice(b"[libccheck] passed=");
     sum.extend_from_slice(crate::util::u64_to_dec(rpt.pass as u64, &mut [0u8; 24]));
