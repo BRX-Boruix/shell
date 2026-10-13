@@ -1110,8 +1110,9 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             // 这两条断言**锁定如实失败**，防止将来有人塞一个假路径进来。
             libc::errno::set_errno(0);
             let p = unsafe { libc::unistd::ttyname(1) };
-            rpt.check("ttyname(terminal) -> NULL (no node-name channel yet)", p.is_null());
-            rpt.check("ttyname(terminal) sets ENOTTY", libc::errno::errno() == libc::errno::ENOTTY);            // 非终端（普通文件）⇒ NULL 置 ENOTTY。
+            rpt.check("ttyname(terminal) -> NULL (no TTY in this design; ADR-042)", p.is_null());
+            rpt.check("ttyname(terminal) sets ENOTTY", libc::errno::errno() == libc::errno::ENOTTY);
+            // 非终端（普通文件）⇒ NULL 置 ENOTTY。
             let f = b"/ttyname_probe.tmp\0";
             let fd = libc::unistd::open(
                 f.as_ptr() as *const i8,
