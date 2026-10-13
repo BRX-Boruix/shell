@@ -1513,6 +1513,387 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         );
     }
 
+    // ---- 覆盖面补齐（真机专属面）：逐函数断言 ----
+    //
+    // 这些导出的共同点是**需要内核**（VFS / syscall / 堆），宿主构造不出来。
+    // 此前它们只在 libccheck 里被**整体**覆盖（未逐函数断言），本块把它们逐条钉住。
+    unsafe {
+        use libc::ctypes::c_char;
+        fn p(s: &[u8]) -> *const c_char {
+            s.as_ptr() as *const c_char
+        }
+
+        // ===== stdio：文件流 =====
+        let fpath = p(b"/scratch/conf_stream.txt\0");
+        let fp = libc::stdio::fopen(fpath, p(b"w\0"));
+        rpt.check("stdio: fopen(w) returns a stream", !fp.is_null());
+        if !fp.is_null() {
+            // **先定位一次**：ftell 对「从未被 lseek 过的 fd」如实返回 ENOTSUP（见其文档），
+            // 那是诚实边界而不是缺陷。定位之后位置进入用户态位置表，本组才在测缓冲记账。
+            rpt.check("stdio: fseek(0,SET) on a fresh stream", libc::stdio::fseek(fp, 0, 0) == 0);
+            // 内容 = "hello\n" + "X" + "Y" + " n=42" = 6+1+1+5 = 13 字节。
+            rpt.check("stdio: fputs writes", libc::stdio::fputs(p(b"hello\n\0"), fp) >= 0);
+            rpt.check("stdio: fputc writes", libc::stdio::fputc(b'X' as i32, fp) == b'X' as i32);
+            rpt.check("stdio: putc writes", libc::stdio::putc(b'Y' as i32, fp) == b'Y' as i32);
+            rpt.check("stdio: fprintf writes", libc::stdio::fprintf(fp, p(b" n=%d\0"), 42i32) == 5);
+            rpt.check("stdio: fileno >= 0", libc::stdio::fileno(fp) >= 0);
+            rpt.check("stdio: ftell reports 13 bytes written", libc::stdio::ftell(fp) == 13);
+            rpt.check(
+                "stdio: setvbuf on a writable stream",
+                libc::stdio::setvbuf(fp, core::ptr::null_mut(), 0, 128) == 0,
+            );
+            libc::stdio::setbuf(fp, core::ptr::null_mut());
+            rpt.check("stdio: fflush ok", libc::stdio::fflush(fp) == 0);
+            rpt.check("stdio: fseek(0, SEEK_SET) ok", libc::stdio::fseek(fp, 0, 0) == 0);
+            rpt.check("stdio: ftell back to 0", libc::stdio::ftell(fp) == 0);
+            rpt.check("stdio: fclose ok", libc::stdio::fclose(fp) == 0);
+        }
+
+        // **读侧必须另开一个 "r" 流**：以 "w" 打开的流读不了（POSIX）。
+        // 诊断：把文件里的**真实字节**打出来（内容不符时能直接看出差在哪）。
+        {
+            let dfd = libc::unistd::open(fpath, libc::unistd::O_RDONLY, 0);
+            if dfd >= 0 {
+                let mut rawb = [0i8; 32];
+                let n = libc::unistd::read(
+                    dfd,
+                    rawb.as_mut_ptr() as *mut libc::ctypes::c_void,
+                    32,
+                );
+                let _ = libc::unistd::close(dfd);
+                out(b"[libccheck] conf_stream.txt n=");
+                out(crate::util::u64_to_dec(n as u64, &mut [0u8; 24]));
+                out(b" bytes=");
+                if n > 0 {
+                    let v: alloc::vec::Vec<u8> =
+                        rawb[..n as usize].iter().map(|&c| c as u8).collect();
+                    out(&v);
+                }
+                out(b"\n");
+            }
+        }
+        let fr = libc::stdio::fopen(fpath, p(b"r\0"));
+        rpt.check("stdio: fopen(r)", !fr.is_null());
+        if !fr.is_null() {
+            let mut line = [0i8; 16];
+            rpt.check("stdio: fgets reads a line", !libc::stdio::fgets(line.as_mut_ptr(), 16, fr).is_null());
+            rpt.check(
+                "stdio: fgets content",
+                line[..6].iter().map(|&c| c as u8).eq(b"hello\n".iter().copied()),
+            );
+            rpt.check("stdio: getc returns X", libc::stdio::getc(fr) == b'X' as i32);
+            rpt.check("stdio: fgetc returns Y", libc::stdio::fgetc(fr) == b'Y' as i32);
+            while libc::stdio::getc(fr) >= 0 {}
+            rpt.check("stdio: feof set at end", libc::stdio::feof(fr) != 0);
+            rpt.check("stdio: ferror stays 0", libc::stdio::ferror(fr) == 0);
+            libc::stdio::clearerr(fr);
+            rpt.check("stdio: clearerr clears EOF", libc::stdio::feof(fr) == 0);
+            rpt.check("stdio: rewind is void+works", {
+                libc::stdio::rewind(fr);
+                libc::stdio::ftell(fr) == 0
+            });
+            rpt.check(
+                "stdio: freopen reopens as r",
+                !libc::stdio::freopen(fpath, p(b"r\0"), fr).is_null(),
+            );
+            rpt.check("stdio: fclose(read stream)", libc::stdio::fclose(fr) == 0);
+        }
+
+        // fseek 必须**先冲刷**再重定位：写 "12345" → fseek(2) → 写 "abc" → 关，
+        // 内容应是 "12abc"（5 字节）。若缓冲留到重定位之后才写，会变成偏移 2 处
+        // 覆盖成 "12345" 而尾部残留，实测正是这条把缺陷暴露出来的。
+        {
+            let fpath2 = p(b"/scratch/conf_flush.txt\0");
+            let sp = libc::stdio::fopen(fpath2, p(b"w\0"));
+            if !sp.is_null() {
+                let _ = libc::stdio::fputs(p(b"12345\0"), sp);
+                let _ = libc::stdio::fseek(sp, 2, 0);
+                let _ = libc::stdio::fputs(p(b"abc\0"), sp);
+                let _ = libc::stdio::fclose(sp);
+                let dfd = libc::unistd::open(fpath2, libc::unistd::O_RDONLY, 0);
+                let mut rawb = [0i8; 16];
+                let n = if dfd >= 0 {
+                    libc::unistd::read(dfd, rawb.as_mut_ptr() as *mut libc::ctypes::c_void, 16)
+                } else {
+                    -1
+                };
+                if dfd >= 0 {
+                    let _ = libc::unistd::close(dfd);
+                }
+                rpt.check(
+                    "stdio: fseek flushes the write buffer before repositioning",
+                    n == 5
+                        && rawb[0] == b'1' as i8
+                        && rawb[1] == b'2' as i8
+                        && rawb[2] == b'a' as i8
+                        && rawb[3] == b'b' as i8
+                        && rawb[4] == b'c' as i8,
+                );
+            }
+        }
+
+        // fdopen / getdelim / getline：从裸 fd 造流并按行读。
+        let fd = libc::unistd::open(fpath, libc::unistd::O_RDONLY, 0);
+        rpt.check("stdio: raw open for fdopen", fd >= 0);
+        if fd >= 0 {
+            let fp2 = libc::stdio::fdopen(fd, p(b"r\0"));
+            rpt.check("stdio: fdopen wraps a raw fd", !fp2.is_null());
+            if !fp2.is_null() {
+                let mut lp: *mut c_char = core::ptr::null_mut();
+                let mut ln: usize = 0;
+                let n = libc::stdio::getdelim(&mut lp, &mut ln, b'\n' as i32, fp2);
+                rpt.check("stdio: getdelim reads a line", n > 0 && !lp.is_null());
+                if !lp.is_null() {
+                    let _ = libc::malloc::free(lp as *mut u8);
+                }
+                let _ = libc::stdio::fseek(fp2, 0, 0);
+                let mut lp2: *mut c_char = core::ptr::null_mut();
+                let mut ln2: usize = 0;
+                let n2 = libc::stdio::getline(&mut lp2, &mut ln2, fp2);
+                rpt.check("stdio: getline reads a line", n2 > 0 && !lp2.is_null());
+                if !lp2.is_null() {
+                    let _ = libc::malloc::free(lp2 as *mut u8);
+                }
+                rpt.check("stdio: setvbuf on a read-only stream honestly fails", libc::stdio::setvbuf(fp2, core::ptr::null_mut(), 0, 128) != 0);
+                rpt.check("stdio: fclose(fdopen)", libc::stdio::fclose(fp2) == 0);
+            }
+        }
+
+        // sscanf / tmpfile / perror / puts / putchar
+        let mut a: i32 = 0;
+        let mut b: i32 = 0;
+        let ns = libc::stdio::sscanf(p(b"12 34\0"), p(b"%d %d\0"), &mut a as *mut i32, &mut b as *mut i32);
+        rpt.check("stdio: sscanf parses two ints", ns == 2 && a == 12 && b == 34);
+        let tf = libc::stdio::tmpfile();
+        rpt.check("stdio: tmpfile returns a stream", !tf.is_null());
+        if !tf.is_null() {
+            rpt.check("stdio: tmpfile is writable", libc::stdio::fputs(p(b"t\0"), tf) >= 0);
+            rpt.check("stdio: fclose(tmpfile)", libc::stdio::fclose(tf) == 0);
+        }
+        libc::stdio::perror(p(b"libccheck\0"));
+        rpt.check("stdio: puts writes to stdout", libc::stdio::puts(p(b"[libccheck] puts ok\0")) >= 0);
+        rpt.check("stdio: putchar writes to stdout", libc::stdio::putchar(b'.' as i32) == b'.' as i32);
+        rpt.check("stdio: fflush(NULL) flushes all", libc::stdio::fflush(core::ptr::null_mut()) == 0);
+
+        // ===== unistd =====
+        let mut cwdbuf = [0i8; 256];
+        rpt.check("unistd: getcwd", !libc::unistd::getcwd(cwdbuf.as_mut_ptr(), cwdbuf.len()).is_null());
+        let old_mask = libc::unistd::umask(0o022);
+        rpt.check("unistd: umask round trip", libc::unistd::umask(old_mask) == 0o022);
+        rpt.check("unistd: chdir to /scratch", libc::unistd::chdir(p(b"/scratch\0")) == 0);
+        let mut cwdbuf2 = [0i8; 256];
+        libc::unistd::getcwd(cwdbuf2.as_mut_ptr(), cwdbuf2.len());
+        rpt.check("unistd: chdir really moved cwd", {
+            let mut n = 0usize;
+            while cwdbuf2[n] != 0 { n += 1; }
+            cwdbuf2[..n].iter().map(|&c| c as u8).eq(b"/scratch".iter().copied())
+        });
+        let _ = libc::unistd::chdir(p(b"/\0"));
+
+        let fd2 = libc::unistd::open(fpath, libc::unistd::O_RDONLY, 0);
+        if fd2 >= 0 {
+            let d = libc::unistd::dup(fd2);
+            rpt.check("unistd: dup returns a new fd", d >= 0 && d != fd2);
+            let mut buf8 = [0i8; 8];
+            rpt.check("unistd: lseek(0,SET) == 0", libc::unistd::lseek(fd2, 0, 0) == 0);
+            rpt.check("unistd: lseek(5,SET) == 5", libc::unistd::lseek(fd2, 5, 0) == 5);
+            rpt.check("unistd: lseek(-2,END) == 11 (file is 13 bytes)", libc::unistd::lseek(fd2, -2, 2) == 11);
+            rpt.check("unistd: read after seek", libc::unistd::read(fd2, buf8.as_mut_ptr() as *mut libc::ctypes::c_void, 2) == 2);
+            if d >= 0 {
+                let _ = libc::unistd::close(d);
+            }
+            let _ = libc::unistd::close(fd2);
+        }
+
+        // truncate / ftruncate
+        rpt.check("unistd: truncate to 4", libc::unistd::truncate(fpath, 4) == 0);
+        let fd3 = libc::unistd::open(fpath, libc::unistd::O_RDWR, 0);
+        if fd3 >= 0 {
+            rpt.check("unistd: ftruncate to 2", libc::unistd::ftruncate(fd3, 2) == 0);
+            let _ = libc::unistd::close(fd3);
+        }
+
+        // symlink / readlink / realpath
+        rpt.check("unistd: symlink", libc::unistd::symlink(fpath, p(b"/scratch/conf_link\0")) == 0);
+        let mut lbuf = [0i8; 128];
+        let ln = libc::unistd::readlink(p(b"/scratch/conf_link\0"), lbuf.as_mut_ptr(), lbuf.len());
+        rpt.check("unistd: readlink returns the target", ln > 0);
+        let mut rbuf = [0i8; 256];
+        rpt.check("unistd: realpath resolves", !libc::unistd::realpath(p(b"/scratch/conf_link\0"), rbuf.as_mut_ptr()).is_null());
+        rpt.check("unistd: chown to self", libc::unistd::chown(fpath, 0, 0) == 0);
+        let mut mt = *b"/scratch/mtXXXXXX\0";
+        let mr = libc::unistd::mktemp(mt.as_mut_ptr() as *mut c_char);
+        rpt.check("unistd: mktemp substitutes XXXXXX", !mr.is_null() && mt[11] != b'X');
+        rpt.check("unistd: execvp honestly fails", libc::unistd::execvp(p(b"nope\0"), core::ptr::null()) == -1);
+
+        // ===== process =====
+        rpt.check("process: gettid > 0", libc::process::gettid() > 0);
+        rpt.check("process: getppid >= 0", libc::process::getppid() >= 0);
+        // 本系统无 real/effective 之分（见 libc/src/process.rs 的文档）⇒ 两者必须同值。
+        // 不假设环境 uid 具体是多少，但把实测值打出来，便于人工核对。
+        let uid = libc::process::getuid();
+        let euid = libc::process::geteuid();
+        let gid = libc::process::getgid();
+        let egid = libc::process::getegid();
+        out(b"[libccheck] identity uid=");
+        out(crate::util::u64_to_dec(uid as u64, &mut [0u8; 24]));
+        out(b" gid=");
+        out(crate::util::u64_to_dec(gid as u64, &mut [0u8; 24]));
+        out(b"\n");
+        rpt.check("process: geteuid == getuid (no real/effective split)", euid == uid);
+        rpt.check("process: getegid == getgid (no real/effective split)", egid == gid);
+        rpt.check("process: uid is a real value, not (uid_t)-1", uid != u32::MAX);
+        rpt.check("process: yield_sys returns 0", libc::process::yield_sys() == 0);
+        let child = libc::process::fork();
+        if child == 0 {
+            libc::process::_exit(7);
+        }
+        rpt.check("process: fork returns a child pid", child > 0);
+        if child > 0 {
+            let mut st: i32 = 0;
+            let w = libc::process::waitpid(child, &mut st, 0);
+            rpt.check("process: waitpid reaps the child", w == child);
+            rpt.check("process: exit status is 7", ((st >> 8) & 0xFF) == 7);
+        }
+
+        // ===== semaphore =====
+        let mut sem: libc::semaphore::bx_sem_t = core::mem::zeroed();
+        rpt.check("sem: sem_init", libc::semaphore::sem_init(&mut sem, 0, 1) == 0);
+        let mut sv: i32 = -1;
+        rpt.check("sem: sem_getvalue == 1", libc::semaphore::sem_getvalue(&mut sem, &mut sv) == 0 && sv == 1);
+        rpt.check("sem: sem_trywait", libc::semaphore::sem_trywait(&mut sem) == 0);
+        rpt.check("sem: sem_getvalue == 0", libc::semaphore::sem_getvalue(&mut sem, &mut sv) == 0 && sv == 0);
+        rpt.check("sem: sem_post", libc::semaphore::sem_post(&mut sem) == 0);
+        rpt.check("sem: sem_wait", libc::semaphore::sem_wait(&mut sem) == 0);
+        rpt.check("sem: sem_destroy", libc::semaphore::sem_destroy(&mut sem) == 0);
+
+        // ===== time =====
+        let mut ts = libc::time::Timespec { tv_sec: 0, tv_nsec: 0 };
+        rpt.check(
+            "time: clock_gettime(monotonic)",
+            libc::time::clock_gettime(libc::time::CLOCK_MONOTONIC, &mut ts) == 0 && ts.tv_sec >= 0,
+        );
+        let mut tv = libc::time::Timeval { tv_sec: 0, tv_usec: 0 };
+        rpt.check("time: gettimeofday", libc::time::gettimeofday(&mut tv, core::ptr::null_mut()) == 0 && tv.tv_sec > 0);
+        let nap = libc::time::Timespec { tv_sec: 0, tv_nsec: 1_000_000 };
+        rpt.check("time: nanosleep", libc::time::nanosleep(&nap, core::ptr::null_mut()) == 0);
+        rpt.check("time: usleep", libc::time::usleep(1000) == 0);
+        rpt.check("time: nanosleep rejects an invalid nsec", {
+            let bad = libc::time::Timespec { tv_sec: 0, tv_nsec: 2_000_000_000 };
+            libc::time::nanosleep(&bad, core::ptr::null_mut()) == -1
+        });
+
+        // ===== dirent =====
+        let dir = libc::dirent::opendir(p(b"/programs\0"));
+        rpt.check("dirent: opendir(/programs)", !dir.is_null());
+        if !dir.is_null() {
+            let first = libc::dirent::readdir(dir);
+            rpt.check("dirent: readdir returns an entry", !first.is_null());
+            let loc = libc::dirent::telldir(dir);
+            rpt.check("dirent: telldir >= 0", loc >= 0);
+            libc::dirent::seekdir(dir, 0);
+            rpt.check("dirent: seekdir(0) then readdir works", !libc::dirent::readdir(dir).is_null());
+            libc::dirent::rewinddir(dir);
+            rpt.check("dirent: rewinddir then readdir works", !libc::dirent::readdir(dir).is_null());
+            rpt.check("dirent: closedir", libc::dirent::closedir(dir) == 0);
+        }
+        let mut names: *mut *mut libc::dirent::dirent = core::ptr::null_mut();
+        let cnt = libc::dirent::scandir(p(b"/programs\0"), &mut names, None, None);
+        rpt.check("dirent: scandir counts entries", cnt > 0 && !names.is_null());
+        if !names.is_null() {
+            let mut i = 0isize;
+            while i < cnt as isize {
+                let e = *names.offset(i);
+                if !e.is_null() {
+                    let _ = libc::malloc::free(e as *mut u8);
+                }
+                i += 1;
+            }
+            let _ = libc::malloc::free(names as *mut u8);
+        }
+
+        // ===== malloc / string =====
+        let cb = libc::malloc::calloc(4, 8);
+        rpt.check("malloc: calloc returns zeroed memory", !cb.is_null() && core::slice::from_raw_parts(cb, 32).iter().all(|&x| x == 0));
+        if !cb.is_null() {
+            let _ = libc::malloc::free(cb);
+        }
+        let ab = libc::malloc::aligned_alloc(64, 128);
+        rpt.check("malloc: aligned_alloc honours the alignment", !ab.is_null() && (ab as usize) % 64 == 0);
+        if !ab.is_null() {
+            let _ = libc::malloc::free(ab);
+        }
+        let sd = libc::string::strdup(p(b"dup\0"));
+        rpt.check("string: strdup copies", !sd.is_null() && *sd as u8 == b'd');
+        if !sd.is_null() {
+            let _ = libc::malloc::free(sd as *mut u8);
+        }
+        let sn = libc::string::strndup(p(b"abcdef\0"), 3);
+        rpt.check("string: strndup respects n", !sn.is_null() && *sn.add(3) == 0 && *sn as u8 == b'a');
+        if !sn.is_null() {
+            let _ = libc::malloc::free(sn as *mut u8);
+        }
+
+        // ===== wchar：多字节 ↔ 宽（逐字节编码） =====
+        let mb = b"AB\0";
+        let mut wbuf = [0 as libc::ctypes::wchar_t; 4];
+        let mut srcp = mb.as_ptr() as *const c_char;
+        rpt.check("wchar: mbsrtowcs converts", libc::wchar::mbsrtowcs(wbuf.as_mut_ptr(), &mut srcp, 4, core::ptr::null_mut()) == 2);
+        let mut back = [0i8; 4];
+        let mut wp = wbuf.as_ptr();
+        rpt.check("wchar: wcsrtombs converts back", libc::wchar::wcsrtombs(back.as_mut_ptr(), &mut wp, 4, core::ptr::null_mut()) == 2);
+        rpt.check("wchar: round trip content", back[0] == b'A' as i8 && back[1] == b'B' as i8);
+
+        // ===== glob =====
+        let mut g = libc::glob::glob_t { gl_pathc: 0, gl_pathv: core::ptr::null_mut(), gl_offs: 0 };
+        let gr = libc::glob::glob(p(b"/programs/*.elf\0"), 0, None, &mut g);
+        rpt.check("glob: expands /programs/*.elf", gr == 0 && g.gl_pathc > 0);
+        if gr == 0 {
+            libc::glob::globfree(&mut g);
+            rpt.check("glob: globfree released the result", g.gl_pathv.is_null() || g.gl_pathc == 0);
+        }
+
+        // ===== posix_batch3：临时文件与定位 IO =====
+        let mut tmpl = *b"/scratch/mkXXXXXX\0";
+        let mfd = libc::posix_batch3::mkstemp(tmpl.as_mut_ptr() as *mut c_char);
+        rpt.check("posix3: mkstemp creates a file", mfd >= 0);
+        if mfd >= 0 {
+            rpt.check("posix3: pwrite at offset 0", libc::posix_batch3::pwrite(mfd, p(b"zz\0") as *const libc::ctypes::c_void, 2, 0) == 2);
+            let mut rb = [0i8; 4];
+            rpt.check("posix3: pread at offset 0", libc::posix_batch3::pread(mfd, rb.as_mut_ptr() as *mut libc::ctypes::c_void, 2, 0) == 2);
+            rpt.check("posix3: pread content", rb[0] == b'z' as i8 && rb[1] == b'z' as i8);
+            let _ = libc::unistd::close(mfd);
+        }
+        let mut dtmpl = *b"/scratch/dkXXXXXX\0";
+        let dr = libc::posix_batch3::mkdtemp(dtmpl.as_mut_ptr() as *mut c_char);
+        rpt.check("posix3: mkdtemp creates a directory", !dr.is_null());
+        if !dr.is_null() {
+            let _ = libc::unistd::rmdir(dtmpl.as_ptr() as *const c_char);
+        }
+
+        // ===== mman =====
+        let sz: usize = 4096;
+        let addr = libc::mman::mmap(
+            core::ptr::null_mut(),
+            sz,
+            libc::mman::PROT_READ | libc::mman::PROT_WRITE,
+            libc::mman::MAP_ANONYMOUS | libc::mman::MAP_PRIVATE,
+            -1,
+            0,
+        );
+        rpt.check("mman: mmap anonymous", addr != libc::mman::MAP_FAILED);
+        if addr != libc::mman::MAP_FAILED {
+            // **必须先触碰**：mmap 给的是按需分页，而内核 protect_user 要求整段**已映射**
+            // （任一页不在页表就如实 NotFound）。这与 sigaltstack 那条同一形态的调用方契约。
+            core::ptr::write_bytes(addr as *mut u8, 0xA5, 16);
+            rpt.check(
+                "mman: mprotect to read-only",
+                libc::mman::mprotect(addr, sz, libc::mman::PROT_READ) == 0,
+            );
+            rpt.check("mman: munmap", libc::mman::munmap(addr, sz) == 0);
+        }
+    }
+
     let mut sum = Vec::new();
     sum.extend_from_slice(b"[libccheck] passed=");
     sum.extend_from_slice(crate::util::u64_to_dec(rpt.pass as u64, &mut [0u8; 24]));
