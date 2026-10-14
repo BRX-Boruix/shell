@@ -67,7 +67,7 @@ pub(crate) fn env_get(name: &[u8]) -> Option<Vec<u8>> {
 /// **为什么必须有内置默认**：3P6-1 的验收要在 shell 里直接敲 `tcc`。若没有
 /// 默认值，首次登录的 shell 里根本没有 `PATH`，用户必须先 `export PATH=...`
 /// 才能用——那是把「系统该怎么找到程序」这件系统的事推给每个用户。
-pub(crate) const DEFAULT_PATH: &[u8] = b"/programs:/volumes/BORUIX_DATA/3p";
+pub(crate) const DEFAULT_PATH: &[u8] = crate::abi_generated::DEFAULT_PATH;
 
 /// 确保 `PATH` 有值：**仅在尚未定义时**写入内置默认。
 ///
