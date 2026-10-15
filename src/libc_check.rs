@@ -1942,6 +1942,54 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         let mut mt = *b"/scratch/mtXXXXXX\0";
         let mr = libc::unistd::mktemp(mt.as_mut_ptr() as *mut c_char);
         rpt.check("unistd: mktemp substitutes XXXXXX", !mr.is_null() && mt[11] != b'X');
+        // POSIX 对 unlink/rmdir 的**类型**约束：内核删除原语同时支持删文件与空目录
+        // （ramfs::unlink 只看「非空与否」、不看类型）⇒ 不做这层判定时，unlink(空目录)
+        // 会真的把目录删掉、rmdir(普通文件) 会真的把文件删掉。libc 用 lstat 取类型真值。
+        {
+            let dpath = p(b"/scratch/conf_unlink_dir\0");
+            let _ = libc::unistd::rmdir(dpath); // 清理可能的残留
+            rpt.check(
+                "unistd: mkdir for unlink-type test",
+                libc::unistd::mkdir(dpath, 0o755) == 0,
+            );
+            libc::errno::set_errno(0);
+            rpt.check("unistd: unlink(dir) -> -1", libc::unistd::unlink(dpath) == -1);
+            rpt.check(
+                "unistd: unlink(dir) sets EPERM",
+                libc::errno::errno() == libc::errno::EPERM,
+            );
+            // 目录必须**还在**（缺陷版会把它删掉）。
+            let mut dst: libc::unistd::stat = unsafe { core::mem::zeroed() };
+            rpt.check(
+                "unistd: unlink(dir) did not delete the directory",
+                unsafe { libc::unistd::stat(dpath, &mut dst) } == 0,
+            );
+            rpt.check("unistd: rmdir(dir) still works", libc::unistd::rmdir(dpath) == 0);
+
+            let fpath9 = p(b"/scratch/conf_rmdir_file\0");
+            let fd9 = libc::unistd::open(
+                fpath9,
+                libc::unistd::O_CREAT | libc::unistd::O_RDWR,
+                0o600,
+            );
+            rpt.check("unistd: create file for rmdir-type test", fd9 >= 0);
+            if fd9 >= 0 {
+                let _ = libc::unistd::close(fd9);
+            }
+            libc::errno::set_errno(0);
+            rpt.check("unistd: rmdir(file) -> -1", libc::unistd::rmdir(fpath9) == -1);
+            rpt.check(
+                "unistd: rmdir(file) sets ENOTDIR",
+                libc::errno::errno() == libc::errno::ENOTDIR,
+            );
+            // 文件必须**还在**（缺陷版会把它删掉）。
+            let mut fst: libc::unistd::stat = unsafe { core::mem::zeroed() };
+            rpt.check(
+                "unistd: rmdir(file) did not delete the file",
+                unsafe { libc::unistd::stat(fpath9, &mut fst) } == 0,
+            );
+            rpt.check("unistd: remove(file) still works", libc::unistd::remove(fpath9) == 0);
+        }
         rpt.check("unistd: execvp honestly fails", libc::unistd::execvp(p(b"nope\0"), core::ptr::null()) == -1);
 
         // ===== process =====
