@@ -1947,6 +1947,28 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         // ===== process =====
         rpt.check("process: gettid > 0", libc::process::gettid() > 0);
         rpt.check("process: getppid >= 0", libc::process::getppid() >= 0);
+        // kill 的 pid 三档语义（POSIX）：本系统**无进程组**（getpgrp/setpgid/setsid 属登记缺失项），
+        // 每个进程自成一个组 ⇒ pid==0 等价于发给自己（此前把 pid=0 直接下发，内核查不到该 pid
+        // ⇒ EINVAL，连 kill(0,0) 探活自己都失败）；pid<0（进程组/全体）做不到 ⇒ 如实 ENOTSUP。
+        libc::errno::set_errno(0);
+        rpt.check(
+            "process: kill(0, 0) -> 0 (no process groups: the group is just self)",
+            libc::process::kill(0, 0) == 0,
+        );
+        rpt.check(
+            "process: kill(getpid(), 0) -> 0",
+            libc::process::kill(libc::process::getpid(), 0) == 0,
+        );
+        libc::errno::set_errno(0);
+        rpt.check("process: kill(-1, 0) -> -1", libc::process::kill(-1, 0) == -1);
+        rpt.check(
+            "process: kill(-1, 0) sets ENOTSUP (process groups unsupported)",
+            libc::errno::errno() == libc::errno::ENOTSUP,
+        );
+        rpt.check(
+            "process: kill(nonexistent pid, 0) -> -1",
+            libc::process::kill(9999, 0) == -1,
+        );
         // 本系统无 real/effective 之分（见 libc/src/process.rs 的文档）⇒ 两者必须同值。
         // 不假设环境 uid 具体是多少，但把实测值打出来，便于人工核对。
         let uid = libc::process::getuid();
