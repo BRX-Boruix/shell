@@ -502,6 +502,23 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         rpt.check("sigaction set rc==0", rsa == 0);
         rpt.check("sigaction oact old==DFL", oact.sa_handler == libc::signal::SIG_DFL);
 
+        // **纯查询模式**（`act==NULL`）：走内核的 `a4=1` 模式位——一次 syscall、不改状态。
+        // 断言两件：(a) 查回来的就是刚装的那个 handler；(b) 查完之后它**还在**（下面的 raise 仍进
+        // handler）。旧实现是「设 SIG_DFL 读旧值、再设回去」的两次 syscall，中间那段处置真的是
+        // SIG_DFL——本用例钉的是**新路径的行为**（查询不改状态），旧路径在无竞争时也能过前一条，
+        // 但第二条（查完 handler 仍在且仍会跑）正是"没被查询顺手重置"的直接证据。
+        let mut q: libc::signal::sigaction = core::mem::zeroed();
+        let rq = libc::signal::sigaction(
+            libc::signal::SIGUSR1,
+            core::ptr::null(),
+            &mut q as *mut libc::signal::sigaction,
+        );
+        rpt.check("sigaction query rc==0", rq == 0);
+        rpt.check(
+            "sigaction query returns installed handler",
+            q.sa_handler == libc_sigusr1_handler as *const () as usize,
+        );
+
         // 真机投递：raise 自身 + yield 让内核投递进 handler
         SIG_LIBC_RAN.store(0, Ordering::SeqCst);
         let rr = libc::signal::raise(libc::signal::SIGUSR1);
