@@ -2209,6 +2209,42 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             "mman: mmap unknown prot bit sets EINVAL",
             libc::errno::errno() == libc::errno::EINVAL,
         );
+        // POSIX：`addr` 是**提示**（非 NULL 且未设 MAP_FIXED 时实现可另择地址，调用方须用
+        // 返回值）——此前对任何非 NULL addr 都返回 ENOTSUP，把合法的「带提示」调用拒掉了。
+        let hint = libc::mman::mmap(
+            4096usize as *mut libc::ctypes::c_void,
+            sz,
+            libc::mman::PROT_READ | libc::mman::PROT_WRITE,
+            libc::mman::MAP_ANONYMOUS | libc::mman::MAP_PRIVATE,
+            -1,
+            0,
+        );
+        rpt.check(
+            "mman: mmap treats addr as a hint (may relocate)",
+            hint != libc::mman::MAP_FAILED,
+        );
+        if hint != libc::mman::MAP_FAILED {
+            rpt.check("mman: munmap the hinted mapping", libc::mman::munmap(hint, sz) == 0);
+        }
+        // MAP_FIXED（Linux 值 0x10）本实现做不到「必须放在这里」⇒ 如实拒绝，**不静默忽略**：
+        // 静默忽略会让调用方以为映射落在指定地址，实际落在内核挑的地址上。
+        libc::errno::set_errno(0);
+        let fx = libc::mman::mmap(
+            core::ptr::null_mut(),
+            sz,
+            libc::mman::PROT_READ | libc::mman::PROT_WRITE,
+            libc::mman::MAP_ANONYMOUS | libc::mman::MAP_PRIVATE | 0x10,
+            -1,
+            0,
+        );
+        rpt.check(
+            "mman: mmap(MAP_FIXED) -> MAP_FAILED (cannot honour)",
+            fx == libc::mman::MAP_FAILED,
+        );
+        rpt.check(
+            "mman: mmap(MAP_FIXED) sets ENOTSUP",
+            libc::errno::errno() == libc::errno::ENOTSUP,
+        );
     }
 
     // ---- 覆盖面补齐（第二批真机专属面）：spawn / access / lstat / fgetpos ----
