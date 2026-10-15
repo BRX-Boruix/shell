@@ -321,13 +321,13 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
 
     // 6b) fscanf %lc / %ls 宽字符（经内核 VFS 文件流）
     unsafe {
-        let wpath = b"/tmp/libc_wide.txt ".as_ptr() as *const i8;
-        let wfp = libc::stdio::fopen(wpath, b"w+ ".as_ptr() as *const i8);
+        let wpath = b"/tmp/libc_wide.txt\0".as_ptr() as *const i8;
+        let wfp = libc::stdio::fopen(wpath, b"w+\0".as_ptr() as *const i8);
         if !wfp.is_null() {
-            let wdata = b"AB 42 ".as_ptr() as *const core::ffi::c_void;
+            let wdata = b"AB 42\0".as_ptr() as *const core::ffi::c_void;
             libc::stdio::fwrite(wdata, 1, 5, wfp);
             libc::stdio::fclose(wfp);
-            let wfr = libc::stdio::fopen(wpath, b"r ".as_ptr() as *const i8);
+            let wfr = libc::stdio::fopen(wpath, b"r\0".as_ptr() as *const i8);
             if !wfr.is_null() {
                 let mut w1: i32 = 0;
                 let mut w2: i32 = 0;
@@ -339,7 +339,7 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
                 rpt.check("fscanf %lc 'A''B'", w1 == b'A' as i32 && w2 == b'B' as i32);
                 libc::stdio::fclose(wfr);
             }
-            let wfr2 = libc::stdio::fopen(wpath, b"r ".as_ptr() as *const i8);
+            let wfr2 = libc::stdio::fopen(wpath, b"r\0".as_ptr() as *const i8);
             if !wfr2.is_null() {
                 let mut ws = [0i32; 8];
                 let mut num: i32 = 0;
@@ -447,13 +447,13 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
 
     // 9) mkdir / opendir / readdir / closedir / remove（经内核 VFS）
     unsafe {
-        let tdir = b"/tmp_libc_dir ".as_ptr() as *const i8;
+        let tdir = b"/tmp_libc_dir\0".as_ptr() as *const i8;
         // mkdir 755
         let rc = libc::unistd::mkdir(tdir, 0o755);
         rpt.check("mkdir rc==0", rc == 0);
         // 在目录内创建文件
-        let tfile = b"/tmp_libc_dir/hello.txt ".as_ptr() as *const i8;
-        let fp = libc::stdio::fopen(tfile, b"w ".as_ptr() as *const i8);
+        let tfile = b"/tmp_libc_dir/hello.txt\0".as_ptr() as *const i8;
+        let fp = libc::stdio::fopen(tfile, b"w\0".as_ptr() as *const i8);
         let file_created = !fp.is_null();
         if !fp.is_null() { libc::stdio::fclose(fp); }
         rpt.check("mkdir create file in dir", file_created);
@@ -547,17 +547,17 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
     // 12) stat / fstat / chmod / rename（经内核 VFS + INode::metadata/set_permissions）
     unsafe {
         // 在根目录下创建独立测试目录与文件。
-        let sdir = b"/tmp_libc_sd ".as_ptr() as *const i8;
+        let sdir = b"/tmp_libc_sd\0".as_ptr() as *const i8;
         let _ = libc::unistd::mkdir(sdir, 0o755);
-        let fa = b"/tmp_libc_sd/a.txt ".as_ptr() as *const i8;
-        let fp = libc::stdio::fopen(fa, b"w ".as_ptr() as *const i8);
+        let fa = b"/tmp_libc_sd/a.txt\0".as_ptr() as *const i8;
+        let fp = libc::stdio::fopen(fa, b"w\0".as_ptr() as *const i8);
         if !fp.is_null() {
-            libc::stdio::fwrite(b"abc ".as_ptr() as *const core::ffi::c_void, 1, 3, fp);
+            libc::stdio::fwrite(b"abc\0".as_ptr() as *const core::ffi::c_void, 1, 3, fp);
             libc::stdio::fclose(fp);
         }
 
         // rename：a.txt -> b.txt（同目录内重命名）。
-        let fb = b"/tmp_libc_sd/b.txt ".as_ptr() as *const i8;
+        let fb = b"/tmp_libc_sd/b.txt\0".as_ptr() as *const i8;
         let rr = libc::unistd::rename(fa, fb);
         rpt.check("rename rc==0", rr == 0);
         // 重命名后旧名不应再存在。
@@ -876,7 +876,7 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             // **有效但非终端** => 0 并置 ENOTTY（POSIX）。此前不置 errno，于是"stdout 被重定向到
             // 普通文件"这个最常见的情形下，调用方读 errno 会拿到**上一次的残留值**。
             {
-                let p2 = b"/config/isatty_probe.tmp ";
+                let p2 = b"/config/isatty_probe.tmp\0";
                 let ifd = libc::unistd::open(
                     p2.as_ptr() as *const i8,
                     libc::unistd::O_CREAT | libc::unistd::O_RDWR,
@@ -1925,6 +1925,16 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         rpt.check("unistd: symlink", libc::unistd::symlink(fpath, p(b"/scratch/conf_link\0")) == 0);
         let mut lbuf = [0i8; 128];
         let ln = libc::unistd::readlink(p(b"/scratch/conf_link\0"), lbuf.as_mut_ptr(), lbuf.len());
+        // POSIX readlink：缓冲不足 ⇒ **截断**并返回「写入缓冲的字节数」（= bufsiz），
+        // 不是 ERANGE（ERANGE 不在 readlink 的错误表里）。此前本实现返回 -1/ERANGE。
+        let mut tbuf = [0i8; 8];
+        libc::errno::set_errno(0);
+        let tn = libc::unistd::readlink(p(b"/scratch/conf_link\0"), tbuf.as_mut_ptr(), 8);
+        rpt.check("unistd: readlink truncates to bufsiz", tn == 8);
+        rpt.check(
+            "unistd: readlink truncated bytes are the prefix",
+            tbuf.iter().map(|&c| c as u8).eq(b"/scratch".iter().copied()),
+        );
         rpt.check("unistd: readlink returns the target", ln > 0);
         let mut rbuf = [0i8; 256];
         rpt.check("unistd: realpath resolves", !libc::unistd::realpath(p(b"/scratch/conf_link\0"), rbuf.as_mut_ptr()).is_null());
@@ -2098,8 +2108,37 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
                 "mman: mprotect to read-only",
                 libc::mman::mprotect(addr, sz, libc::mman::PROT_READ) == 0,
             );
+            // 未知 prot 位必须**如实拒绝**（内核 map_flags_from_prot 的单点判定），
+            // 不能被 libc 掩码掉当成 PROT_DEFAULT(RW) 成功返回。
+            libc::errno::set_errno(0);
+            rpt.check(
+                "mman: mprotect with an unknown prot bit -> -1",
+                libc::mman::mprotect(addr, sz, 0x100) == -1,
+            );
+            rpt.check(
+                "mman: mprotect unknown prot bit sets EINVAL",
+                libc::errno::errno() == libc::errno::EINVAL,
+            );
             rpt.check("mman: munmap", libc::mman::munmap(addr, sz) == 0);
         }
+        // 未知 prot 位的 mmap：内核单点拒绝（InvalidParam ⇒ EINVAL），不得被掩码成 PROT_DEFAULT。
+        libc::errno::set_errno(0);
+        let bad = libc::mman::mmap(
+            core::ptr::null_mut(),
+            4096,
+            0x100,
+            libc::mman::MAP_ANONYMOUS | libc::mman::MAP_PRIVATE,
+            -1,
+            0,
+        );
+        rpt.check(
+            "mman: mmap with an unknown prot bit -> MAP_FAILED",
+            bad == libc::mman::MAP_FAILED,
+        );
+        rpt.check(
+            "mman: mmap unknown prot bit sets EINVAL",
+            libc::errno::errno() == libc::errno::EINVAL,
+        );
     }
 
     // ---- 覆盖面补齐（第二批真机专属面）：spawn / access / lstat / fgetpos ----
