@@ -812,6 +812,34 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
                 let rc = libc::unistd::fsync(pfd[0]);
                 rpt.check("fsync(pipe) -> -1", rc == -1);
                 rpt.check("fsync(pipe) sets EINVAL", libc::errno::errno() == libc::errno::EINVAL);
+
+                // POSIX：管道**不可定位** ⇒ lseek 必须 ESPIPE，而且**不得**把该 fd 转入
+                // 「用户态维护位置」模式——否则此后 read/write 会走定位 I/O，被内核按节点
+                // 真值拒绝，一个探测性 lseek 就把管道用坏了。故探完还要**证明管道仍可用**。
+                libc::errno::set_errno(0);
+                let lr = libc::unistd::lseek(pfd[0], 0, 0 /* SEEK_SET */);
+                rpt.check("lseek(pipe, SET) -> -1", lr == -1);
+                rpt.check(
+                    "lseek(pipe, SET) sets ESPIPE",
+                    libc::errno::errno() == libc::errno::ESPIPE,
+                );
+                let msg = b"ok";
+                let wn = libc::unistd::write(
+                    pfd[1],
+                    msg.as_ptr() as *const core::ffi::c_void,
+                    2,
+                );
+                rpt.check("pipe still writable after lseek probe", wn == 2);
+                let mut rb = [0u8; 2];
+                let rn = libc::unistd::read(
+                    pfd[0],
+                    rb.as_mut_ptr() as *mut core::ffi::c_void,
+                    2,
+                );
+                rpt.check(
+                    "pipe still readable after lseek probe",
+                    rn == 2 && &rb == b"ok",
+                );
                 let _ = libc::unistd::close(pfd[0]);
                 let _ = libc::unistd::close(pfd[1]);
             }
@@ -843,6 +871,29 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             }
             rpt.check("fchmod(bad fd) -> -1", libc::unistd::fchmod(9999, 0o644) == -1);
             rpt.check("fchown(bad fd) -> -1", libc::unistd::fchown(9999, 0, 0) == -1);
+
+            // ---- isatty 的 errno 语义（语义忠实性审查）----
+            // **有效但非终端** => 0 并置 ENOTTY（POSIX）。此前不置 errno，于是"stdout 被重定向到
+            // 普通文件"这个最常见的情形下，调用方读 errno 会拿到**上一次的残留值**。
+            {
+                let p2 = b"/config/isatty_probe.tmp ";
+                let ifd = libc::unistd::open(
+                    p2.as_ptr() as *const i8,
+                    libc::unistd::O_CREAT | libc::unistd::O_RDWR,
+                    0o600,
+                );
+                rpt.check("isatty: open probe file", ifd >= 0);
+                if ifd >= 0 {
+                    libc::errno::set_errno(0);
+                    rpt.check("isatty(regular file) -> 0", libc::unistd::isatty(ifd) == 0);
+                    rpt.check(
+                        "isatty(regular file) sets ENOTTY",
+                        libc::errno::errno() == libc::errno::ENOTTY,
+                    );
+                    let _ = libc::unistd::close(ifd);
+                    let _ = libc::unistd::remove(p2.as_ptr() as *const i8);
+                }
+            }
             let mut pfd2 = [0i32; 2];
             if libc::posix_batch2::pipe(pfd2.as_mut_ptr()) == 0 {
                 rpt.check("fchmod(pipe) -> -1", libc::unistd::fchmod(pfd2[0], 0o644) == -1);
