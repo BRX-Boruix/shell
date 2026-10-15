@@ -1743,6 +1743,146 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         rpt.check("stdio: putchar writes to stdout", libc::stdio::putchar(b'.' as i32) == b'.' as i32);
         rpt.check("stdio: fflush(NULL) flushes all", libc::stdio::fflush(core::ptr::null_mut()) == 0);
 
+        // ---- 语义忠实性审查 第五轮：stdio 的 x/e 后缀、freopen 冲刷、lseek 坏 fd ----
+        {
+            // `fopen(p, "wx")`：O_CREAT|O_EXCL —— 文件已存在必须**失败**（EEXIST），
+            // 且**绝不能截断**它。此前 `x` 被静默忽略 ⇒ "wx" 退化成 "w" ⇒ 销毁数据。
+            let xpath = p(b"/scratch/conf_excl.txt\0");
+            let seed = libc::stdio::fopen(xpath, p(b"w\0"));
+            rpt.check("stdio: seed file for O_EXCL test", !seed.is_null());
+            if !seed.is_null() {
+                let _ = libc::stdio::fputs(p(b"KEEPDATA\0"), seed);
+                let _ = libc::stdio::fclose(seed);
+            }
+            libc::errno::set_errno(0);
+            let wx = libc::stdio::fopen(xpath, p(b"wx\0"));
+            rpt.check("stdio: fopen(wx) on existing file -> NULL", wx.is_null());
+            rpt.check(
+                "stdio: fopen(wx) sets EEXIST",
+                libc::errno::errno() == libc::errno::EEXIST,
+            );
+            // 关键：原内容必须**还在**（被截断就说明 x 没生效）。
+            let chk = libc::stdio::fopen(xpath, p(b"r\0"));
+            rpt.check("stdio: reopen for O_EXCL content check", !chk.is_null());
+            if !chk.is_null() {
+                let mut cb = [0i8; 16];
+                let got = libc::stdio::fgets(cb.as_mut_ptr(), 16, chk);
+                rpt.check(
+                    "stdio: fopen(wx) did not truncate the file",
+                    !got.is_null()
+                        && cb[..8].iter().map(|&c| c as u8).eq(b"KEEPDATA".iter().copied()),
+                );
+                let _ = libc::stdio::fclose(chk);
+            }
+            // `x` 与 `r` 同用：POSIX 未定义 ⇒ 本实现**明确拒绝**（EINVAL），不静默降级。
+            libc::errno::set_errno(0);
+            let rx = libc::stdio::fopen(xpath, p(b"rx\0"));
+            rpt.check("stdio: fopen(rx) rejected (POSIX-undefined combo)", rx.is_null());
+            rpt.check(
+                "stdio: fopen(rx) sets EINVAL",
+                libc::errno::errno() == libc::errno::EINVAL,
+            );
+            // `e` 后缀（O_CLOEXEC）**在机内不可观测**：内核没有查询已打开 fd 标志的原语
+            // （fcntl(F_GETFD) 恒 0，见第五轮登记）。故这里只断言「被接受且流可用」，
+            // **不**假装验证了 CLOEXEC 位。
+            let we = libc::stdio::fopen(p(b"/scratch/conf_cloexec.txt\0"), p(b"we\0"));
+            rpt.check("stdio: fopen(we) accepted (CLOEXEC bit not observable in-guest)", !we.is_null());
+            if !we.is_null() {
+                let _ = libc::stdio::fclose(we);
+            }
+            let _ = libc::unistd::remove(xpath);
+            let _ = libc::unistd::remove(p(b"/scratch/conf_cloexec.txt\0"));
+        }
+
+        // `freopen` 必须**先冲刷旧流**（POSIX/C：先关闭旧文件，关闭含冲刷）。
+        // 此前不冲刷：全缓冲写流上 fputs 之后直接 freopen，缓冲字节被静默丢弃。
+        {
+            let a1 = p(b"/scratch/conf_freopen_a.txt\0");
+            let a2 = p(b"/scratch/conf_freopen_b.txt\0");
+            let sfp = libc::stdio::fopen(a1, p(b"w\0"));
+            rpt.check("stdio: freopen test stream", !sfp.is_null());
+            if !sfp.is_null() {
+                let _ = libc::stdio::fputs(p(b"FLUSHME\0"), sfp);
+                // **不** fflush：交给 freopen 的「关闭旧文件」去冲刷。
+                rpt.check(
+                    "stdio: freopen to a second file",
+                    !libc::stdio::freopen(a2, p(b"w\0"), sfp).is_null(),
+                );
+                let _ = libc::stdio::fclose(sfp);
+                let dfd = libc::unistd::open(a1, libc::unistd::O_RDONLY, 0);
+                let mut rb = [0i8; 16];
+                let n = if dfd >= 0 {
+                    libc::unistd::read(dfd, rb.as_mut_ptr() as *mut libc::ctypes::c_void, 16)
+                } else {
+                    -1
+                };
+                if dfd >= 0 {
+                    let _ = libc::unistd::close(dfd);
+                }
+                rpt.check(
+                    "stdio: freopen flushed the old stream's buffer",
+                    n == 7 && rb[..7].iter().map(|&c| c as u8).eq(b"FLUSHME".iter().copied()),
+                );
+            }
+            let _ = libc::unistd::remove(a1);
+            let _ = libc::unistd::remove(a2);
+        }
+
+        // `lseek` 对**坏 fd**：POSIX 要求 -1/EBADF（此前返回 0，假成功）。
+        // 另：探针前移到 `whence` 之前后，管道上的 SEEK_CUR/SEEK_END 也如实 ESPIPE。
+        {
+            libc::errno::set_errno(0);
+            rpt.check("unistd: lseek(bad fd) -> -1", libc::unistd::lseek(9999, 0, 0) == -1);
+            rpt.check(
+                "unistd: lseek(bad fd) sets EBADF",
+                libc::errno::errno() == libc::errno::EBADF,
+            );
+            let mut pp = [0i32; 2];
+            if libc::posix_batch2::pipe(pp.as_mut_ptr()) == 0 {
+                libc::errno::set_errno(0);
+                rpt.check("unistd: lseek(pipe, CUR) -> -1", libc::unistd::lseek(pp[0], 0, 1) == -1);
+                rpt.check(
+                    "unistd: lseek(pipe, CUR) sets ESPIPE",
+                    libc::errno::errno() == libc::errno::ESPIPE,
+                );
+                libc::errno::set_errno(0);
+                rpt.check("unistd: lseek(pipe, END) -> -1", libc::unistd::lseek(pp[0], 0, 2) == -1);
+                rpt.check(
+                    "unistd: lseek(pipe, END) sets ESPIPE",
+                    libc::errno::errno() == libc::errno::ESPIPE,
+                );
+                let _ = libc::unistd::close(pp[0]);
+                let _ = libc::unistd::close(pp[1]);
+            }
+        }
+        // `fclose` 必须把**最终冲刷的失败**报出来（POSIX/C：关闭失败 ⇒ EOF）。
+        // 构造一个必然失败的冲刷：内核句柄的 write=false（只读打开的 fd）被 `fdopen`
+        // 包成写流 ⇒ 全缓冲收下字节 ⇒ fclose 冲刷时内核按句柄方向拒绝（PermissionDenied）。
+        {
+            let ropath = p(b"/scratch/conf_fclose_fail.txt\0");
+            let mk = libc::stdio::fopen(ropath, p(b"w\0"));
+            if !mk.is_null() {
+                let _ = libc::stdio::fputs(p(b"z\0"), mk);
+                let _ = libc::stdio::fclose(mk);
+            }
+            let rofd = libc::unistd::open(ropath, libc::unistd::O_RDONLY, 0);
+            rpt.check("stdio: open O_RDONLY for flush-failure test", rofd >= 0);
+            if rofd >= 0 {
+                let wf = libc::stdio::fdopen(rofd, p(b"w\0"));
+                rpt.check("stdio: fdopen(O_RDONLY fd, w) returns a stream", !wf.is_null());
+                if !wf.is_null() {
+                    // 进缓冲（全缓冲），此刻还没有任何 syscall 失败。
+                    let _ = libc::stdio::fputs(p(b"DATA\0"), wf);
+                    rpt.check(
+                        "stdio: fclose returns EOF when the final flush fails",
+                        libc::stdio::fclose(wf) == -1,
+                    );
+                } else {
+                    let _ = libc::unistd::close(rofd);
+                }
+            }
+            let _ = libc::unistd::remove(ropath);
+        }
         // ===== unistd =====
         let mut cwdbuf = [0i8; 256];
         rpt.check("unistd: getcwd", !libc::unistd::getcwd(cwdbuf.as_mut_ptr(), cwdbuf.len()).is_null());
