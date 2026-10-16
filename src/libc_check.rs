@@ -2185,6 +2185,59 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
                 let _ = libc::unistd::close(pp[1]);
             }
         }
+        // ---- 登记项⑨：「设置位置」是内核原语，且 dup 出来的 fd **共享**位置 ----
+        // POSIX：dup/dup2 得到的 fd 与原来那个属于**同一个打开文件描述** ⇒ 共享文件位置。
+        // 登记项⑨ 之前，libc 在用户态按 fd 号维护位置表 ⇒ dup 只能**拷贝**（此后各走各的）✗。
+        {
+            let spath = p(b"/scratch/conf_seek_share\0");
+            let sfd = libc::unistd::open(
+                spath,
+                libc::unistd::O_CREAT | libc::unistd::O_RDWR,
+                0o600,
+            );
+            rpt.check("seek: create file", sfd >= 0);
+            if sfd >= 0 {
+                let msg = b"0123456789";
+                let w = libc::unistd::write(sfd, msg.as_ptr() as *const core::ffi::c_void, msg.len());
+                rpt.check("seek: wrote 10 bytes", w == 10);
+                // (a) SEEK_SET 真的生效（内核持有位置）
+                rpt.check(
+                    "seek: lseek(fd, 0, SEEK_SET) -> 0",
+                    libc::unistd::lseek(sfd, 0, libc::unistd::SEEK_SET) == 0,
+                );
+                let mut b1 = [0u8; 4];
+                rpt.check(
+                    "seek: read after seek gives the head",
+                    libc::unistd::read(sfd, b1.as_mut_ptr() as *mut core::ffi::c_void, 4) == 4 && &b1 == b"0123",
+                );
+                // (b) **dup 出来的 fd 与原来那个共享位置**（判别性）
+                let dfd = libc::unistd::dup(sfd);
+                rpt.check("seek: dup() -> new fd", dfd >= 0);
+                if dfd >= 0 {
+                    rpt.check(
+                        "seek: lseek(dup fd, 6, SEEK_SET) -> 6",
+                        libc::unistd::lseek(dfd, 6, libc::unistd::SEEK_SET) == 6,
+                    );
+                    let mut b2 = [0u8; 2];
+                    rpt.check(
+                        "seek: read on the ORIGINAL fd continues from the dup'd fd's position",
+                        libc::unistd::read(sfd, b2.as_mut_ptr() as *mut core::ffi::c_void, 2) == 2
+                            && &b2 == b"67",
+                    );
+                    rpt.check(
+                        "seek: SEEK_CUR on the dup'd fd reflects the shared position",
+                        libc::unistd::lseek(dfd, 0, libc::unistd::SEEK_CUR) == 8,
+                    );
+                    let _ = libc::unistd::close(dfd);
+                }
+                rpt.check(
+                    "seek: lseek(fd, 0, SEEK_END) -> 10",
+                    libc::unistd::lseek(sfd, 0, libc::unistd::SEEK_END) == 10,
+                );
+                let _ = libc::unistd::close(sfd);
+                let _ = libc::unistd::unlink(spath);
+            }
+        }
         // `fclose` 必须把**最终冲刷的失败**报出来（POSIX/C：关闭失败 ⇒ EOF）。
         // 构造一个必然失败的冲刷：内核句柄的 write=false（只读打开的 fd）被 `fdopen`
         // 包成写流 ⇒ 全缓冲收下字节 ⇒ fclose 冲刷时内核按句柄方向拒绝（PermissionDenied）。
