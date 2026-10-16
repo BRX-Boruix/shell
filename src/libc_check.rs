@@ -1388,6 +1388,74 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
                     );
                 }
                 let _ = unsafe { libc::mman::munmap(pn, 4096) };
+
+                // (f) **从未触碰**的映射也必须能 mprotect（POSIX：mprotect 改的是**映射的
+                //     权限**，与页是否已驻留无关）。此前内核先扫一遍「每页都已映射」，
+                //     对刚 mmap、还没碰过的区间直接报 ENOENT。
+                let pu = unsafe {
+                    libc::mman::mmap(
+                        core::ptr::null_mut(),
+                        4096,
+                        libc::mman::PROT_READ | libc::mman::PROT_WRITE,
+                        libc::mman::MAP_PRIVATE | libc::mman::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                rpt.check("prot_none: mmap for the never-touched test", pu != libc::mman::MAP_FAILED);
+                if pu != libc::mman::MAP_FAILED {
+                    rpt.check(
+                        "prot_none: mprotect on a NEVER-TOUCHED mapping works",
+                        unsafe { libc::mman::mprotect(pu, 4096, libc::mman::PROT_READ) } == 0,
+                    );
+                    // (g) 新权限必须**作用于首次提交**：改成 PROT_NONE 之后，子进程读一次必须
+                    //     fault（handler ⇒ _exit(42)）。若内核把新权限丢了、仍按旧 RW 提交这一页，
+                    //     读就会成功 ⇒ 退出码 0 ⇒ 红。
+                    rpt.check(
+                        "prot_none: mprotect(PROT_NONE) on the never-touched mapping",
+                        unsafe { libc::mman::mprotect(pu, 4096, 0) } == 0,
+                    );
+                    let kid2 = libc::process::fork();
+                    if kid2 == 0 {
+                        extern "C" fn on_segv2(_s: i32) {
+                            libc::process::_exit(42);
+                        }
+                        let sa2 = libc::signal::sigaction {
+                            sa_handler: on_segv2 as usize,
+                            sa_mask: 0,
+                            sa_flags: 0,
+                            sa_restorer: core::ptr::null_mut(),
+                        };
+                        let _ = unsafe {
+                            libc::signal::sigaction(libc::signal::SIGSEGV, &sa2, core::ptr::null_mut())
+                        };
+                        let v2 = unsafe { core::ptr::read_volatile(pu as *const u8) };
+                        libc::process::_exit(v2 as i32); // 没 fault ⇒ 退出码 0
+                    }
+                    rpt.check("prot_none: never-touched fault probe forked", kid2 > 0);
+                    if kid2 > 0 {
+                        let mut st2: i32 = 0;
+                        let mut waited2 = 0;
+                        let mut w2 = 0;
+                        loop {
+                            w2 = libc::process::waitpid(kid2, &mut st2, libc::unistd::WNOHANG);
+                            if w2 == kid2 || w2 == -1 || waited2 > 60 {
+                                break;
+                            }
+                            let _ = libsys::sleep(50_000_000);
+                            waited2 += 1;
+                        }
+                        if w2 != kid2 {
+                            let _ = libc::process::kill(kid2, libc::signal::SIGKILL);
+                            let _ = libc::process::waitpid(kid2, &mut st2, 0);
+                        }
+                        rpt.check(
+                            "prot_none: never-touched mapping faults on first touch (exit 42)",
+                            w2 == kid2 && ((st2 >> 8) & 0xFF) == 42,
+                        );
+                    }
+                    let _ = unsafe { libc::mman::munmap(pu, 4096) };
+                }
             }
         }
         // ---- 登记项⑩：信号处置是**进程级**的（fork 继承；组内线程共享）----
@@ -1424,14 +1492,25 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
                 let r = unsafe {
                     libc::signal::sigaction(libc::signal::SIGUSR1, core::ptr::null(), &mut old)
                 };
-                // 继承到 handler ⇒ 42；仍是 SIG_DFL（缺陷版）⇒ 0。
-                libc::process::_exit(if r == 0 && old.sa_handler == on_pw as usize { 42 } else { 0 });
+                // 退出码可区分（便于定位）：42 = 继承到 handler；41 = **查询本身失败**；
+                // 40 = 查询成功但处置不是它（SIG_DFL，缺陷版）。
+                let code = if r != 0 {
+                    41
+                } else if old.sa_handler == on_pw as usize {
+                    42
+                } else {
+                    40
+                };
+                libc::process::_exit(code);
             }
             rpt.check("sigproc: fork for the inheritance probe", kid > 0);
             if kid > 0 {
                 let mut st: i32 = 0;
                 let w = libc::process::waitpid(kid, &mut st, 0);
                 rpt.check("sigproc: inheritance probe reaped", w == kid);
+                out(b"[sigproc] child exit = ");
+                out(crate::util::u64_to_dec(((st >> 8) & 0xFF) as u64, &mut [0u8; 24]));
+                out(b" (42=inherited, 41=query failed, 40=default)\n");
                 rpt.check(
                     "sigproc: the child INHERITED the handler (POSIX fork)",
                     w == kid && ((st >> 8) & 0xFF) == 42,
@@ -2660,14 +2739,21 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             rpt.check("process: exit status is 7", ((st >> 8) & 0xFF) == 7);
         }
         // ---- 登记项⑧：waitpid 的 pid 语义与 ECHILD ----
-        // **判别性设计（确定性）**：fork 两个子进程（退出码 11 / 22），父**先睡 150ms**
-        // 让两个子都成为 zombie，再**指定**等 k2。
-        // 若 pid 被丢掉（旧行为「等任意子」），内核按 pid 升序取第一个 zombie ⇒ 收走 k1
-        // ⇒ 下面第一条断言就红（确定性，不依赖调度先后）。
+        // **判别性：只有 ECHILD 那一半有**（pid 那一半**如实登记为没有**）。
         //
-        // **第一版设计不是判别性的**（留档）：两个子进程都立即退出、父**不睡**就直接
-        // 指定等 k2——那时 k1 可能还没成为 zombie，WAIT_ANY 等到的第一个可能是 k2，
-        // 于是变异运行里它**没红**。是「反向验证」把这条弱门禁抓出来的。
+        // 三次尝试想把「按 pid 等」也做成确定性判据，都没成（全部留档，不再硬凑）：
+        //   1) 两个子进程都立即退出、父不睡就指定等 k2 ⇒ k1 可能还没成为 zombie，
+        //      WAIT_ANY 等到的第一个可能是 k2 ⇒ 变异下**没红**；
+        //   2) 父先睡 150ms 让两个子都成 zombie、再指定等 k2（依赖「k1 的 pid 更小」）
+        //      ⇒ **pid 会被复用**，前提不成立 ⇒ 变异下**仍没红**；
+        //   3) **管道握手**（k2 阻塞在管道读上、父睡后发 WNOHANG）⇒ 实测 k2 在父发问**之前**
+        //      就退出了（诊断：`k2 was already reapable (w0=13)`，且它的读连 EINTR 重试都没
+        //      兜住）⇒ 子进程的阻塞读在这条路径上**没能把它留住**。
+        //      ⇒ 这本身是一条**新线索**（子进程对继承来的管道端的阻塞读行为），已登记待查；
+        //      在查清之前，这一半的门禁**只是能通过，不是能证伪**。
+        //
+        // 下面这版就是绿过、也跑过变异的那一版（保留它 + 上面的登记，而不是留一个
+        // 好看但不可靠的「判别性」设计）。
         let k1 = libc::process::fork();
         if k1 == 0 {
             libc::process::_exit(11);
@@ -2679,6 +2765,7 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         libc::time::usleep(150_000);
         rpt.check("waitpid: two children forked", k1 > 0 && k2 > 0);
         if k1 > 0 && k2 > 0 {
+
             let mut s1: i32 = 0;
             let w1 = libc::process::waitpid(k2, &mut s1, 0);
             rpt.check("waitpid: waitpid(k2) returns k2", w1 == k2);
