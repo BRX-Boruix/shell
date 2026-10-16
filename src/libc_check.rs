@@ -871,6 +871,121 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             }
             rpt.check("fchmod(bad fd) -> -1", libc::unistd::fchmod(9999, 0o644) == -1);
             rpt.check("fchown(bad fd) -> -1", libc::unistd::fchown(9999, 0, 0) == -1);
+        // ---- 语义忠实性审查登记项①：坏 fd ⇒ **EBADF**（内核新增 BadFd 错误码）----
+        // 在此之前内核错误集里没有 EBADF：读/写坏 fd 报 EINVAL、fstat/close 报 ENOENT、
+        // 读只写 fd 报 EACCES（与「节点权限不足」同码，用户态无法区分）。
+        {
+            let mut one = [0u8; 1];
+            libc::errno::set_errno(0);
+            rpt.check(
+                "badfd: read(bad fd) -> -1",
+                libc::unistd::read(9999, one.as_mut_ptr() as *mut core::ffi::c_void, 1) == -1,
+            );
+            rpt.check(
+                "badfd: read(bad fd) sets EBADF",
+                libc::errno::errno() == libc::errno::EBADF,
+            );
+            libc::errno::set_errno(0);
+            rpt.check(
+                "badfd: write(bad fd) -> -1",
+                libc::unistd::write(9999, one.as_ptr() as *const core::ffi::c_void, 1) == -1,
+            );
+            rpt.check(
+                "badfd: write(bad fd) sets EBADF",
+                libc::errno::errno() == libc::errno::EBADF,
+            );
+            libc::errno::set_errno(0);
+            let mut st9: libc::unistd::stat = unsafe { core::mem::zeroed() };
+            rpt.check(
+                "badfd: fstat(bad fd) -> -1",
+                unsafe { libc::unistd::fstat(9999, &mut st9) } == -1,
+            );
+            rpt.check(
+                "badfd: fstat(bad fd) sets EBADF",
+                libc::errno::errno() == libc::errno::EBADF,
+            );
+            libc::errno::set_errno(0);
+            rpt.check("badfd: close(bad fd) -> -1", libc::unistd::close(9999) == -1);
+            rpt.check(
+                "badfd: close(bad fd) sets EBADF",
+                libc::errno::errno() == libc::errno::EBADF,
+            );
+            libc::errno::set_errno(0);
+            rpt.check(
+                "badfd: dup2(bad fd, 200) -> -1",
+                libc::unistd::dup2(9999, 200) == -1,
+            );
+            rpt.check(
+                "badfd: dup2(bad fd) sets EBADF",
+                libc::errno::errno() == libc::errno::EBADF,
+            );
+            libc::errno::set_errno(0);
+            rpt.check(
+                "badfd: ftruncate(bad fd, 0) -> -1",
+                libc::unistd::ftruncate(9999, 0) == -1,
+            );
+            rpt.check(
+                "badfd: ftruncate(bad fd) sets EBADF",
+                libc::errno::errno() == libc::errno::EBADF,
+            );
+            libc::errno::set_errno(0);
+            rpt.check("badfd: fsync(bad fd) -> -1", libc::unistd::fsync(9999) == -1);
+            rpt.check(
+                "badfd: fsync(bad fd) sets EBADF",
+                libc::errno::errno() == libc::errno::EBADF,
+            );
+            libc::errno::set_errno(0);
+            rpt.check(
+                "badfd: fchmod(bad fd) -> -1",
+                libc::unistd::fchmod(9999, 0o644) == -1,
+            );
+            rpt.check(
+                "badfd: fchmod(bad fd) sets EBADF",
+                libc::errno::errno() == libc::errno::EBADF,
+            );
+        }
+
+        // ---- 登记项①（方向那一半）：对**未以该方向打开**的 fd 读写 ⇒ EBADF ----
+        {
+            // 注意：本块的 `p` 是外层作用域里的字节串变量（不是那个 helper fn），
+            // 故这里直接取指针。
+            let dpath = b"/scratch/conf_badfd_dir.txt\0".as_ptr() as *const libc::ctypes::c_char;
+            let ro = libc::unistd::open(
+                dpath,
+                libc::unistd::O_CREAT | libc::unistd::O_RDONLY,
+                0o600,
+            );
+            rpt.check("badfd: open O_RDONLY for direction test", ro >= 0);
+            if ro >= 0 {
+                let b2 = [0u8; 1];
+                libc::errno::set_errno(0);
+                rpt.check(
+                    "badfd: write(read-only fd) -> -1",
+                    libc::unistd::write(ro, b2.as_ptr() as *const core::ffi::c_void, 1) == -1,
+                );
+                rpt.check(
+                    "badfd: write(read-only fd) sets EBADF",
+                    libc::errno::errno() == libc::errno::EBADF,
+                );
+                let _ = libc::unistd::close(ro);
+            }
+            let wo = libc::unistd::open(dpath, libc::unistd::O_WRONLY, 0);
+            rpt.check("badfd: open O_WRONLY for direction test", wo >= 0);
+            if wo >= 0 {
+                let mut b3 = [0u8; 1];
+                libc::errno::set_errno(0);
+                rpt.check(
+                    "badfd: read(write-only fd) -> -1",
+                    libc::unistd::read(wo, b3.as_mut_ptr() as *mut core::ffi::c_void, 1) == -1,
+                );
+                rpt.check(
+                    "badfd: read(write-only fd) sets EBADF",
+                    libc::errno::errno() == libc::errno::EBADF,
+                );
+                let _ = libc::unistd::close(wo);
+            }
+            let _ = libc::unistd::remove(dpath);
+        }
 
             // ---- isatty 的 errno 语义（语义忠实性审查）----
             // **有效但非终端** => 0 并置 ENOTTY（POSIX）。此前不置 errno，于是"stdout 被重定向到
