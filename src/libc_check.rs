@@ -1223,6 +1223,103 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             rpt.check("alarm: SIGALRM delivered within bound",
                 ALRM.load(core::sync::atomic::Ordering::SeqCst) == 1);
         }
+        // ---- 登记项⑥：PROT_NONE（存在但不可访问）----
+        {
+            // (a) POSIX 调用形态：prot == 0 的 mmap 必须**成功**（不是 ENOTSUP/EINVAL）。
+            let pn0 = unsafe {
+                libc::mman::mmap(
+                    core::ptr::null_mut(),
+                    4096,
+                    0,
+                    libc::mman::MAP_PRIVATE | libc::mman::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            rpt.check("prot_none: mmap(prot=0) succeeds", pn0 != libc::mman::MAP_FAILED);
+            if pn0 != libc::mman::MAP_FAILED {
+                let _ = unsafe { libc::mman::munmap(pn0, 4096) };
+            }
+            // (b) 先 RW 映射并**触碰**（按需分页要真落帧——见报告里登记的
+            //     「mprotect 对从未触碰的页返回 NotFound」缺口），再改权限。
+            let pn = unsafe {
+                libc::mman::mmap(
+                    core::ptr::null_mut(),
+                    4096,
+                    libc::mman::PROT_READ | libc::mman::PROT_WRITE,
+                    libc::mman::MAP_PRIVATE | libc::mman::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            rpt.check("prot_none: mmap(RW) succeeds", pn != libc::mman::MAP_FAILED);
+            if pn != libc::mman::MAP_FAILED {
+                unsafe { core::ptr::write_volatile(pn as *mut u8, 7) };
+                rpt.check(
+                    "prot_none: touched page reads back",
+                    unsafe { core::ptr::read_volatile(pn as *const u8) } == 7,
+                );
+                rpt.check(
+                    "prot_none: mprotect(prot=0) is supported",
+                    unsafe { libc::mman::mprotect(pn, 4096, 0) } == 0,
+                );
+                // 「存在」：改成只读应当成功 ⇒ 是「存在但不可访问」，不是「根本没映射」。
+                rpt.check(
+                    "prot_none: mapping is present (mprotect to READ works)",
+                    unsafe { libc::mman::mprotect(pn, 4096, libc::mman::PROT_READ) } == 0,
+                );
+                rpt.check(
+                    "prot_none: mprotect(prot=0) again",
+                    unsafe { libc::mman::mprotect(pn, 4096, 0) } == 0,
+                );
+                // 「不可访问」：交给子进程真读一次。若内核仍把它当 RW（旧行为 prot=0 →
+                // PROT_DEFAULT），读会成功 ⇒ 子进程 _exit(读到的值 = 0) ⇒ 断言红。
+                let kid = libc::process::fork();
+                if kid == 0 {
+                    extern "C" fn on_segv(_s: i32) {
+                        libc::process::_exit(42);
+                    }
+                    let sa = libc::signal::sigaction {
+                        sa_handler: on_segv as usize,
+                        sa_mask: 0,
+                        sa_flags: 0,
+                        sa_restorer: core::ptr::null_mut(),
+                    };
+                    let _ = unsafe {
+                        libc::signal::sigaction(libc::signal::SIGSEGV, &sa, core::ptr::null_mut())
+                    };
+                    let v = unsafe { core::ptr::read_volatile(pn as *const u8) };
+                    libc::process::_exit(v as i32); // 没 fault ⇒ 退出码 0
+                }
+                rpt.check("prot_none: fault probe child forked", kid > 0);
+                if kid > 0 {
+                    // **有界等待**（最多 ~3s）：若内核把 PROT_NONE 当成「待提交」而陷入
+                    // 「提交 → 重试 → 再 fault」的死循环，这里必须能脱身并判红，
+                    // 绝不能让整轮 libccheck 挂死（登记项⑦ 上已经吃过一次挂死的亏）。
+                    let mut st: i32 = 0;
+                    let mut waited = 0;
+                    let mut w = 0;
+                    loop {
+                        w = libc::process::waitpid(kid, &mut st, libc::unistd::WNOHANG);
+                        if w == kid || w == -1 || waited > 60 {
+                            break;
+                        }
+                        let _ = libsys::sleep(50_000_000);
+                        waited += 1;
+                    }
+                    if w != kid {
+                        let _ = libc::process::kill(kid, libc::signal::SIGKILL);
+                        let _ = libc::process::waitpid(kid, &mut st, 0);
+                    }
+                    rpt.check("prot_none: fault probe reaped (bounded wait)", w == kid);
+                    rpt.check(
+                        "prot_none: access faults (child handler ran -> exit 42)",
+                        w == kid && ((st >> 8) & 0xFF) == 42,
+                    );
+                }
+                let _ = unsafe { libc::mman::munmap(pn, 4096) };
+            }
+        }
         // ---- 登记项⑦：nanosleep 的 rem（被信号打断时写回剩余时长）----
         // **只做可验证的那一半**：不被打断时 `nanosleep` 成功返回 0，且**不碰** `rem`。
         //
