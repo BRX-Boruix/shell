@@ -553,9 +553,65 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         let wc = libc::unistd::write(newfd, b"".as_ptr() as *const core::ffi::c_void, 0);
         let _ = wc;
         libc::unistd::close(newfd);
-        // F_GETFD：无 fd 标志 → 0。
+        // F_GETFD：stdout 未带 CLOEXEC ⇒ 0。**登记项③ 之后这是真值**，不再是硬编码近似。
         let gfd = libc::unistd::fcntl(1, libc::unistd::F_GETFD, 0);
         rpt.check("fcntl F_GETFD==0", gfd == 0);
+        // ---- 登记项③：fd-flags 原语（兑现 F_GETFD / F_SETFD）----
+        {
+            let ff = b"/scratch/conf_fdflags\0".as_ptr() as *const i8;
+            let fd = libc::unistd::open(
+                ff,
+                libc::unistd::O_CREAT | libc::unistd::O_RDWR | libc::unistd::O_CLOEXEC,
+                0o600,
+            );
+            rpt.check("fdflags: open(O_CLOEXEC) -> fd", fd >= 0);
+            if fd >= 0 {
+                // (a) 如实报出 FD_CLOEXEC（旧实现恒 0 ⇒ 这条必红，是判别性断言）
+                rpt.check(
+                    "fdflags: F_GETFD reports FD_CLOEXEC for an O_CLOEXEC fd",
+                    libc::unistd::fcntl(fd, libc::unistd::F_GETFD) == libc::unistd::FD_CLOEXEC,
+                );
+                // (b) F_SETFD(0) **真的**清掉它（旧实现只是「没做」）
+                rpt.check(
+                    "fdflags: F_SETFD(0) -> 0",
+                    libc::unistd::fcntl(fd, libc::unistd::F_SETFD, 0) == 0,
+                );
+                rpt.check(
+                    "fdflags: F_GETFD after clearing -> 0",
+                    libc::unistd::fcntl(fd, libc::unistd::F_GETFD) == 0,
+                );
+                // (c) 再设回去
+                rpt.check(
+                    "fdflags: F_SETFD(FD_CLOEXEC) -> 0",
+                    libc::unistd::fcntl(fd, libc::unistd::F_SETFD, libc::unistd::FD_CLOEXEC) == 0,
+                );
+                rpt.check(
+                    "fdflags: F_GETFD after setting -> FD_CLOEXEC",
+                    libc::unistd::fcntl(fd, libc::unistd::F_GETFD) == libc::unistd::FD_CLOEXEC,
+                );
+                // (d) 坏 fd ⇒ -1/EBADF
+                libc::errno::set_errno(0);
+                rpt.check(
+                    "fdflags: F_GETFD(bad fd) -> -1",
+                    libc::unistd::fcntl(9999, libc::unistd::F_GETFD) == -1,
+                );
+                rpt.check(
+                    "fdflags: F_GETFD(bad fd) sets EBADF",
+                    libc::errno::errno() == libc::errno::EBADF,
+                );
+                let _ = libc::unistd::close(fd);
+            }
+            // (e) 普通 fd ⇒ 0（既不是恒 0 也不是恒 FD_CLOEXEC：真在查标志位）
+            let fd2 = libc::unistd::open(ff, libc::unistd::O_RDWR, 0o600);
+            if fd2 >= 0 {
+                rpt.check(
+                    "fdflags: F_GETFD == 0 for a plain fd",
+                    libc::unistd::fcntl(fd2, libc::unistd::F_GETFD) == 0,
+                );
+                let _ = libc::unistd::close(fd2);
+            }
+            let _ = libc::unistd::unlink(ff);
+        }
     }
 
     // 12) stat / fstat / chmod / rename（经内核 VFS + INode::metadata/set_permissions）
@@ -2112,12 +2168,20 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
                 "stdio: fopen(rx) sets EINVAL",
                 libc::errno::errno() == libc::errno::EINVAL,
             );
-            // `e` 后缀（O_CLOEXEC）**在机内不可观测**：内核没有查询已打开 fd 标志的原语
-            // （fcntl(F_GETFD) 恒 0，见第五轮登记）。故这里只断言「被接受且流可用」，
-            // **不**假装验证了 CLOEXEC 位。
+            // `e` 后缀（O_CLOEXEC）：**登记项③ 之后在机内可观测了**——内核有了每-fd 标志的
+            // 查询原语，故这里直接断言「流可用 **且** 它的 fd 真的带 FD_CLOEXEC」。
+            // （此前那句「不可观测、fcntl(F_GETFD) 恒 0」是第五轮的登记，现已兑现。）
             let we = libc::stdio::fopen(p(b"/scratch/conf_cloexec.txt\0"), p(b"we\0"));
-            rpt.check("stdio: fopen(we) accepted (CLOEXEC bit not observable in-guest)", !we.is_null());
+            rpt.check("stdio: fopen(we) accepted", !we.is_null());
             if !we.is_null() {
+                let wfd = libc::stdio::fileno(we);
+                rpt.check("stdio: fileno(we) -> fd", wfd >= 0);
+                rpt.check(
+                    "stdio: fopen(we) really set FD_CLOEXEC on its fd",
+                    wfd >= 0
+                        && libc::unistd::fcntl(wfd, libc::unistd::F_GETFD)
+                            == libc::unistd::FD_CLOEXEC,
+                );
                 let _ = libc::stdio::fclose(we);
             }
             let _ = libc::unistd::remove(xpath);
