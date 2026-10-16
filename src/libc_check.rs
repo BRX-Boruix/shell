@@ -2235,6 +2235,79 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             rpt.check("process: waitpid reaps the child", w == child);
             rpt.check("process: exit status is 7", ((st >> 8) & 0xFF) == 7);
         }
+        // ---- 登记项⑧：waitpid 的 pid 语义与 ECHILD ----
+        // **判别性设计（确定性）**：fork 两个子进程（退出码 11 / 22），父**先睡 150ms**
+        // 让两个子都成为 zombie，再**指定**等 k2。
+        // 若 pid 被丢掉（旧行为「等任意子」），内核按 pid 升序取第一个 zombie ⇒ 收走 k1
+        // ⇒ 下面第一条断言就红（确定性，不依赖调度先后）。
+        //
+        // **第一版设计不是判别性的**（留档）：两个子进程都立即退出、父**不睡**就直接
+        // 指定等 k2——那时 k1 可能还没成为 zombie，WAIT_ANY 等到的第一个可能是 k2，
+        // 于是变异运行里它**没红**。是「反向验证」把这条弱门禁抓出来的。
+        let k1 = libc::process::fork();
+        if k1 == 0 {
+            libc::process::_exit(11);
+        }
+        let k2 = libc::process::fork();
+        if k2 == 0 {
+            libc::process::_exit(22);
+        }
+        libc::time::usleep(150_000);
+        rpt.check("waitpid: two children forked", k1 > 0 && k2 > 0);
+        if k1 > 0 && k2 > 0 {
+            let mut s1: i32 = 0;
+            let w1 = libc::process::waitpid(k2, &mut s1, 0);
+            rpt.check("waitpid: waitpid(k2) returns k2", w1 == k2);
+            rpt.check("waitpid: k2 exit code is 22", ((s1 >> 8) & 0xFF) == 22);
+            let mut s2: i32 = 0;
+            let w2 = libc::process::waitpid(k1, &mut s2, 0);
+            rpt.check("waitpid: waitpid(k1) returns k1", w2 == k1);
+            rpt.check("waitpid: k1 exit code is 11", ((s2 >> 8) & 0xFF) == 11);
+            // 已收尸 ⇒ ECHILD（POSIX：该 pid 已不存在）。
+            libc::errno::set_errno(0);
+            rpt.check(
+                "waitpid: re-waitpid(k1) -> -1",
+                libc::process::waitpid(k1, &mut s2, 0) == -1,
+            );
+            rpt.check(
+                "waitpid: re-waitpid(k1) sets ECHILD",
+                libc::errno::errno() == libc::errno::ECHILD,
+            );
+        }
+        // 不存在的 pid ⇒ ECHILD（此前是 ENOENT）。
+        libc::errno::set_errno(0);
+        let mut sx: i32 = 0;
+        rpt.check(
+            "waitpid: waitpid(999999) -> -1",
+            libc::process::waitpid(999_999, &mut sx, 0) == -1,
+        );
+        rpt.check(
+            "waitpid: waitpid(999999) sets ECHILD",
+            libc::errno::errno() == libc::errno::ECHILD,
+        );
+        // 无子进程 ⇒ ECHILD（用 WNOHANG 形态，避免阻塞）。
+        libc::errno::set_errno(0);
+        rpt.check(
+            "waitpid: waitpid(-1, WNOHANG) with no children -> -1",
+            libc::process::waitpid(-1, &mut sx, libc::unistd::WNOHANG) == -1,
+        );
+        rpt.check(
+            "waitpid: waitpid(-1, WNOHANG) with no children sets ECHILD",
+            libc::errno::errno() == libc::errno::ECHILD,
+        );
+        // pid==0（同进程组）/ pid<-1（进程组 |pid|）：本系统无进程组 ⇒ 如实 ENOTSUP。
+        libc::errno::set_errno(0);
+        rpt.check("waitpid: waitpid(0) -> -1", libc::process::waitpid(0, &mut sx, 0) == -1);
+        rpt.check(
+            "waitpid: waitpid(0) sets ENOTSUP (no process groups)",
+            libc::errno::errno() == libc::errno::ENOTSUP,
+        );
+        libc::errno::set_errno(0);
+        rpt.check("waitpid: waitpid(-2) -> -1", libc::process::waitpid(-2, &mut sx, 0) == -1);
+        rpt.check(
+            "waitpid: waitpid(-2) sets ENOTSUP (no process groups)",
+            libc::errno::errno() == libc::errno::ENOTSUP,
+        );
 
         // ===== semaphore =====
         let mut sem: libc::semaphore::bx_sem_t = core::mem::zeroed();
