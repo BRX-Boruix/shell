@@ -2370,6 +2370,58 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             );
             rpt.check("unistd: remove(file) still works", libc::unistd::remove(fpath9) == 0);
         }
+        // ---- 登记项⑤：**内核删除原语自己**按类型判定（消 TOCTOU）----
+        // 直接走 libsys（**绕开** libc 的预检），证明判定内建在删除原语里——
+        // 这正是「判定与删除同一临界区」的可证形态：调用方**不可能**先看类型再删。
+        {
+            let kdir = "/scratch/conf_del_kernel_dir";
+            let _ = libsys::rmdir(kdir); // 清理残留
+            rpt.check(
+                "del: mkdir for kernel-level type test",
+                libc::unistd::mkdir(p(b"/scratch/conf_del_kernel_dir\0"), 0o755) == 0,
+            );
+            // (a) unlink（FileOnly）作用在**目录**上：内核必须拒绝……
+            rpt.check(
+                "del: libsys::unlink(<dir>) -> Err (kernel-side type check)",
+                libsys::unlink(kdir).is_err(),
+            );
+            // ……而且目录**必须还在**（缺陷版会把它真的删掉）。
+            let mut kdst: libc::unistd::stat = unsafe { core::mem::zeroed() };
+            rpt.check(
+                "del: the directory survived libsys::unlink",
+                unsafe { libc::unistd::stat(p(b"/scratch/conf_del_kernel_dir\0"), &mut kdst) } == 0
+                    && kdst.st_mode & libc::unistd::S_IFMT == libc::unistd::S_IFDIR,
+            );
+            // (b) rmdir（DirOnly）作用在**普通文件**上：内核必须拒绝
+            let kfile = "/scratch/conf_del_kernel_file";
+            let kfd = libc::unistd::open(
+                p(b"/scratch/conf_del_kernel_file\0"),
+                libc::unistd::O_CREAT | libc::unistd::O_RDWR,
+                0o600,
+            );
+            rpt.check("del: create file for kernel-level rmdir test", kfd >= 0);
+            if kfd >= 0 {
+                let _ = libc::unistd::close(kfd);
+            }
+            rpt.check(
+                "del: libsys::rmdir(<file>) -> Err (kernel-side type check)",
+                libsys::rmdir(kfile).is_err(),
+            );
+            let mut kfst: libc::unistd::stat = unsafe { core::mem::zeroed() };
+            rpt.check(
+                "del: the file survived libsys::rmdir",
+                unsafe { libc::unistd::stat(p(b"/scratch/conf_del_kernel_file\0"), &mut kfst) } == 0,
+            );
+            // (c) 正常路径仍然工作（判定没有把合法删除一起拒掉）。
+            rpt.check(
+                "del: libsys::rmdir(<dir>) works",
+                libsys::rmdir(kdir).is_ok(),
+            );
+            rpt.check(
+                "del: libsys::remove(<file>) works",
+                libsys::remove(kfile).is_ok(),
+            );
+        }
         rpt.check("unistd: execvp honestly fails", libc::unistd::execvp(p(b"nope\0"), core::ptr::null()) == -1);
 
         // ===== process =====
