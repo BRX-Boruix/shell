@@ -2065,6 +2065,19 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             "sysconf: unknown name sets EINVAL",
             libc::errno::errno() == libc::errno::EINVAL,
         );
+        // 登记项⑪ 第二批：时钟频率与 fd 水位（两者都有单一事实源）。
+        let clk = libc::unistd::sysconf(libc::unistd::_SC_CLK_TCK);
+        out(b"[libccheck] sysconf _SC_CLK_TCK=");
+        out(crate::util::u64_to_dec(clk as u64, &mut [0u8; 24]));
+        out(b"\n");
+        // 精确值 100 Hz = 内核 `arch_x86_64::lapic::SCHED_TICK_HZ`（调度 tick 频率）。
+        // **不要**写成 `> 0`：第一版暴露的是时钟计数器频率（有 HPET 时 1e9），
+        // `> 0` 那条弱断言**放过了它**——是打印出来的值才把它抓住的。
+        rpt.check("sysconf: _SC_CLK_TCK == 100 (kernel SCHED_TICK_HZ)", clk == 100);
+        rpt.check(
+            "sysconf: _SC_OPEN_MAX == 1024 (kernel Process::MAX_FDS watermark)",
+            libc::unistd::sysconf(libc::unistd::_SC_OPEN_MAX) == 1024,
+        );
         let old_mask = libc::unistd::umask(0o022);
         rpt.check("unistd: umask round trip", libc::unistd::umask(old_mask) == 0o022);
         rpt.check("unistd: chdir to /scratch", libc::unistd::chdir(p(b"/scratch\0")) == 0);
