@@ -1223,6 +1223,27 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             rpt.check("alarm: SIGALRM delivered within bound",
                 ALRM.load(core::sync::atomic::Ordering::SeqCst) == 1);
         }
+        // ---- 登记项⑦：nanosleep 的 rem（被信号打断时写回剩余时长）----
+        // **只做可验证的那一半**：不被打断时 `nanosleep` 成功返回 0，且**不碰** `rem`。
+        //
+        // **为什么不做「被打断」那一半——一个重大发现（已登记，待独立排查）**：
+        // 把「装 SIGALRM handler + alarm(1) + nanosleep(3s)」放进机内用例后，
+        // **libccheck 永久挂起**（20 分钟无任何输出，只剩内核周期性 intel-hda 日志）。
+        // 即：**一个正在定时睡眠的进程收到信号后不再返回**。这是**内核缺陷**，不是 libc 侧：
+        // 本轮 libc 的改动只在 `libsys::sleep` **返回之后**写 rem，不可能让它不返回。
+        // 详见报告「第十五轮」的登记（含复现步骤）。
+        {
+            let req0 = libc::time::Timespec { tv_sec: 0, tv_nsec: 10_000_000 };
+            let mut rem0 = libc::time::Timespec { tv_sec: 77, tv_nsec: 77 };
+            rpt.check(
+                "nanosleep: uninterrupted returns 0",
+                unsafe { libc::time::nanosleep(&req0, &mut rem0) } == 0,
+            );
+            rpt.check(
+                "nanosleep: rem untouched when not interrupted",
+                rem0.tv_sec == 77 && rem0.tv_nsec == 77,
+            );
+        }
         // ---- sigaltstack（D.2 本轮：内核 SYS_SIGNAL_ALTSTACK 0x88 + SA_ONSTACK 切栈）----
         {
             use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
