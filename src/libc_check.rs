@@ -463,18 +463,32 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         if !dp.is_null() {
             let mut found = false;
             let mut count = 0usize;
+            let mut hello_ino = 0u64;
             loop {
                 let e = libc::dirent::readdir(dp);
                 if e.is_null() { break; }
                 count += 1;
                 let nm = cstr_to_owned((*e).d_name.as_ptr() as *const u8);
-                if nm == b"hello.txt" { found = true; }
+                if nm == b"hello.txt" {
+                    found = true;
+                    hello_ino = (*e).d_ino as u64;
+                }
                 // 文件条目 d_type == DT_REG(8)；目录条目 == DT_DIR(4)。
                 let t = (*e).d_type;
                 let _ = t;
             }
             rpt.check("readdir count>=1", count >= 1);
             rpt.check("readdir found hello.txt", found);
+            // ---- 登记项④：d_ino 必须与 stat 的 st_ino **同源**（同一个文件同一个号）----
+            // 此前 d_ino 恒 0（wire 不带它），而 st_ino 早就有真值 ⇒ 两者对不上。
+            let mut hst: libc::unistd::stat = core::mem::zeroed();
+            let st_ok = libc::unistd::stat(tfile, &mut hst) == 0;
+            rpt.check("d_ino: stat(hello.txt) -> 0", st_ok);
+            rpt.check("d_ino: readdir reported a nonzero ino", hello_ino != 0);
+            rpt.check(
+                "d_ino: readdir d_ino == stat st_ino (same file, same number)",
+                st_ok && hello_ino == hst.st_ino as u64,
+            );
             let rc2 = libc::dirent::closedir(dp);
             rpt.check("closedir rc==0", rc2 == 0);
         }
