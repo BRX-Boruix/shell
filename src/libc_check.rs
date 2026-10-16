@@ -1390,6 +1390,64 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
                 let _ = unsafe { libc::mman::munmap(pn, 4096) };
             }
         }
+        // ---- 登记项⑩：信号处置是**进程级**的（fork 继承；组内线程共享）----
+        // POSIX：fork 出来的子进程**继承**父的信号处置；组内线程**共享**同一份处置
+        // （一个线程 sigaction 之后，同进程其它线程都看得到）。此前 SignalState 挂在
+        // Process（= 每线程）上 ⇒ 子进程只剩 restorer、处置全丢；组员之间也互不可见。
+        {
+            extern "C" fn on_pw(_s: i32) {}
+            let act = libc::signal::sigaction {
+                sa_handler: on_pw as usize,
+                sa_mask: 0,
+                sa_flags: 0,
+                sa_restorer: core::ptr::null_mut(),
+            };
+            rpt.check(
+                "sigproc: install SIGUSR1 handler",
+                unsafe {
+                    libc::signal::sigaction(libc::signal::SIGUSR1, &act, core::ptr::null_mut())
+                } == 0,
+            );
+            // 先自证：本进程查得到（查询模式，不改状态）。
+            let mut cur: libc::signal::sigaction = unsafe { core::mem::zeroed() };
+            rpt.check(
+                "sigproc: query sees the handler in this process",
+                unsafe {
+                    libc::signal::sigaction(libc::signal::SIGUSR1, core::ptr::null(), &mut cur)
+                } == 0
+                    && cur.sa_handler == on_pw as usize,
+            );
+            let kid = libc::process::fork();
+            if kid == 0 {
+                // 子进程：查询 SIGUSR1 的处置 —— POSIX fork 要求**继承**它。
+                let mut old: libc::signal::sigaction = unsafe { core::mem::zeroed() };
+                let r = unsafe {
+                    libc::signal::sigaction(libc::signal::SIGUSR1, core::ptr::null(), &mut old)
+                };
+                // 继承到 handler ⇒ 42；仍是 SIG_DFL（缺陷版）⇒ 0。
+                libc::process::_exit(if r == 0 && old.sa_handler == on_pw as usize { 42 } else { 0 });
+            }
+            rpt.check("sigproc: fork for the inheritance probe", kid > 0);
+            if kid > 0 {
+                let mut st: i32 = 0;
+                let w = libc::process::waitpid(kid, &mut st, 0);
+                rpt.check("sigproc: inheritance probe reaped", w == kid);
+                rpt.check(
+                    "sigproc: the child INHERITED the handler (POSIX fork)",
+                    w == kid && ((st >> 8) & 0xFF) == 42,
+                );
+            }
+            // 复原：SIG_DFL（不把 handler 留给后面的用例）。
+            let dfl = libc::signal::sigaction {
+                sa_handler: libc::signal::SIG_DFL,
+                sa_mask: 0,
+                sa_flags: 0,
+                sa_restorer: core::ptr::null_mut(),
+            };
+            let _ = unsafe {
+                libc::signal::sigaction(libc::signal::SIGUSR1, &dfl, core::ptr::null_mut())
+            };
+        }
         // ---- 登记项⑦：nanosleep 的 rem（被信号打断时写回剩余时长）----
         // **只做可验证的那一半**：不被打断时 `nanosleep` 成功返回 0，且**不碰** `rem`。
         //
@@ -1448,12 +1506,21 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
                 "nanosleep: rem is in (0, requested)",
                 rem_ns > 0 && rem_ns < 3_000_000_000,
             );
-            // 更强的判据：rem 必须 ≈「请求 − 已过」（±100ms，覆盖毫秒粒度）。
+            // 更强的判据：**闹钟已经响过 ⇒ 剩余必须明显小于请求值**（且大于 0）。
             // 若 rem 恒 0（未写）或恒等于请求值（没减 elapsed），这条会红。
-            let want = 3_000_000_000i128 - t1.saturating_sub(t0) as i128;
+            //
+            // **为什么不钉具体数值**（两轮实测教训）：
+            // 1) 「请求 − 本函数测得的 elapsed」量的是「从 t0 到本进程**重新被调度**
+            //    之后」——EINTR 之后进程可能被推迟很久才回到这里（实测一次 elapsed
+            //    被记成 2.246s，而内核其实在 0.88s 就打断、算出 rem=2.118s）；
+            // 2) 闹钟**自身的抖动**在 4 核负载下达数百毫秒（实测 1s 的闹钟在
+            //    0.88s~1.6s 之间响 ⇒ rem 相应落在 1.40s~2.12s）。
+            // 钉死带宽会让门禁变成「时钟抖动检测器」而不是「实现检测器」；
+            // 保留的判据（0 < rem < 2.4s）仍能证伪两种坏实现，且对抖动免疫。
+            let _ = (t0, t1); // 两者只用于上面的留证打印
             rpt.check(
-                "nanosleep: rem ≈ requested - elapsed (±100ms)",
-                (rem_ns - want).abs() < 100_000_000,
+                "nanosleep: rem is well below the request (the alarm burned time)",
+                rem_ns > 0 && rem_ns < 2_400_000_000,
             );
             // 对照：**没有**信号时 nanosleep 成功返回 0，且**不碰** rem。
             let req0 = libc::time::Timespec { tv_sec: 0, tv_nsec: 10_000_000 };
