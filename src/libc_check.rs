@@ -1233,6 +1233,62 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         // 本轮 libc 的改动只在 `libsys::sleep` **返回之后**写 rem，不可能让它不返回。
         // 详见报告「第十五轮」的登记（含复现步骤）。
         {
+            use core::sync::atomic::{AtomicU32, Ordering};
+            static NRM: AtomicU32 = AtomicU32::new(0);
+            extern "C" fn on_alrm3(_sig: i32) {
+                NRM.fetch_add(1, Ordering::SeqCst);
+            }
+            let act3 = libc::signal::sigaction {
+                sa_handler: on_alrm3 as usize,
+                sa_mask: 0,
+                sa_flags: 0,
+                sa_restorer: core::ptr::null_mut(),
+            };
+            rpt.check(
+                "nanosleep: install SIGALRM handler",
+                unsafe { libc::signal::sigaction(libc::signal::SIGALRM, &act3, core::ptr::null_mut()) } == 0,
+            );
+            rpt.check("nanosleep: alarm(1) armed", libc::signal::alarm(1) == 0);
+            // 请求 3s、闹钟 1s ⇒ 约 1s 后被 SIGALRM **打断**，rem 应约 2s。
+            // **这条断言在修复内核前是红的**（实测 nanosleep 返回 0、rem 未写）——
+            // 见报告「第十六轮」：内核的 sleep 重试循环没有兑现 EINTR。
+            let req = libc::time::Timespec { tv_sec: 3, tv_nsec: 0 };
+            let mut rem = libc::time::Timespec { tv_sec: 0, tv_nsec: 0 };
+            libc::errno::set_errno(0);
+            let t0 = libsys::now();
+            let rc = unsafe { libc::time::nanosleep(&req, &mut rem) };
+            let t1 = libsys::now();
+            // **把值打印出来**（本审查的教训：弱断言会放过语义错误的实现，
+            // 钉精确值钉不了时至少要让人眼看得见）：请求 3s、闹钟 1s，
+            // 故 elapsed≈1s、rem≈2s。
+            out(b"[ns] elapsed_ns=");
+            out(crate::util::u64_to_dec(t1.saturating_sub(t0), &mut [0u8; 24]));
+            out(b" rem=");
+            out(crate::util::u64_to_dec(rem.tv_sec as u64, &mut [0u8; 24]));
+            out(b".");
+            out(crate::util::u64_to_dec(rem.tv_nsec as u64, &mut [0u8; 24]));
+            out(b" s\n");
+            rpt.check("nanosleep: interrupted -> -1", rc == -1);
+            rpt.check(
+                "nanosleep: interrupted sets EINTR",
+                libc::errno::errno() == libc::errno::EINTR,
+            );
+            rpt.check("nanosleep: handler ran", NRM.load(Ordering::SeqCst) >= 1);
+            // **判据用纳秒总量，不要用「秒数向上取整」**：rem = 2.088s 时
+            // 「秒数 + 1」会凑成 3 而被误判为失败（本轮实测踩到）。
+            let rem_ns = (rem.tv_sec as i128) * 1_000_000_000 + rem.tv_nsec as i128;
+            rpt.check(
+                "nanosleep: rem is in (0, requested)",
+                rem_ns > 0 && rem_ns < 3_000_000_000,
+            );
+            // 更强的判据：rem 必须 ≈「请求 − 已过」（±100ms，覆盖毫秒粒度）。
+            // 若 rem 恒 0（未写）或恒等于请求值（没减 elapsed），这条会红。
+            let want = 3_000_000_000i128 - t1.saturating_sub(t0) as i128;
+            rpt.check(
+                "nanosleep: rem ≈ requested - elapsed (±100ms)",
+                (rem_ns - want).abs() < 100_000_000,
+            );
+            // 对照：**没有**信号时 nanosleep 成功返回 0，且**不碰** rem。
             let req0 = libc::time::Timespec { tv_sec: 0, tv_nsec: 10_000_000 };
             let mut rem0 = libc::time::Timespec { tv_sec: 77, tv_nsec: 77 };
             rpt.check(
