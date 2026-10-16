@@ -897,7 +897,34 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             let mut pfd2 = [0i32; 2];
             if libc::posix_batch2::pipe(pfd2.as_mut_ptr()) == 0 {
                 rpt.check("fchmod(pipe) -> -1", libc::unistd::fchmod(pfd2[0], 0o644) == -1);
-                let _ = libc::unistd::close(pfd2[0]);
+                // POSIX：fstat 对**管道**也必须成功（S_IFIFO）。此前内核只处理文件句柄，
+                // 管道端返回 NotFound ⇒ 用户态把"这是管道"与"fd 不存在"混成同一个 ENOENT。
+                let mut pst: libc::unistd::stat = unsafe { core::mem::zeroed() };
+                rpt.check(
+                    "unistd: fstat(pipe) -> 0",
+                    unsafe { libc::unistd::fstat(pfd2[0], &mut pst) } == 0,
+                );
+                rpt.check(
+                    "unistd: fstat(pipe) reports S_IFIFO",
+                    pst.st_mode & libc::unistd::S_IFMT == libc::unistd::S_IFIFO,
+                );
+                rpt.check("unistd: fstat(pipe) has a stable ino", pst.st_ino != 0);
+                let mut pst2: libc::unistd::stat = unsafe { core::mem::zeroed() };
+                rpt.check(
+                    "unistd: fstat on both pipe ends -> 0",
+                    unsafe { libc::unistd::fstat(pfd2[1], &mut pst2) } == 0,
+                );
+                rpt.check(
+                    "unistd: both pipe ends share the same (nonzero) ino",
+                    pst.st_ino == pst2.st_ino && pst.st_ino != 0,
+                );
+                // 有效但非终端 ⇒ 0 并置 ENOTTY（此前管道被报成 ENOENT，errno 是错的）。
+                libc::errno::set_errno(0);
+                rpt.check("unistd: isatty(pipe) -> 0", libc::unistd::isatty(pfd2[0]) == 0);
+                rpt.check(
+                    "unistd: isatty(pipe) sets ENOTTY (not ENOENT)",
+                    libc::errno::errno() == libc::errno::ENOTTY,
+                );                let _ = libc::unistd::close(pfd2[0]);
                 let _ = libc::unistd::close(pfd2[1]);
             }
             let _ = libc::unistd::remove(p.as_ptr() as *const i8);
