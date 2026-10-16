@@ -2028,6 +2028,43 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         // ===== unistd =====
         let mut cwdbuf = [0i8; 256];
         rpt.check("unistd: getcwd", !libc::unistd::getcwd(cwdbuf.as_mut_ptr(), cwdbuf.len()).is_null());
+        // ---- sysconf 的真值来源（语义忠实性审查登记项⑪）----
+        // 每个名字的答案必须来自**单一事实源**：PAGE_SIZE/ARG_MAX 是 constants.json 的
+        // 跨边界常量（内核用同一份），VERSION 是本实现声称遵循的 POSIX 版本。
+        rpt.check(
+            "sysconf: _SC_PAGESIZE == 4096",
+            libc::unistd::sysconf(libc::unistd::_SC_PAGESIZE) == 4096,
+        );
+        rpt.check(
+            "sysconf: _SC_PAGE_SIZE == _SC_PAGESIZE",
+            libc::unistd::sysconf(libc::unistd::_SC_PAGE_SIZE)
+                == libc::unistd::sysconf(libc::unistd::_SC_PAGESIZE),
+        );
+        rpt.check(
+            "sysconf: _SC_ARG_MAX == 4096 (kernel MAX_CMDLINE_BYTES)",
+            libc::unistd::sysconf(libc::unistd::_SC_ARG_MAX) == 4096,
+        );
+        rpt.check(
+            "sysconf: _SC_VERSION == 200809 (POSIX.1-2008)",
+            libc::unistd::sysconf(libc::unistd::_SC_VERSION) == 200809,
+        );
+        rpt.check(
+            "sysconf: _SC_2_VERSION == 200809",
+            libc::unistd::sysconf(libc::unistd::_SC_2_VERSION) == 200809,
+        );
+        let nconf = libc::unistd::sysconf(libc::unistd::_SC_NPROCESSORS_CONF);
+        rpt.check("sysconf: _SC_NPROCESSORS_CONF >= 1", nconf >= 1);
+        rpt.check(
+            "sysconf: _SC_NPROCESSORS_CONF == _SC_NPROCESSORS_ONLN",
+            nconf == libc::unistd::sysconf(libc::unistd::_SC_NPROCESSORS_ONLN),
+        );
+        // 未定义的名字：-1 且 EINVAL（POSIX 只允许对这一类这么做）。
+        libc::errno::set_errno(0);
+        rpt.check("sysconf: unknown name -> -1", libc::unistd::sysconf(9999) == -1);
+        rpt.check(
+            "sysconf: unknown name sets EINVAL",
+            libc::errno::errno() == libc::errno::EINVAL,
+        );
         let old_mask = libc::unistd::umask(0o022);
         rpt.check("unistd: umask round trip", libc::unistd::umask(old_mask) == 0o022);
         rpt.check("unistd: chdir to /scratch", libc::unistd::chdir(p(b"/scratch\0")) == 0);
