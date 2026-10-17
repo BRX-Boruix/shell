@@ -337,7 +337,8 @@ fn cmd_help() -> u8 {
     out(b"         A ; B    run B unconditionally\n");
     out(b"lookup:  a word without '/' that is not a builtin is searched in $PATH\n");
     out(b"         default PATH: ");
-    out(crate::env::DEFAULT_PATH);
+    // 运行期算（卷标 / 有几块盘 / 3p 在哪块盘上都是部署事实，不是编译期常量）。
+    out(libsys::search_path().as_bytes());
     out(b"\n");
     out(b"         override with: export PATH=/dir1:/dir2\n");
     out(b"         each entry is tried as NAME, then NAME.elf\n");

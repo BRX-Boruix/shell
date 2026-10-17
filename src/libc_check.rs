@@ -2516,6 +2516,48 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             "sysconf: unknown name sets EINVAL",
             libc::errno::errno() == libc::errno::EINVAL,
         );
+        // ---- 部署事实不得编译期烧死：`confstr(_CS_PATH)` 的每一项都必须**真的存在** ----
+        // 判别性：此前该值是编译期常量 `/programs:/volumes/BORUIX_DATA/3p`。换一个卷标、
+        // 或干脆没有第二块盘时，它指向**不存在的目录**，而没有任何地方报错。
+        // 现在它由 libsys::search_path() 从 `/volumes` 的**真实挂载点**算出。
+        {
+            let mut cb = [0u8; 256];
+            let n = unsafe {
+                libc::posix_batch7::confstr(
+                    1, /* _CS_PATH */
+                    cb.as_mut_ptr() as *mut core::ffi::c_char,
+                    cb.len(),
+                )
+            };
+            rpt.check("confstr: _CS_PATH returns a value", n > 0);
+            let end = if n > 0 { n - 1 } else { 0 }; // 去掉结尾 NUL
+            let raw = &cb[..end.min(cb.len())];
+            rpt.check(
+                "confstr: _CS_PATH starts with /programs",
+                raw.starts_with(b"/programs"),
+            );
+            let mut all_exist = true;
+            let mut any_3p = false;
+            for part in raw.split(|&b| b == b':').filter(|s| !s.is_empty()) {
+                let mut tmp = [0i8; 256];
+                for (i, &b) in part.iter().enumerate() {
+                    tmp[i] = b as i8;
+                }
+                tmp[part.len()] = 0;
+                // F_OK = 0（存在性）
+                if unsafe { libc::posix_batch2::access(tmp.as_ptr(), 0) } != 0 {
+                    all_exist = false;
+                }
+                if part.ends_with(b"/3p") {
+                    any_3p = true;
+                }
+            }
+            rpt.check(
+                "confstr: every _CS_PATH entry really exists (no baked deployment fact)",
+                all_exist,
+            );
+            rpt.check("confstr: discovered a <volume>/3p entry", any_3p);
+        }
         // 登记项⑪ 第二批：时钟频率与 fd 水位（两者都有单一事实源）。
         let clk = libc::unistd::sysconf(libc::unistd::_SC_CLK_TCK);
         out(b"[libccheck] sysconf _SC_CLK_TCK=");

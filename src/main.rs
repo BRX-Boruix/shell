@@ -20,7 +20,6 @@ extern crate std;
 extern crate alloc;
 
 // 跨边界常量的**生成物**（源：tools/abi/constants.json）。数值勿手改——门禁会比对。
-mod abi_generated;
 mod commands;
 mod env;
 mod json_tree;
