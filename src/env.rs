@@ -77,7 +77,7 @@ pub(crate) fn env_get(name: &[u8]) -> Option<Vec<u8>> {
 /// 而不是假装用户没 unset 过（S09：不把失败伪装成成功）。
 pub(crate) fn init_path_default() {
     if env_get(b"PATH").is_none() {
-        env_set(b"PATH", libsys::search_path().as_bytes());
+        env_set(b"PATH", libsys::PROGRAM_DIR.as_bytes());
     }
 }
 
