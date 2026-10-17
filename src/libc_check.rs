@@ -3150,6 +3150,55 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         }
     }
 
+    // ---- 测试盘可自由插拔：卸载 → 挂载点消失 → 按**设备名**重新挂载 ----
+    // **不认盘名**：只按 `/volumes` 的目录项与 `/devices/disks` 的设备项操作。
+    // 这正是「系统按普通卷处理」的含义——它对这块盘没有任何特殊认知。
+    {
+        let vols = libsys::read_dir("/volumes").unwrap_or_default();
+        let devs = libsys::read_dir("/devices/disks").unwrap_or_default();
+        rpt.check("volume: at least one volume is mounted", !vols.is_empty());
+        // 挂载点路径 + 各自的内容条目数（挂载时是 ext2 根，卸载后回落到空的 ramfs 目录）。
+        let mut paths: Vec<alloc::string::String> = Vec::new();
+        let mut nonempty = 0usize;
+        for v in vols.iter() {
+            let p = alloc::format!("/volumes/{}", v.name);
+            if libsys::read_dir(&p).map(|e| !e.is_empty()).unwrap_or(false) {
+                nonempty += 1;
+            }
+            paths.push(p);
+        }
+        rpt.check("volume: mounted volumes have contents", nonempty > 0);
+        for p in paths.iter() {
+            rpt.check("volume: unmount succeeds", libsys::volume_unmount(p).is_ok());
+        }
+        // **卸载的判据是「挂载点回落到空目录」，不是「目录项消失」**：
+        // 内核的 MountTable::unmount 只删挂载表项，`/volumes/<name>` 这个目录项留在父目录里
+        // （与 Linux 的 umount 一致）。卸载后读该路径得到 0 项，才是「真的卸了」。
+        let mut emptied = true;
+        for p in paths.iter() {
+            if libsys::read_dir(p).map(|e| !e.is_empty()).unwrap_or(true) {
+                emptied = false;
+            }
+        }
+        rpt.check(
+            "volume: every mount point falls back to an empty dir after unmount",
+            emptied,
+        );
+        // 按**设备名**重新挂载（不认卷标），内容应当回来。
+        for d in devs.iter() {
+            // `volume_mount` 收的是 **/devices/disks 下的叶子设备名**（内核日志
+            // "[volume] mounted 'ata0' at ..."），不是全路径。
+            let _ = libsys::volume_mount(&d.name);
+        }
+        let mut restored = 0usize;
+        for p in paths.iter() {
+            if libsys::read_dir(p).map(|e| !e.is_empty()).unwrap_or(false) {
+                restored += 1;
+            }
+        }
+        rpt.check("volume: remount restores the contents", restored == nonempty);
+    }
+
     let mut sum = Vec::new();
     sum.extend_from_slice(b"[libccheck] passed=");
     sum.extend_from_slice(crate::util::u64_to_dec(rpt.pass as u64, &mut [0u8; 24]));
