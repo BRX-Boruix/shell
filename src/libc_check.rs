@@ -2705,7 +2705,12 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
                 libsys::remove(kfile).is_ok(),
             );
         }
-        rpt.check("unistd: execvp honestly fails", libc::unistd::execvp(p(b"nope\0"), core::ptr::null()) == -1);
+        // execvp 自 3P4-12 起是真实现（替换映像）；这条测的是「程序不存在时如实 -1」，
+        // 不再表示「本系统做不了 exec」。
+        rpt.check(
+            "unistd: execvp on a missing program returns -1",
+            libc::unistd::execvp(p(b"nope\0"), core::ptr::null()) == -1,
+        );
 
         // ===== process =====
         rpt.check("process: gettid > 0", libc::process::gettid() > 0);
@@ -3197,6 +3202,151 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             }
         }
         rpt.check("volume: remount restores the contents", restored == nonempty);
+    }
+
+    // ---- 3P4-12：exec 真的替换映像（同一 pid；失败不改动调用者）----
+    // **不认卷名**：按 `/volumes` 的目录项找一块挂着 hello 程序的卷。
+    {
+        let mut prog: Option<Vec<u8>> = None;
+        for v in libsys::read_dir("/volumes").unwrap_or_default().iter() {
+            for rel in ["/3p/hello.elf", "/hello.elf"] {
+                let cand = alloc::format!("/volumes/{}{}", v.name, rel);
+                if libsys::stat(&cand).is_ok() {
+                    let mut b = Vec::new();
+                    b.extend_from_slice(cand.as_bytes());
+                    b.push(0);
+                    prog = Some(b);
+                    break;
+                }
+            }
+            if prog.is_some() {
+                break;
+            }
+        }
+        rpt.check(
+            "exec: found a program to exec on a mounted volume",
+            prog.is_some(),
+        );
+
+        if let Some(prog) = prog {
+            let arg0: Vec<u8> = b"hello\0".to_vec();
+
+            // 收尸：本系统的**阻塞** `waitpid` 在「子进程尚未退出、且当下无法切换」时
+            // 如实返回 EAGAIN（内核「无可切对象」的诚实回报，见 libc/src/process.rs 与
+            // 内核 sys_task_wait 的文档）。按 POSIX 语义那不是错误，只是「还没结果」，
+            // 调用方须重试——shell 的 acee2e/trave2e 是同一纪律。
+            // 这条重试**不是**在掩盖 exec 的问题：exec 的语义由内核 test_task_exec
+            // 单独证明，这里只负责把「子进程跑完」这件事等到。
+            let reap = |pid: libc::ctypes::c_int| -> (libc::ctypes::c_int, libc::ctypes::c_int) {
+                let mut st: libc::ctypes::c_int = -1;
+                let mut tries = 0u32;
+                loop {
+                    let w = libc::process::waitpid(pid, &mut st, 0);
+                    if w != -1 || libc::errno::errno() != libc::errno::EAGAIN || tries >= 200_000 {
+                        return (w, st);
+                    }
+                    tries += 1;
+                    let _ = libsys::yield_now();
+                }
+            };
+
+            // (1) 成功路径：fork 出的子进程 exec，父按**同一个 pid** 收尸。
+            // 这就是「同一 pid 跑新程序」的机内证据——若把 exec 做成「派生+等待+退出」，
+            // 原 pid 会以 99 退出、新程序的退出码落在一个陌生 pid 上。
+            let pid = libc::process::fork();
+            rpt.check("exec: fork succeeds", pid >= 0);
+            if pid == 0 {
+                let argv: [*const libc::ctypes::c_char; 2] =
+                    [arg0.as_ptr() as *const libc::ctypes::c_char, core::ptr::null()];
+                unsafe {
+                    libc::exec::execv(prog.as_ptr() as *const libc::ctypes::c_char, argv.as_ptr());
+                }
+                libc::process::_exit(99);
+            } else if pid > 0 {
+                let (w, st) = reap(pid);
+                rpt.check(
+                    "exec: waitpid reaps the same pid after exec",
+                    w == pid,
+                );
+                rpt.check(
+                    "exec: the replaced image ran and exited 0 (not the 99 fallback)",
+                    (st >> 8) == 0,
+                );
+            }
+
+            // (2) 失败路径：exec 失败后**原程序继续运行**（POSIX 铁律），
+            // 且 errno 是真实的 ENOENT（不是"做不了"）。
+            let pid2 = libc::process::fork();
+            rpt.check("exec: fork succeeds (failure-path child)", pid2 >= 0);
+            if pid2 == 0 {
+                let argv: [*const libc::ctypes::c_char; 2] =
+                    [arg0.as_ptr() as *const libc::ctypes::c_char, core::ptr::null()];
+                let rc = unsafe {
+                    libc::exec::execv(
+                        b"/definitely/not/here\0".as_ptr() as *const libc::ctypes::c_char,
+                        argv.as_ptr(),
+                    )
+                };
+                let e = libc::errno::errno();
+                libc::process::_exit(if rc == -1 && e == libc::errno::ENOENT {
+                    77
+                } else {
+                    76
+                });
+            } else if pid2 > 0 {
+                let (w, st) = reap(pid2);
+                rpt.check(
+                    "exec: a failed exec leaves the caller running (ENOENT, rc=-1)",
+                    w == pid2 && (st >> 8) == 77,
+                );
+            }
+
+            // (3) `execve` 与 `execv` 走同一条内核链路（`envp` 的边界见 libc/src/exec.rs）。
+            let pid3 = libc::process::fork();
+            rpt.check("exec: fork succeeds (execve child)", pid3 >= 0);
+            if pid3 == 0 {
+                let argv: [*const libc::ctypes::c_char; 2] =
+                    [arg0.as_ptr() as *const libc::ctypes::c_char, core::ptr::null()];
+                unsafe {
+                    libc::exec::execve(
+                        prog.as_ptr() as *const libc::ctypes::c_char,
+                        argv.as_ptr(),
+                        core::ptr::null(),
+                    );
+                }
+                libc::process::_exit(98);
+            } else if pid3 > 0 {
+                let (w, st) = reap(pid3);
+                rpt.check(
+                    "exec: execve replaces the image too",
+                    w == pid3 && (st >> 8) == 0,
+                );
+            }
+
+            // (4) `execvp` 的 PATH 搜索分支：找不到时如实 ENOENT、调用者继续运行。
+            // 搜索规则与 `posix_spawnp` **同一实现**（libc/src/spawn.rs 的 search_path）。
+            let pid4 = libc::process::fork();
+            rpt.check("exec: fork succeeds (execvp child)", pid4 >= 0);
+            if pid4 == 0 {
+                let argv: [*const libc::ctypes::c_char; 2] =
+                    [arg0.as_ptr() as *const libc::ctypes::c_char, core::ptr::null()];
+                let rc = unsafe {
+                    libc::unistd::execvp(
+                        b"definitely-not-a-real-program\0".as_ptr()
+                            as *const libc::ctypes::c_char,
+                        argv.as_ptr(),
+                    )
+                };
+                let e = libc::errno::errno();
+                libc::process::_exit(if rc == -1 && e == libc::errno::ENOENT { 75 } else { 74 });
+            } else if pid4 > 0 {
+                let (w, st) = reap(pid4);
+                rpt.check(
+                    "exec: execvp searches PATH and reports ENOENT honestly",
+                    w == pid4 && (st >> 8) == 75,
+                );
+            }
+        }
     }
 
     let mut sum = Vec::new();
