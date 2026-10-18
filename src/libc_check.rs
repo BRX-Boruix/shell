@@ -3375,6 +3375,82 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         }
     }
 
+    // ---- 3P4-14：system / popen / pclose（shell 路径读 SHELL）----
+    {
+        let shell = unsafe {
+            libc::stdlib::getenv(b"SHELL\0".as_ptr() as *const libc::ctypes::c_char)
+        };
+        rpt.check(
+            "system: SHELL is exported by the shell (path not hardcoded in libc)",
+            !shell.is_null(),
+        );
+        rpt.check(
+            "system: system(NULL) reports a command processor",
+            unsafe { libc::popen::system(core::ptr::null()) } != 0,
+        );
+        let st = unsafe {
+            libc::popen::system(b"echo system-ok\0".as_ptr() as *const libc::ctypes::c_char)
+        };
+        rpt.check(
+            "system: runs a command line through SHELL and returns status 0",
+            st == 0,
+        );
+
+        let f = unsafe {
+            libc::popen::popen(
+                b"echo popen-ok\0".as_ptr() as *const libc::ctypes::c_char,
+                b"r\0".as_ptr() as *const libc::ctypes::c_char,
+            )
+        };
+        rpt.check("popen: returns a stream for mode \"r\"", !f.is_null());
+        if !f.is_null() {
+            // 读到 EOF 为止：管道上单次 read 只保证「有数据就返回」，不保证一次读全。
+            // 一次 fread 就断言内容是最常见的写错法（真实程序也是循环读）。
+            let mut got: Vec<u8> = Vec::new();
+            loop {
+                let mut buf = [0u8; 64];
+                let n = unsafe {
+                    libc::stdio::fread(
+                        buf.as_mut_ptr() as *mut libc::ctypes::c_void,
+                        1,
+                        buf.len(),
+                        f,
+                    )
+                };
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            rpt.check(
+                "popen: reads the child process output",
+                got.windows(8).any(|w| w == b"popen-ok"),
+            );
+            let rc = unsafe { libc::popen::pclose(f) };
+            rpt.check("pclose: closes the stream and reaps the child (status 0)", rc == 0);
+        }
+
+        // "e"（cloexec）如实拒绝——本系统没有「fork 与 exec 之间设 cloexec」的窗口。
+        let bad = unsafe {
+            libc::popen::popen(
+                b"echo x\0".as_ptr() as *const libc::ctypes::c_char,
+                b"e\0".as_ptr() as *const libc::ctypes::c_char,
+            )
+        };
+        rpt.check("popen: mode \"e\" is refused with EINVAL", bad.is_null());
+
+        // 非 popen 流：如实 EINVAL，且**不**关掉它（关不关由调用方决定）。
+        let plain = unsafe { libc::stdio::tmpfile() };
+        rpt.check("pclose: a tmpfile() stream exists for the negative case", !plain.is_null());
+        if !plain.is_null() {
+            rpt.check(
+                "pclose: a non-popen stream is refused",
+                unsafe { libc::popen::pclose(plain) } == -1,
+            );
+            let _ = unsafe { libc::stdio::fclose(plain) };
+        }
+    }
+
     let mut sum = Vec::new();
     sum.extend_from_slice(b"[libccheck] passed=");
     sum.extend_from_slice(crate::util::u64_to_dec(rpt.pass as u64, &mut [0u8; 24]));

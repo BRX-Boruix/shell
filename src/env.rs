@@ -60,8 +60,8 @@ pub(crate) fn env_get(name: &[u8]) -> Option<Vec<u8>> {
 
 /// 确保 `PATH` 有值：**仅在尚未定义时**写入内置默认。
 ///
-/// 默认值由 `libsys::search_path()` 在**运行期**算出：
-/// `PROGRAM_DIR` + 每个**已挂载卷**上真实存在的 `3p` 子目录。
+/// 默认值 = `libsys::PROGRAM_DIR`（ABI 契约常量 `/programs`）。**不是**卷标拼出来的路径：
+/// 卷标、有几块盘、`3p` 在哪块盘上都是部署事实，写死等于假定用户用的是作者那块盘。
 ///
 /// **为什么不是编译期常量**：卷标、有几块盘、`3p` 在哪块盘上都是**部署事实**。
 /// 烧死成 `/volumes/<某个卷标>/3p` 等于假定用户用的就是作者那块盘——换卷标、
@@ -79,6 +79,42 @@ pub(crate) fn init_path_default() {
     if env_get(b"PATH").is_none() {
         env_set(b"PATH", libsys::PROGRAM_DIR.as_bytes());
     }
+}
+
+/// 把 `SHELL` 指向**本进程自己**的路径，供 `system`/`popen` 使用（3P4-14）。
+///
+/// 值 = `PROGRAM_DIR` + `/` + `AT_EXECFN`。两段都来自系统、都不是写死的：`PROGRAM_DIR`
+/// 是 ABI 契约常量，`AT_EXECFN` 是内核经 auxv 给出的**真实程序名**。故「shell 装在哪、
+/// 叫什么」本函数一律不假设——换成 `/programs/myshell.elf` 也不用改这里。
+///
+/// **已存在 `SHELL` 时不覆盖**：用户/父进程显式指定的优先（S16：自动逻辑必须可手动覆盖）。
+///
+/// **两处都写**：本表（`$SHELL`/`env` 要看得到）与 **libc 的 `environ`**（`system`/`popen`
+/// 读的是 libc 的 `getenv`）。只写一处就会出现「`echo $SHELL` 有值、`system()` 说没有」——
+/// 那是最难查的一类不一致。
+pub(crate) fn init_shell_default(argc: isize, argv: *const *const u8) {
+    if env_get(b"SHELL").is_some() {
+        return;
+    }
+    let Some(name) = (unsafe { libsys::execfn(argc, argv) }) else {
+        return;
+    };
+    let mut path: Vec<u8> = Vec::new();
+    path.extend_from_slice(libsys::PROGRAM_DIR.as_bytes());
+    path.push(b'/');
+    path.extend_from_slice(name);
+    env_set(b"SHELL", &path);
+    let mut key: Vec<u8> = Vec::new();
+    key.extend_from_slice(b"SHELL\0");
+    let mut val: Vec<u8> = path.clone();
+    val.push(0);
+    unsafe {
+        libc::stdlib::setenv(
+            key.as_ptr() as *const libc::ctypes::c_char,
+            val.as_ptr() as *const libc::ctypes::c_char,
+            1,
+        )
+    };
 }
 
 /// 删除变量。
