@@ -3346,6 +3346,32 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
                     w == pid4 && (st >> 8) == 75,
                 );
             }
+            // (5) `execve` 带**显式环境**：libc 把 envp 交给内核（滤掉 PATH/PWD），新映像照常运行。
+            // 保留键的拒绝在**内核**层（直调 syscall 才会看到 EINVAL）——libc 必须先滤掉，
+            // 否则 `execve(path, argv, environ)` 恒失败（environ 里本来就有 PATH）。
+            let pid5 = libc::process::fork();
+            rpt.check("exec: fork succeeds (execve+envp child)", pid5 >= 0);
+            if pid5 == 0 {
+                let e1: Vec<u8> = b"FOO=bar\0".to_vec();
+                let argv: [*const libc::ctypes::c_char; 2] =
+                    [arg0.as_ptr() as *const libc::ctypes::c_char, core::ptr::null()];
+                let envp: [*const libc::ctypes::c_char; 2] =
+                    [e1.as_ptr() as *const libc::ctypes::c_char, core::ptr::null()];
+                unsafe {
+                    libc::exec::execve(
+                        prog.as_ptr() as *const libc::ctypes::c_char,
+                        argv.as_ptr(),
+                        envp.as_ptr(),
+                    );
+                }
+                libc::process::_exit(97);
+            } else if pid5 > 0 {
+                let (w, st) = reap(pid5);
+                rpt.check(
+                    "exec: execve with an explicit envp still replaces the image",
+                    w == pid5 && (st >> 8) == 0,
+                );
+            }
         }
     }
 
