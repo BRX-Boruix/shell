@@ -1700,19 +1700,39 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             let _ = unsafe { libc::signal::sigaltstack(core::ptr::null(), &mut q3) };
             rpt.check("sigaltstack: disabled shows SS_DISABLE", q3.ss_flags == libc::signal::SS_DISABLE);
         }
-        // ---- ttyname（D.2 本轮：纯 libc 实现——isatty + fstat/stat 的 st_ino 比对）----
+        // ---- ttyname / ttyname_r（3P4-13：身份比对，靠节点的稳定 st_ino）----
         {
-            // --run 下 stdout 就是 console ⇒ 应返回 /devices/console。
-            // 本实现只能忠实回答「不是终端」这一半。**是终端时也返回 NULL**——因为本系统
-            // 没有「节点自述名字」通道（INode::stable_id 默认是 self 地址，视图节点的 lookup
-            // 可能每次新建实例 ⇒ fstat/stat 的身份比对必然不等，实测如此），而编一个路径
-            // （如恒返回 /devices/console）会在 fd 属于别的终端时撒谎。
-            // 这两条断言**锁定如实失败**，防止将来有人塞一个假路径进来。
+            // --run 下 stdout 就是 console ⇒ 必须返回 /devices/console。
+            // 这条能成立的前提是 stdio 节点与 console 节点**同号**（3P4-13 的 stable_id 覆写）——
+            // 此前二者身份不等，本断言只能锁「如实失败」。
             libc::errno::set_errno(0);
             let p = unsafe { libc::unistd::ttyname(1) };
-            rpt.check("ttyname(terminal) -> NULL (no TTY in this design; ADR-042)", p.is_null());
-            rpt.check("ttyname(terminal) sets ENOTTY", libc::errno::errno() == libc::errno::ENOTTY);
-            // 非终端（普通文件）⇒ NULL 置 ENOTTY。
+            let got = if p.is_null() { Vec::new() } else { cstr_to_owned(p as *const u8) };
+            rpt.check(
+                "ttyname(1) names the console (/devices/console)",
+                got.as_slice() == b"/devices/console",
+            );
+
+            // ttyname_r：可重入版，**返回错误号本身**（0 = 成功）。
+            let mut buf = [0u8; 64];
+            let rc = unsafe {
+                libc::unistd::ttyname_r(1, buf.as_mut_ptr() as *mut i8, buf.len())
+            };
+            rpt.check(
+                "ttyname_r(1) returns 0 and the same path",
+                rc == 0 && buf.starts_with(b"/devices/console\0"),
+            );
+            let mut tiny = [0u8; 4];
+            let rc2 = unsafe {
+                libc::unistd::ttyname_r(1, tiny.as_mut_ptr() as *mut i8, tiny.len())
+            };
+            rpt.check(
+                "ttyname_r with a short buffer reports ERANGE",
+                rc2 == libc::errno::ERANGE,
+            );
+
+            // 非终端（普通文件）⇒ NULL 置 ENOTTY。**重定向之后身份就该不同**——
+            // 这正是「终端性跟着节点走、不跟着 fd 号走」的可执行判据。
             let f = b"/ttyname_probe.tmp\0";
             let fd = libc::unistd::open(
                 f.as_ptr() as *const i8,
@@ -3404,9 +3424,14 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
         };
         rpt.check("popen: returns a stream for mode \"r\"", !f.is_null());
         if !f.is_null() {
-            // 读到 EOF 为止：管道上单次 read 只保证「有数据就返回」，不保证一次读全。
-            // 一次 fread 就断言内容是最常见的写错法（真实程序也是循环读）。
+            // 读到 EOF 为止。两个理由，都是本系统的**既定语义**而不是测试写法问题：
+            // ① 管道单次 read 只保证「有数据就返回」，不保证一次读全；
+            // ② **ADR-052**：本系统的「阻塞」由帧交换实现，被唤醒的阻塞 syscall
+            //    **不会在内核继续执行**，只能如实返回 EAGAIN（WouldBlock）让调用方重试。
+            //    shell 自己的 acee2e/trave2e 全都按这条纪律重试（见 commands.rs）。
+            // 实测证据：漏了这条重试时 fread 拿到 errno=11、n=0，直接把 EAGAIN 当成了 EOF。
             let mut got: Vec<u8> = Vec::new();
+            let mut spins = 0u32;
             loop {
                 let mut buf = [0u8; 64];
                 let n = unsafe {
@@ -3418,6 +3443,11 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
                     )
                 };
                 if n == 0 {
+                    if libc::errno::errno() == libc::errno::EAGAIN && spins < 200_000 {
+                        spins += 1;
+                        let _ = libsys::yield_now();
+                        continue;
+                    }
                     break;
                 }
                 got.extend_from_slice(&buf[..n]);
