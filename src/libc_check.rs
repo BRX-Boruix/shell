@@ -1527,20 +1527,25 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
                 libc::signal::sigaction(libc::signal::SIGUSR1, &dfl, core::ptr::null_mut())
             };
         }
-        // ---- 登记项⑦：nanosleep 的 rem（被信号打断时写回剩余时长）----
-        // **只做可验证的那一半**：不被打断时 `nanosleep` 成功返回 0，且**不碰** `rem`。
+        // ---- ⑦ nanosleep 被信号打断（POSIX：-1/EINTR + rem 剩余）----
         //
-        // **为什么不做「被打断」那一半——一个重大发现（已登记，待独立排查）**：
-        // 把「装 SIGALRM handler + alarm(1) + nanosleep(3s)」放进机内用例后，
-        // **libccheck 永久挂起**（20 分钟无任何输出，只剩内核周期性 intel-hda 日志）。
-        // 即：**一个正在定时睡眠的进程收到信号后不再返回**。这是**内核缺陷**，不是 libc 侧：
-        // 本轮 libc 的改动只在 `libsys::sleep` **返回之后**写 rem，不可能让它不返回。
-        // 详见报告「第十五轮」的登记（含复现步骤）。
+        // **回归探针：5 轮。** 这条曾经是间歇红的（五次里红两次，见
+        // docs/evidence/README.md 的「订正：nanosleep 那四条…」）。2026-10-25 定因：
+        // 失败样本是 `elapsed≈3.0s / 4.4s 且 rem 未写`——进程**睡满了全程**，EINTR 没落到
+        // 它身上。根因：信号恰在「睡眠者复检完 pending → 真正置 Blocked」之间到达，而
+        // `raise_to` 只对 **Blocked** 目标写 EINTR ⇒ 那一次投递被丢掉；随后进程睡到自己
+        // 的 deadline，拿到「睡满」的返回值。修法在内核侧：到期回调用 `task::wake_sleep`
+        // 在**同一把 pid 锁**内判 pending（与 `raise_to` 的写入互斥）并预置 -EINTR/0。
+        //
+        // 为什么 5 轮：单轮失败率约 1/5~2/5，5 轮把暴露概率抬到 ~70%~90%；每轮约 1s
+        // （闹钟 1s 打断 3s 睡眠），代价可接受——与 popen 的 30 轮同一条理由。
         {
-            use core::sync::atomic::{AtomicU32, Ordering};
+            use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
             static NRM: AtomicU32 = AtomicU32::new(0);
+            static NRM_AT: AtomicU64 = AtomicU64::new(0);
             extern "C" fn on_alrm3(_sig: i32) {
                 NRM.fetch_add(1, Ordering::SeqCst);
+                NRM_AT.store(libsys::now(), Ordering::SeqCst);
             }
             let act3 = libc::signal::sigaction {
                 sa_handler: on_alrm3 as usize,
@@ -1552,54 +1557,72 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
                 "nanosleep: install SIGALRM handler",
                 unsafe { libc::signal::sigaction(libc::signal::SIGALRM, &act3, core::ptr::null_mut()) } == 0,
             );
-            rpt.check("nanosleep: alarm(1) armed", libc::signal::alarm(1) == 0);
-            // 请求 3s、闹钟 1s ⇒ 约 1s 后被 SIGALRM **打断**，rem 应约 2s。
-            // **这条断言在修复内核前是红的**（实测 nanosleep 返回 0、rem 未写）——
-            // 见报告「第十六轮」：内核的 sleep 重试循环没有兑现 EINTR。
-            let req = libc::time::Timespec { tv_sec: 3, tv_nsec: 0 };
-            let mut rem = libc::time::Timespec { tv_sec: 0, tv_nsec: 0 };
-            libc::errno::set_errno(0);
-            let t0 = libsys::now();
-            let rc = unsafe { libc::time::nanosleep(&req, &mut rem) };
-            let t1 = libsys::now();
-            // **把值打印出来**（本审查的教训：弱断言会放过语义错误的实现，
-            // 钉精确值钉不了时至少要让人眼看得见）：请求 3s、闹钟 1s，
-            // 故 elapsed≈1s、rem≈2s。
-            out(b"[ns] elapsed_ns=");
-            out(crate::util::u64_to_dec(t1.saturating_sub(t0), &mut [0u8; 24]));
-            out(b" rem=");
-            out(crate::util::u64_to_dec(rem.tv_sec as u64, &mut [0u8; 24]));
-            out(b".");
-            out(crate::util::u64_to_dec(rem.tv_nsec as u64, &mut [0u8; 24]));
-            out(b" s\n");
-            rpt.check("nanosleep: interrupted -> -1", rc == -1);
+            let mut bad_rc = 0u32;
+            let mut bad_errno = 0u32;
+            let mut bad_handler = 0u32;
+            let mut bad_rem = 0u32;
+            for it in 0..5u32 {
+                NRM.store(0, Ordering::SeqCst);
+                NRM_AT.store(0, Ordering::SeqCst);
+                rpt.check("nanosleep: alarm(1) armed", libc::signal::alarm(1) == 0);
+                // 请求 **10s**、闹钟 1s ⇒ 约 1s 后被 SIGALRM 打断，rem 应约 9s。
+                //
+                // **为什么是 10s 而不是 3s**：闹钟本身的延迟在本机并不稳定（实测同一份
+                // 二进制里它落在 0.46s~2.15s；而历史红样本的 elapsed=3.017s/4.378s 说明它
+                // 曾被推迟到 3s 之后）。用 3s 睡眠时，「闹钟迟到」与「EINTR 实现坏了」会
+                // 给出同一个可观察结果（返回 0、rem 未写），于是断言实际考的是**时钟准时性**，
+                // 不是实现。把睡眠拉长到 10s 后，闹钟即使迟到 2~3s 仍落在睡眠窗口内 ⇒
+                // 断言重新只考「打断与 rem」。
+                let req = libc::time::Timespec { tv_sec: 10, tv_nsec: 0 };
+                let mut rem = libc::time::Timespec { tv_sec: 0, tv_nsec: 0 };
+                libc::errno::set_errno(0);
+                let t0 = libsys::now();
+                let rc = unsafe { libc::time::nanosleep(&req, &mut rem) };
+                let t1 = libsys::now();
+                let handler_at = NRM_AT.load(Ordering::SeqCst);
+                let handler_rel = if handler_at == 0 { 0 } else { handler_at.saturating_sub(t0) };
+                // **把值打印出来**：间歇缺陷必须让人眼看得见每一轮的真实数字。
+                out(b"[ns] round=");
+                out(crate::util::u64_to_dec(it as u64, &mut [0u8; 24]));
+                out(b" elapsed_ns=");
+                out(crate::util::u64_to_dec(t1.saturating_sub(t0), &mut [0u8; 24]));
+                out(b" rem=");
+                out(crate::util::u64_to_dec(rem.tv_sec as u64, &mut [0u8; 24]));
+                out(b".");
+                out(crate::util::u64_to_dec(rem.tv_nsec as u64, &mut [0u8; 24]));
+                out(b"s handler_at_ns=");
+                out(crate::util::u64_to_dec(handler_rel, &mut [0u8; 24]));
+                out(b"\n");
+                if rc != -1 {
+                    bad_rc += 1;
+                }
+                if libc::errno::errno() != libc::errno::EINTR {
+                    bad_errno += 1;
+                }
+                if NRM.load(Ordering::SeqCst) < 1 {
+                    bad_handler += 1;
+                }
+                // 判据用纳秒总量（rem=2.088s 时「秒数 + 1」会凑成 3，上一版实测踩过）。
+                //
+                // **不变式：elapsed + rem ≈ 请求值**（同一轮里两者互补）。这比「rem 落进某个
+                // 固定区间」强得多，也对时钟抖动免疫：闹钟早响 ⇒ elapsed 小、rem 大；晚响 ⇒ 反过来。
+                // 容差 0.6s：实测 elapsed 与「内核真正打断时刻」可能差几百毫秒（返回后被推迟调度），
+                // 观测到的和值落在 3.015~3.041s（请求 3s 时），故 0.6s 足够松、仍能证伪
+                // 「rem 恒 0」「rem 未减 elapsed」两类坏实现。
+                let elapsed_ns = t1.saturating_sub(t0) as i128;
+                let rem_ns = (rem.tv_sec as i128) * 1_000_000_000 + rem.tv_nsec as i128;
+                let req_ns: i128 = 10_000_000_000;
+                let sum_ns = elapsed_ns + rem_ns;
+                if !(rem_ns > 0 && (sum_ns - req_ns).unsigned_abs() < 600_000_000) {
+                    bad_rem += 1;
+                }
+            }
+            rpt.check("nanosleep: all 5 rounds interrupted -> -1", bad_rc == 0);
+            rpt.check("nanosleep: all 5 rounds set EINTR", bad_errno == 0);
+            rpt.check("nanosleep: handler ran in all 5 rounds", bad_handler == 0);
             rpt.check(
-                "nanosleep: interrupted sets EINTR",
-                libc::errno::errno() == libc::errno::EINTR,
-            );
-            rpt.check("nanosleep: handler ran", NRM.load(Ordering::SeqCst) >= 1);
-            // **判据用纳秒总量，不要用「秒数向上取整」**：rem = 2.088s 时
-            // 「秒数 + 1」会凑成 3 而被误判为失败（本轮实测踩到）。
-            let rem_ns = (rem.tv_sec as i128) * 1_000_000_000 + rem.tv_nsec as i128;
-            rpt.check(
-                "nanosleep: rem is in (0, requested)",
-                rem_ns > 0 && rem_ns < 3_000_000_000,
-            );
-            // 更强的判据：**闹钟已经响过 ⇒ 剩余必须明显小于请求值**（且大于 0）。
-            // 若 rem 恒 0（未写）或恒等于请求值（没减 elapsed），这条会红。
-            //
-            // **为什么不钉具体数值**（两轮实测教训）：
-            // 1) 「请求 − 本函数测得的 elapsed」量的是「从 t0 到本进程**重新被调度**
-            //    之后」——EINTR 之后进程可能被推迟很久才回到这里（实测一次 elapsed
-            //    被记成 2.246s，而内核其实在 0.88s 就打断、算出 rem=2.118s）；
-            // 2) 闹钟**自身的抖动**在 4 核负载下达数百毫秒（实测 1s 的闹钟在
-            //    0.88s~1.6s 之间响 ⇒ rem 相应落在 1.40s~2.12s）。
-            // 钉死带宽会让门禁变成「时钟抖动检测器」而不是「实现检测器」；
-            // 保留的判据（0 < rem < 2.4s）仍能证伪两种坏实现，且对抖动免疫。
-            let _ = (t0, t1); // 两者只用于上面的留证打印
-            rpt.check(
-                "nanosleep: rem is well below the request (the alarm burned time)",
-                rem_ns > 0 && rem_ns < 2_400_000_000,
+                "nanosleep: all 5 rounds keep elapsed + rem ~= the request",
+                bad_rem == 0,
             );
             // 对照：**没有**信号时 nanosleep 成功返回 0，且**不碰** rem。
             let req0 = libc::time::Timespec { tv_sec: 0, tv_nsec: 10_000_000 };
