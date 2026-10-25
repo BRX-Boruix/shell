@@ -3416,14 +3416,52 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
             st == 0,
         );
 
-        let f = unsafe {
-            libc::popen::popen(
-                b"echo popen-ok\0".as_ptr() as *const libc::ctypes::c_char,
-                b"r\0".as_ptr() as *const libc::ctypes::c_char,
-            )
+        // **回归探针：30 轮**（3P4-14 复核定位的跨进程写 rax 缺陷）。
+        //
+        // 缺陷形态：管道读无数据时会真的切走（ADR-052 帧交换），而 ipc 层当时把
+        // `BlockOutcome::Switched` 当成「继续循环」吞掉；循环最终返回的 Done/Err 被
+        // syscall 尾部写进 `arch_frame(frame).rax`——而那已是**被切进来那个进程的帧**。
+        // 受害者正是刚 fork 出来的子进程：它第一个用户态指令就判 fork 返回值，于是
+        // 误判 fork 失败、走错分支。
+        //
+        // 为什么单轮不够：这依赖「读者阻塞的那一刻恰好把子进程切进来」，单轮命中率
+        // 约 1/3；30 轮把暴露概率抬到接近必然。修复前本段 3/3 复现红（红证据见
+        // docs/TODO/3p.md 的 3P4-14 复核记录），修复后稳定绿——**这是回归探针，
+        // 不是压力测试**，请勿因"慢一点"而删。
+        // 失败取证打印（S15 单点）：本轮序号 + 本进程 pid（+ 可选尾值）。
+        let note = |tag: &[u8], i: u32, tail: &[u8], tail_v: Option<u32>| {
+            let mut m = Vec::new();
+            m.extend_from_slice(b"[popen-regress] ");
+            m.extend_from_slice(tag);
+            m.extend_from_slice(b" i=");
+            m.extend_from_slice(crate::util::u64_to_dec(i as u64, &mut [0u8; 24]));
+            m.extend_from_slice(b" pid=");
+            m.extend_from_slice(crate::util::u64_to_dec(
+                unsafe { libc::process::getpid() } as u64,
+                &mut [0u8; 24],
+            ));
+            if let Some(v) = tail_v {
+                m.extend_from_slice(tail);
+                m.extend_from_slice(crate::util::u64_to_dec(v as u64, &mut [0u8; 24]));
+            }
+            m.extend_from_slice(b"\n");
+            outln(&m);
         };
-        rpt.check("popen: returns a stream for mode \"r\"", !f.is_null());
-        if !f.is_null() {
+        let mut it_null = 0u32;
+        let mut it_noout = 0u32;
+        let mut it_badrc = 0u32;
+        for it in 0..30u32 {
+            let f = unsafe {
+                libc::popen::popen(
+                    b"echo popen-ok\0".as_ptr() as *const libc::ctypes::c_char,
+                    b"r\0".as_ptr() as *const libc::ctypes::c_char,
+                )
+            };
+            if f.is_null() {
+                it_null += 1;
+                note(b"NULL", it, b" errno=", Some(libc::errno::errno() as u32));
+                continue;
+            }
             // 读到 EOF 为止。两个理由，都是本系统的**既定语义**而不是测试写法问题：
             // ① 管道单次 read 只保证「有数据就返回」，不保证一次读全；
             // ② **ADR-052**：本系统的「阻塞」由帧交换实现，被唤醒的阻塞 syscall
@@ -3452,13 +3490,19 @@ pub(crate) fn cmd_libccheck(_arg: &[u8]) -> u8 {
                 }
                 got.extend_from_slice(&buf[..n]);
             }
-            rpt.check(
-                "popen: reads the child process output",
-                got.windows(8).any(|w| w == b"popen-ok"),
-            );
+            if !got.windows(8).any(|w| w == b"popen-ok") {
+                it_noout += 1;
+                note(b"NOOUTPUT", it, b"", None);
+            }
             let rc = unsafe { libc::popen::pclose(f) };
-            rpt.check("pclose: closes the stream and reaps the child (status 0)", rc == 0);
+            if rc != 0 {
+                it_badrc += 1;
+                note(b"BADRC", it, b" rc=", Some(rc as u32));
+            }
         }
+        rpt.check("popen: all 30 forks returned a stream", it_null == 0);
+        rpt.check("popen: all 30 reads saw the child output", it_noout == 0);
+        rpt.check("pclose: all 30 reaps reported status 0", it_badrc == 0);
 
         // "e"（cloexec）如实拒绝——本系统没有「fork 与 exec 之间设 cloexec」的窗口。
         let bad = unsafe {
